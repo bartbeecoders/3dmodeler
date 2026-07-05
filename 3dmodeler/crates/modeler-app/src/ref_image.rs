@@ -145,6 +145,17 @@ fn quad_mesh() -> CpuMesh {
     }
 }
 
+/// Pixel dimensions of an embedded image (header parse only, no full
+/// decode) — used by the control API to map pixel picks to meters.
+pub fn decoded_size(data_base64: &str) -> Option<(u32, u32)> {
+    let bytes = BASE64.decode(data_base64).ok()?;
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 fn decode_texture(data_base64: &str) -> Option<CpuTexture> {
     let bytes = BASE64.decode(data_base64).ok()?;
     let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();

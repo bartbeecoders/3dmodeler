@@ -436,19 +436,22 @@ impl Drop for PhysicsMirror {
     }
 }
 
+/// box3d keeps global state that is not safe to touch from multiple threads
+/// at once (cargo test runs tests in parallel) — EVERY test that creates a
+/// world (any `PhysicsMirror::new`), in any module, must hold this lock.
+#[cfg(test)]
+pub(crate) fn ffi_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static FFI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FFI_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use modeler_core::Primitive;
-    use std::sync::{Mutex, MutexGuard};
 
-    /// box3d keeps global state that is not safe to touch from multiple
-    /// threads at once (cargo test runs tests in parallel) — serialize all
-    /// tests that create worlds.
-    static FFI_LOCK: Mutex<()> = Mutex::new(());
-
-    fn ffi_lock() -> MutexGuard<'static, ()> {
-        FFI_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn ffi_lock() -> std::sync::MutexGuard<'static, ()> {
+        ffi_test_lock()
     }
 
     fn scene_with_dynamic_cube_at(z: f32) -> (Scene, ObjectId) {

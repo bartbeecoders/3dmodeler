@@ -142,6 +142,65 @@ fn tool_definitions() -> Value {
             "name": "new_scene",
             "description": "Reset to the default scene (a single cube). Destroys all current objects.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "add_reference_image",
+            "description": "Place a PNG/JPEG in the viewport as a semi-transparent reference image locked to an axis plane (x = side/YZ, y = front/XZ, z = floor/XY). Pass either a file path readable by the modeler app or the raw image bytes as base64. The image keeps its aspect ratio; width_m sets its world size. It is embedded in the scene file, so it saves/loads with the scene. get_scene lists all reference images including their pixel dimensions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to a .png/.jpg on the machine running the modeler app"},
+                    "data_base64": {"type": "string", "description": "Alternative to 'path': base64-encoded PNG/JPEG bytes"},
+                    "name": {"type": "string", "description": "Optional name (unique-suffixed like objects)"},
+                    "plane": {"type": "string", "enum": ["x", "y", "z"], "description": "Axis the image plane is perpendicular to (default y = front view)"},
+                    "location": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] center of the image in meters"},
+                    "rotation_deg": {"type": "number", "description": "In-plane rotation in degrees"},
+                    "width_m": {"type": "number", "description": "World width in meters (default 2; height follows the aspect ratio)"},
+                    "opacity": {"type": "number", "description": "0..1, default 0.5"},
+                    "visible": {"type": "boolean"}
+                }
+            }
+        },
+        {
+            "name": "update_reference_image",
+            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility or name. Reference it by name or id (see get_scene).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Reference image name (or id as string)"},
+                    "new_name": {"type": "string"},
+                    "plane": {"type": "string", "enum": ["x", "y", "z"]},
+                    "location": {"type": "array", "items": {"type": "number"}},
+                    "rotation_deg": {"type": "number"},
+                    "width_m": {"type": "number"},
+                    "opacity": {"type": "number"},
+                    "visible": {"type": "boolean"}
+                },
+                "required": ["image"]
+            }
+        },
+        {
+            "name": "delete_reference_image",
+            "description": "Remove a reference image from the scene (by name or id).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"image": {"type": "string"}},
+                "required": ["image"]
+            }
+        },
+        {
+            "name": "calibrate_reference_image",
+            "description": "Scale a reference image to real-world size from two points: give two pixel coordinates IN THE SOURCE IMAGE (origin top-left; get_scene reports width_px/height_px) and the real distance between them in meters. The image is rescaled so that pixel span matches the distance — e.g. a blueprint's known 4 m wall. Returns the currently-measured span and the updated image.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Reference image name (or id as string)"},
+                    "point_a_px": {"type": "array", "items": {"type": "number"}, "description": "[x, y] in source-image pixels"},
+                    "point_b_px": {"type": "array", "items": {"type": "number"}, "description": "[x, y] in source-image pixels"},
+                    "real_distance_m": {"type": "number", "description": "Real-world distance between the two points, meters"}
+                },
+                "required": ["image", "point_a_px", "point_b_px", "real_distance_m"]
+            }
         }
     ])
 }
@@ -153,7 +212,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
         "add_object" | "update_object" | "delete_object" | "set_parent" | "add_measurement"
-        | "simulate" => {
+        | "simulate" | "add_reference_image" | "update_reference_image"
+        | "delete_reference_image" | "calibrate_reference_image" => {
             let mut command = arguments.clone();
             if !command.is_object() {
                 command = json!({});
