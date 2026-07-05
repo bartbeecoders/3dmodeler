@@ -9,7 +9,7 @@
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::{EulerRot, Quat, Vec3};
-use modeler_core::{ObjectId, Primitive, Scene, Transform};
+use modeler_core::{library, Library, LibraryAsset, ObjectId, Primitive, Scene, Transform};
 use serde_json::{json, Value};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -94,6 +94,7 @@ impl ControlServer {
         scene: &mut Scene,
         selection: &mut Selection,
         physics: &mut PhysicsMirror,
+        library_doc: &mut Library,
     ) {
         while let Ok((command, reply)) = self.requests.try_recv() {
             self.commands_handled += 1;
@@ -102,7 +103,7 @@ impl ControlServer {
                 self.pending_screenshots.push(reply);
                 continue;
             }
-            let response = execute(&command, scene, selection, physics);
+            let response = execute(&command, scene, selection, physics, library_doc);
             let _ = reply.send(response);
         }
     }
@@ -330,13 +331,90 @@ fn ref_image_json(image: &modeler_core::ReferenceImage) -> Value {
     })
 }
 
+/// Resolve a library-asset reference: numeric id or (unique) name.
+fn resolve_asset(library_doc: &Library, reference: &Value) -> Result<u64, String> {
+    if let Some(n) = reference.as_u64() {
+        if library_doc.asset(n).is_some() {
+            return Ok(n);
+        }
+        return Err(format!("no library item with id {n}"));
+    }
+    let name = reference
+        .as_str()
+        .ok_or("library item reference must be a name or an id")?;
+    if let Some(asset) = library_doc.assets().iter().find(|a| a.name == name) {
+        return Ok(asset.id);
+    }
+    if let Ok(n) = name.parse::<u64>() {
+        if library_doc.asset(n).is_some() {
+            return Ok(n);
+        }
+    }
+    Err(format!("no library item named '{name}'"))
+}
+
+fn asset_json(asset: &LibraryAsset) -> Value {
+    json!({
+        "id": asset.id,
+        "name": asset.name,
+        "description": asset.description,
+        "object_count": asset.objects.len(),
+        "objects": asset.objects.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
+        "has_preview": asset.preview_png_base64.is_some(),
+    })
+}
+
+/// The objects a library create/update captures: explicit references from
+/// `params["objects"]`, or the current viewport selection when omitted.
+fn capture_for_library(
+    scene: &Scene,
+    selection: &Selection,
+    params: &Value,
+) -> Result<Vec<modeler_core::Object>, String> {
+    let ids: Vec<ObjectId> = match params.get("objects").filter(|v| !v.is_null()) {
+        Some(refs) => refs
+            .as_array()
+            .ok_or("'objects' must be an array of names/ids")?
+            .iter()
+            .map(|r| resolve(scene, r))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => selection.selected().to_vec(),
+    };
+    let objects = library::capture_objects(scene, &ids);
+    if objects.is_empty() {
+        return Err(
+            "no objects to capture: pass 'objects' (names/ids) or select some first".to_string(),
+        );
+    }
+    Ok(objects)
+}
+
+/// Preview for an asset: explicit `preview_png_base64` wins, otherwise a
+/// rendered isometric thumbnail of the captured objects.
+fn preview_for_library(
+    params: &Value,
+    objects: &[modeler_core::Object],
+) -> Result<Option<String>, String> {
+    match params.get("preview_png_base64").and_then(Value::as_str) {
+        Some(data) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| format!("bad preview_png_base64: {e}"))?;
+            Ok(Some(data.to_string()))
+        }
+        None => Ok(crate::preview::render_preview_base64(objects)),
+    }
+}
+
 pub fn execute(
     command: &Value,
     scene: &mut Scene,
     selection: &mut Selection,
     physics: &mut PhysicsMirror,
+    library_doc: &mut Library,
 ) -> Value {
-    let result = execute_inner(command, scene, selection, physics);
+    let result = execute_inner(command, scene, selection, physics, library_doc);
     match result {
         Ok(value) => {
             let mut response = json!({"ok": true});
@@ -358,6 +436,7 @@ fn execute_inner(
     scene: &mut Scene,
     selection: &mut Selection,
     physics: &mut PhysicsMirror,
+    library_doc: &mut Library,
 ) -> Result<Value, String> {
     let cmd = command["cmd"].as_str().ok_or("missing 'cmd'")?;
     match cmd {
@@ -528,11 +607,83 @@ fn execute_inner(
                 "image": ref_image_json(scene.reference_images().iter().find(|r| r.id == id).unwrap()),
             }))
         }
+        "get_library" => {
+            let assets: Vec<Value> = library_doc.assets().iter().map(asset_json).collect();
+            Ok(json!({"assets": assets}))
+        }
+        "create_library_object" => {
+            let name = command["name"]
+                .as_str()
+                .filter(|n| !n.trim().is_empty())
+                .ok_or("missing 'name'")?;
+            let description = command["description"].as_str().unwrap_or_default();
+            let objects = capture_for_library(scene, selection, command)?;
+            let preview = preview_for_library(command, &objects)?;
+            let id = library_doc.add_asset(name.trim(), description.trim(), objects, preview);
+            Ok(json!({"asset": asset_json(library_doc.asset(id).unwrap())}))
+        }
+        "update_library_object" => {
+            let id = resolve_asset(library_doc, &command["asset"])?;
+            // recapture contents only when 'objects' is given
+            let recaptured = if command.get("objects").is_some_and(|v| !v.is_null()) {
+                let objects = capture_for_library(scene, selection, command)?;
+                let preview = preview_for_library(command, &objects)?;
+                Some((objects, preview))
+            } else {
+                None
+            };
+            if let Some(name) = command["new_name"].as_str() {
+                library_doc.rename_asset(id, name);
+            }
+            let asset = library_doc.asset_mut(id).ok_or("library item vanished")?;
+            if let Some(description) = command["description"].as_str() {
+                asset.description = description.trim().to_string();
+            }
+            match recaptured {
+                Some((objects, preview)) => {
+                    asset.objects = objects;
+                    asset.preview_png_base64 = preview;
+                }
+                None => {
+                    if let Some(data) = command["preview_png_base64"].as_str() {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|e| format!("bad preview_png_base64: {e}"))?;
+                        asset.preview_png_base64 = Some(data.to_string());
+                    }
+                }
+            }
+            Ok(json!({"asset": asset_json(library_doc.asset(id).unwrap())}))
+        }
+        "delete_library_object" => {
+            let id = resolve_asset(library_doc, &command["asset"])?;
+            library_doc.remove_asset(id);
+            Ok(json!({}))
+        }
+        "place_library_object" => {
+            let id = resolve_asset(library_doc, &command["asset"])?;
+            let at = match command.get("location").filter(|v| !v.is_null()) {
+                Some(v) => vec3_from(v).ok_or("location must be [x, y, z]")?,
+                None => Vec3::ZERO,
+            };
+            let asset = library_doc.asset(id).unwrap().clone();
+            let new_ids = library::instantiate(scene, &asset, at);
+            let active = new_ids.first().copied();
+            selection.set(new_ids.clone(), active);
+            let placed: Vec<Value> = new_ids
+                .iter()
+                .filter_map(|&id| scene.object(id))
+                .map(|o| json!({"id": o.id.0, "name": o.name}))
+                .collect();
+            Ok(json!({"placed": placed}))
+        }
         other => Err(format!(
             "unknown cmd '{other}' (get_scene, new_scene, add_object, update_object, \
              delete_object, set_parent, add_measurement, simulate, screenshot, \
              add_reference_image, update_reference_image, delete_reference_image, \
-             calibrate_reference_image)"
+             calibrate_reference_image, get_library, create_library_object, \
+             update_library_object, delete_library_object, place_library_object)"
         )),
     }
 }
@@ -565,8 +716,13 @@ pub fn encode_screenshot(pixels: &[[u8; 4]], width: u32, height: u32) -> Result<
 mod tests {
     use super::*;
 
-    fn setup() -> (Scene, Selection, PhysicsMirror) {
-        (Scene::default_scene(), Selection::default(), PhysicsMirror::new())
+    fn setup() -> (Scene, Selection, PhysicsMirror, Library) {
+        (
+            Scene::default_scene(),
+            Selection::default(),
+            PhysicsMirror::new(),
+            Library::default(),
+        )
     }
 
     /// A valid 8x4 white PNG, base64-encoded (via the screenshot encoder).
@@ -578,7 +734,7 @@ mod tests {
     #[test]
     fn reference_image_commands_roundtrip() {
         let _guard = crate::physics::ffi_test_lock();
-        let (mut scene, mut sel, mut physics) = setup();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
 
         // add from base64 with overrides (agents may not share a filesystem)
         let response = execute(
@@ -590,6 +746,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
         let image = &response["image"];
@@ -610,6 +767,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
         assert!((response["measured_m"].as_f64().unwrap() - 1.0).abs() < 1e-5);
@@ -622,6 +780,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
         assert_eq!(response["image"]["visible"], false);
@@ -631,6 +790,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
         assert!(scene.reference_images().is_empty());
@@ -642,6 +802,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], false);
         let response = execute(
@@ -649,6 +810,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], false);
     }
@@ -656,7 +818,7 @@ mod tests {
     #[test]
     fn control_commands_roundtrip() {
         let _guard = crate::physics::ffi_test_lock();
-        let (mut scene, mut sel, mut physics) = setup();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
 
         // add a red dynamic sphere at (2, 0, 3)
         let response = execute(
@@ -667,6 +829,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
         assert_eq!(response["name"], "Ball");
@@ -677,11 +840,18 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true, "{response}");
 
         // scene reflects everything
-        let response = execute(&json!({"cmd": "get_scene"}), &mut scene, &mut sel, &mut physics);
+        let response = execute(
+            &json!({"cmd": "get_scene"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
         let objects = response["objects"].as_array().unwrap();
         assert_eq!(objects.len(), 2);
         let ball = objects.iter().find(|o| o["name"] == "Ball").unwrap();
@@ -694,6 +864,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], true);
         let response = execute(
@@ -701,6 +872,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["length_m"], 5.0);
         let response = execute(
@@ -708,6 +880,7 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], false);
 
@@ -717,6 +890,126 @@ mod tests {
             &mut scene,
             &mut sel,
             &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn library_commands_roundtrip() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        // build a two-object group and store it by explicit reference
+        let response = execute(
+            &json!({
+                "cmd": "add_object", "primitive": "cylinder", "new_name": "Leg",
+                "location": [3.0, 0.0, 1.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let response = execute(
+            &json!({"cmd": "set_parent", "child": "Leg", "parent": "Cube"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+
+        // selecting the root captures the child too; preview auto-renders
+        let response = execute(
+            &json!({
+                "cmd": "create_library_object", "name": "Table",
+                "description": "cube with a leg", "objects": ["Cube"]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["asset"]["name"], "Table");
+        assert_eq!(response["asset"]["object_count"], 2);
+        assert_eq!(response["asset"]["has_preview"], true);
+
+        // list it
+        let response = execute(
+            &json!({"cmd": "get_library"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["assets"].as_array().unwrap().len(), 1);
+
+        // place two copies; each gets fresh unique names and is selected
+        let response = execute(
+            &json!({"cmd": "place_library_object", "asset": "Table", "location": [5.0, 5.0, 0.0]}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["placed"].as_array().unwrap().len(), 2);
+        assert_eq!(sel.selected().len(), 2);
+        let response = execute(
+            &json!({"cmd": "place_library_object", "asset": "Table"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(scene.objects().len(), 6); // 2 originals + 2 placements of 2
+
+        // update: rename + description without touching the contents
+        let response = execute(
+            &json!({
+                "cmd": "update_library_object", "asset": "Table",
+                "new_name": "Desk", "description": "renamed"
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["asset"]["name"], "Desk");
+        assert_eq!(response["asset"]["object_count"], 2);
+
+        // delete, then errors on the gone item
+        let response = execute(
+            &json!({"cmd": "delete_library_object", "asset": "Desk"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(lib.assets().is_empty());
+        let response = execute(
+            &json!({"cmd": "place_library_object", "asset": "Desk"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+
+        // create with nothing selected and no refs is a friendly error
+        sel.set(Vec::new(), None);
+        let response = execute(
+            &json!({"cmd": "create_library_object", "name": "Empty"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
         );
         assert_eq!(response["ok"], false);
     }

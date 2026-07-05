@@ -4,10 +4,12 @@
 //! the command/undo system and serialization. It knows nothing about
 //! rendering or physics — those live in `modeler-app`.
 
+pub mod library;
 pub mod mesh;
 
 use glam::{Quat, Vec3};
 pub use glam;
+pub use library::{Library, LibraryAsset};
 pub use mesh::MeshData;
 use serde::{Deserialize, Serialize};
 
@@ -384,6 +386,20 @@ impl Scene {
             mesh_revision: 0,
         });
         id
+    }
+
+    /// Insert a pre-built object (e.g. from a library asset), assigning a
+    /// fresh id and a unique name derived from the object's current name.
+    /// Everything else (transform, material, edited mesh, …) is kept; the
+    /// caller is responsible for the parent link being valid.
+    pub fn insert_object(&mut self, mut object: Object) -> ObjectId {
+        self.next_id += 1;
+        self.version += 1;
+        object.id = ObjectId(self.next_id);
+        object.name = self.unique_name(&object.name);
+        object.mesh_revision = 0;
+        self.objects.push(object);
+        ObjectId(self.next_id)
     }
 
     fn unique_name(&self, base: &str) -> String {

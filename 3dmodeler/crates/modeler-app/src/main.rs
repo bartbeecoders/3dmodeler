@@ -11,11 +11,13 @@ mod control;
 mod camera;
 mod edit_mode;
 mod grid;
+mod library;
 mod modal;
 mod object_ops;
 mod io;
 mod overlay;
 mod physics;
+mod preview;
 mod ref_image;
 mod scene_render;
 mod selection;
@@ -97,6 +99,8 @@ pub fn main() {
     let mut calibrate = ref_image::CalibrateTool::new();
     let mut settings = settings::Settings::load();
     let mut saved_settings = settings.clone();
+    let mut library = library::load();
+    let mut library_saved_revision = library.revision();
     let mut snap_to_grid = false;
     let mut snap_to_vertex = false;
     let mut shade_mode = scene_render::ShadeMode::Shaded;
@@ -172,6 +176,7 @@ pub fn main() {
                     &mut measure,
                     &mut calibrate,
                     &mut settings,
+                    &mut library,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
@@ -268,6 +273,40 @@ pub fn main() {
         if settings != saved_settings {
             settings.save();
             saved_settings = settings.clone();
+        }
+
+        // a library asset dragged into the viewport lands here: place it on
+        // the picked surface (or the z=0 grid plane) under the cursor
+        if let Some(drop) = ui_state.library_panel.take_drop() {
+            if !physics.is_stopped() {
+                ui_state.status_message =
+                    Some("stop the simulation before placing library items".into());
+            } else if let Some(asset) = library.asset(drop.asset_id).cloned() {
+                // egui gives logical top-left coords; pick rays want physical
+                // bottom-left (see camera::pick_ray)
+                let dpr = frame_input.device_pixel_ratio;
+                let x_px = drop.pos.x * dpr;
+                let y_px = frame_input.viewport.height as f32 - drop.pos.y * dpr;
+                physics.sync(&scene); // ray needs a current mirror
+                let (origin, direction) =
+                    camera.pick_ray(frame_input.viewport, x_px, y_px);
+                let at = physics
+                    .pick_point(
+                        glam::Vec3::new(origin.x, origin.y, origin.z),
+                        glam::Vec3::new(direction.x, direction.y, direction.z),
+                    )
+                    .unwrap_or(glam::Vec3::ZERO);
+                let new_ids = modeler_core::library::instantiate(&mut scene, &asset, at);
+                let active = new_ids.first().copied();
+                sel.set(new_ids, active);
+                ui_state.status_message = Some(format!("placed '{}'", asset.name));
+            }
+        }
+
+        // persist library changes (sidebar edits or MCP commands)
+        if library.revision() != library_saved_revision {
+            library::save(&library);
+            library_saved_revision = library.revision();
         }
 
         // did egui consume the keyboard this frame (e.g. focused text field)?
@@ -470,7 +509,7 @@ pub fn main() {
         // external control API (MCP): execute queued agent commands
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(control) = control.as_mut() {
-            control.poll(&mut scene, &mut sel, &mut physics);
+            control.poll(&mut scene, &mut sel, &mut physics, &mut library);
         }
 
         // step the simulation (writes transforms back into the scene)

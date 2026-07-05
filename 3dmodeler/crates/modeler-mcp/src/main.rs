@@ -189,6 +189,61 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_library",
+            "description": "List the object library: reusable assets (each a named collection of objects with a description and preview) that can be placed into any scene with place_library_object. The library persists across scenes and sessions.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "create_library_object",
+            "description": "Save a group of scene objects as a reusable library asset. Pass 'objects' (names/ids — their children are captured automatically) or omit it to capture the user's current selection. The group is stored normalized: centered in x/y with its lowest point at z=0, so placing it at a point puts it ON that point. A small isometric preview image is rendered automatically unless preview_png_base64 is given.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Asset name (unique-suffixed like Table, Table.001, ...)"},
+                    "description": {"type": "string"},
+                    "objects": {"type": "array", "items": {"type": "string"}, "description": "Scene object names/ids to capture (children included). Defaults to the current selection."},
+                    "preview_png_base64": {"type": "string", "description": "Optional custom preview image (PNG, base64)"}
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "update_library_object",
+            "description": "Update a library asset by name or id: rename (new_name), change the description, replace its contents with new scene objects ('objects', regenerates the preview), or set a custom preview_png_base64.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset": {"type": "string", "description": "Library asset name (or id as string)"},
+                    "new_name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "objects": {"type": "array", "items": {"type": "string"}, "description": "Replace the asset's contents with these scene objects (children included)"},
+                    "preview_png_base64": {"type": "string"}
+                },
+                "required": ["asset"]
+            }
+        },
+        {
+            "name": "delete_library_object",
+            "description": "Delete an asset from the object library (by name or id). Scene objects are not affected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"asset": {"type": "string"}},
+                "required": ["asset"]
+            }
+        },
+        {
+            "name": "place_library_object",
+            "description": "Instantiate a library asset into the scene at a world location (default [0,0,0]). The asset's lowest point lands on that location. Objects get fresh ids and unique names, hierarchy preserved; the new objects become the selection. Returns their ids and names.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset": {"type": "string", "description": "Library asset name (or id as string)"},
+                    "location": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] in meters"}
+                },
+                "required": ["asset"]
+            }
+        },
+        {
             "name": "calibrate_reference_image",
             "description": "Scale a reference image to real-world size from two points: give two pixel coordinates IN THE SOURCE IMAGE (origin top-left; get_scene reports width_px/height_px) and the real distance between them in meters. The image is rescaled so that pixel span matches the distance — e.g. a blueprint's known 4 m wall. Returns the currently-measured span and the updated image.",
             "inputSchema": {
@@ -211,9 +266,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "get_scene" => json!({"cmd": "get_scene"}),
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
+        "get_library" => json!({"cmd": "get_library"}),
         "add_object" | "update_object" | "delete_object" | "set_parent" | "add_measurement"
         | "simulate" | "add_reference_image" | "update_reference_image"
-        | "delete_reference_image" | "calibrate_reference_image" => {
+        | "delete_reference_image" | "calibrate_reference_image" | "create_library_object"
+        | "update_library_object" | "delete_library_object" | "place_library_object" => {
             let mut command = arguments.clone();
             if !command.is_object() {
                 command = json!({});

@@ -5,6 +5,7 @@
 //! popups misbehave inside the deprecated panel API (see plan.md, Phase 3).
 
 use crate::camera::BlenderCamera;
+use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
 use crate::physics::{PhysicsMirror, SimState};
@@ -17,7 +18,7 @@ use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use modeler_core::ImagePlane;
 use modeler_core::glam::{EulerRot, Quat};
-use modeler_core::{ObjectId, Primitive, Scene, Transform};
+use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
 use three_d::Event;
 
@@ -42,6 +43,7 @@ pub struct UiState {
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
     settings_window: SettingsWindow,
+    pub library_panel: LibraryPanel,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
     #[cfg(target_arch = "wasm32")]
@@ -78,6 +80,7 @@ impl UiState {
             status_message: None,
             current_file: None,
             settings_window: SettingsWindow::new(),
+            library_panel: LibraryPanel::new(),
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
             #[cfg(target_arch = "wasm32")]
@@ -117,6 +120,7 @@ impl UiState {
         measure: &mut MeasureTool,
         calibrate: &mut CalibrateTool,
         settings: &mut Settings,
+        library: &mut Library,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -172,7 +176,7 @@ impl UiState {
             mcp,
         );
         let right_offset = if self.show_sidebar {
-            self.sidebar(ctx, scene, selection, settings, calibrate)
+            self.sidebar(ctx, scene, selection, settings, calibrate, library)
         } else {
             0.0
         };
@@ -181,6 +185,11 @@ impl UiState {
         self.save_as_window(ctx, scene, settings);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
+        if let Some(message) = self.library_panel.dialog_window(ctx, scene, selection, library) {
+            self.status_message = Some(message);
+        }
+        self.library_panel
+            .detect_viewport_drop(ctx, top_offset, right_offset, bottom_offset);
         UiLayout {
             top_offset,
             right_offset,
@@ -254,7 +263,10 @@ impl UiState {
                                 edit_menu(ui, scene, undo, &mut self.settings_window)
                             }
                             Menu::Add => add_menu_items(ui, scene, measure),
-                            Menu::Object => object_menu(ui, scene, selection, modal, physics),
+                            Menu::Object => object_menu(
+                                ui, scene, selection, modal, physics,
+                                &mut self.library_panel,
+                            ),
                             Menu::View => view_menu(
                                 ui, camera, scene, selection, settings, snap_to_grid,
                                 shade_mode, xray,
@@ -803,6 +815,7 @@ impl UiState {
         selection: &mut Selection,
         settings: &Settings,
         calibrate: &mut CalibrateTool,
+        library: &mut Library,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
@@ -810,6 +823,10 @@ impl UiState {
             .show(ctx, |ui| {
                 ui.strong("Outliner");
                 self.outliner(ui, scene, selection);
+                ui.separator();
+                if let Some(message) = self.library_panel.section(ui, library) {
+                    self.status_message = Some(message);
+                }
                 ui.separator();
                 if !scene.reference_images().is_empty() {
                     ui.strong("Reference Images");
@@ -1098,6 +1115,7 @@ fn object_menu(
     selection: &mut Selection,
     modal: &mut ModalTransform,
     physics: &mut PhysicsMirror,
+    library_panel: &mut LibraryPanel,
 ) -> bool {
     let has_selection = !selection.is_empty();
     let mut close = false;
@@ -1150,6 +1168,18 @@ fn object_menu(
         for id in selection.selected().to_vec() {
             scene.set_parent(id, None);
         }
+        close = true;
+    }
+    ui.separator();
+    if ui
+        .add_enabled(
+            has_selection,
+            egui::Button::new("Save Selection to Library…"),
+        )
+        .on_hover_text("Store the selected objects (children included) as a reusable library item")
+        .clicked()
+    {
+        library_panel.open_create_dialog(scene, selection);
         close = true;
     }
     ui.separator();

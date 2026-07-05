@@ -158,6 +158,11 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | `add_measurement` | Persistent ruler between two points, returns the distance in meters |
 | `simulate` | `play` / `pause` / `stop` the physics simulation (stop restores the scene) |
 | `new_scene` | Reset to the default scene |
+| `get_library` | List the object library: reusable assets that persist across scenes and sessions |
+| `create_library_object` | Save scene objects (or the current selection) as a named library asset with a description and an auto-rendered preview image |
+| `update_library_object` | Rename an asset, edit its description, replace its contents, or set a custom preview |
+| `delete_library_object` | Remove an asset from the library (scene objects untouched) |
+| `place_library_object` | Instantiate a library asset into the scene at a location (fresh ids/names, hierarchy preserved, lowest point lands on the location) |
 
 Conventions the agent should know (also sent in the server's MCP
 `instructions`): units are **meters**, the world is **Z-up** (ground = XY
