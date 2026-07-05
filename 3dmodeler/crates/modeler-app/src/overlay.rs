@@ -4,6 +4,7 @@
 
 use crate::camera::BlenderCamera;
 use crate::modal::{GuideKind, Guides};
+use crate::ref_image::CalibrateTool;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::Scene;
@@ -193,10 +194,32 @@ pub fn draw(
     device_pixel_ratio: f32,
     scene: &Scene,
     measure: &MeasureTool,
+    calibrate: &CalibrateTool,
     unit: Unit,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
+
+    // --- calibration picks (scale-from-2-points) ---------------------------
+    for (i, point) in calibrate.points.iter().enumerate() {
+        if let Some(pos) = project(*point) {
+            painter.circle_stroke(pos, 6.0, egui::Stroke::new(2.0, DIM_COLOR));
+            painter.circle_filled(pos, 2.0, DIM_COLOR);
+            text_with_bg(
+                &painter,
+                pos + egui::vec2(0.0, -10.0),
+                egui::Align2::CENTER_BOTTOM,
+                &format!("{}", i + 1),
+                11.0,
+                DIM_COLOR,
+            );
+        }
+    }
+    if calibrate.points.len() == 2 {
+        if let (Some(a), Some(b)) = (project(calibrate.points[0]), project(calibrate.points[1])) {
+            painter.line_segment([a, b], egui::Stroke::new(1.5, DIM_COLOR));
+        }
+    }
 
     // --- measurements ------------------------------------------------------
     for m in scene.measurements() {

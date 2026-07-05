@@ -288,9 +288,28 @@ fn execute_inner(
                     })
                 })
                 .collect();
+            // reference images without their (large) embedded pixel data
+            let reference_images: Vec<Value> = scene
+                .reference_images()
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "name": r.name,
+                        "plane": format!("{:?}", r.plane),
+                        "location": [r.location.x, r.location.y, r.location.z],
+                        "rotation_deg": r.rotation_deg,
+                        "width_m": r.width_m,
+                        "height_m": r.height_m(),
+                        "opacity": r.opacity,
+                        "visible": r.visible,
+                    })
+                })
+                .collect();
             Ok(json!({
                 "objects": objects,
                 "measurements": measurements,
+                "reference_images": reference_images,
                 "sim_state": format!("{:?}", physics.sim_state()),
             }))
         }

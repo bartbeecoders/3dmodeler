@@ -15,6 +15,7 @@ mod object_ops;
 mod io;
 mod overlay;
 mod physics;
+mod ref_image;
 mod scene_render;
 mod selection;
 mod settings;
@@ -90,6 +91,8 @@ pub fn main() {
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
+    let mut ref_render = ref_image::RefImageRender::new();
+    let mut calibrate = ref_image::CalibrateTool::new();
     let mut settings = settings::Settings::load();
     let mut saved_settings = settings.clone();
     let mut snap_to_grid = false;
@@ -143,6 +146,7 @@ pub fn main() {
                     &mut physics,
                     &mut undo,
                     &mut measure,
+                    &mut calibrate,
                     &mut settings,
                     &mut snap_to_grid,
                     &modal_status,
@@ -157,6 +161,7 @@ pub fn main() {
                     frame_input.device_pixel_ratio,
                     &scene,
                     &measure,
+                    &calibrate,
                     settings.unit,
                 );
                 if let Some(guides) = &modal_guides {
@@ -315,6 +320,34 @@ pub fn main() {
             }
         }
 
+        // reference-image scale calibration: pick 2 points on the image plane
+        if calibrate.picking() {
+            for event in frame_input.events.iter_mut() {
+                match event {
+                    Event::MousePress {
+                        button: MouseButton::Left,
+                        position,
+                        handled,
+                        ..
+                    } if !*handled && !pointer_over_ui => {
+                        let (origin, direction) =
+                            camera.pick_ray(frame_input.viewport, position.x, position.y);
+                        calibrate.add_ray(
+                            &scene,
+                            glam::Vec3::new(origin.x, origin.y, origin.z),
+                            glam::Vec3::new(direction.x, direction.y, direction.z),
+                        );
+                        *handled = true;
+                    }
+                    Event::KeyPress { kind: Key::Escape, handled, .. } if !*handled => {
+                        calibrate.cancel();
+                        *handled = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Space = play/pause, Esc = stop (when not editing)
         if !modal.active() {
             for event in frame_input.events.iter_mut() {
@@ -443,6 +476,7 @@ pub fn main() {
         }
 
         scene_render.sync(&scene, &sel, &overlaps, &context);
+        ref_render.sync(&scene, &context);
 
         let cam = camera.camera(frame_input.viewport);
 
@@ -450,6 +484,8 @@ pub fn main() {
             scene_render.models().map(|m| m as &dyn Object).collect();
         render_objects.extend(scene_render.outlines().map(|m| m as &dyn Object));
         render_objects.push(&grid);
+        // reference images last: they blend over the grid and the meshes
+        render_objects.extend(ref_render.models().map(|m| m as &dyn Object));
 
         frame_input
             .screen()

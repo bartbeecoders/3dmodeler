@@ -227,12 +227,80 @@ impl Measurement {
     }
 }
 
+/// The axis a reference image's plane is perpendicular to (its normal):
+/// X = side view (YZ plane), Y = front view (XZ plane), Z = floor (XY plane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImagePlane {
+    X,
+    Y,
+    Z,
+}
+
+impl ImagePlane {
+    pub const ALL: [ImagePlane; 3] = [ImagePlane::X, ImagePlane::Y, ImagePlane::Z];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ImagePlane::X => "X (side)",
+            ImagePlane::Y => "Y (front)",
+            ImagePlane::Z => "Z (floor)",
+        }
+    }
+
+    /// Plane basis: (u = image right, v = image up, normal), right-handed.
+    /// The Y normal points toward the front view (-Y) so "right" stays +X.
+    pub fn basis(self) -> (Vec3, Vec3, Vec3) {
+        match self {
+            ImagePlane::X => (Vec3::Y, Vec3::Z, Vec3::X),
+            ImagePlane::Y => (Vec3::X, Vec3::Z, Vec3::NEG_Y),
+            ImagePlane::Z => (Vec3::X, Vec3::Y, Vec3::Z),
+        }
+    }
+}
+
+/// A reference image shown in the viewport as a flat, optionally transparent
+/// picture locked to an axis plane. The image bytes (PNG/JPEG) are embedded
+/// base64 so scenes stay self-contained across save/load and platforms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceImage {
+    pub id: u64,
+    pub name: String,
+    pub plane: ImagePlane,
+    /// Center of the image, world space.
+    pub location: Vec3,
+    /// In-plane rotation around the plane normal, degrees.
+    pub rotation_deg: f32,
+    /// World width in meters; height follows from the pixel aspect ratio.
+    pub width_m: f32,
+    /// height / width of the source image, cached at import.
+    pub aspect: f32,
+    /// 0 = invisible, 1 = opaque.
+    pub opacity: f32,
+    pub visible: bool,
+    /// Original file bytes (PNG or JPEG), base64-encoded.
+    pub data_base64: String,
+}
+
+impl ReferenceImage {
+    pub fn height_m(&self) -> f32 {
+        self.width_m * self.aspect.max(1e-6)
+    }
+
+    /// Basis with the in-plane rotation applied: (right, up, normal).
+    pub fn oriented_basis(&self) -> (Vec3, Vec3, Vec3) {
+        let (u, v, n) = self.plane.basis();
+        let (s, c) = self.rotation_deg.to_radians().sin_cos();
+        (u * c + v * s, v * c - u * s, n)
+    }
+}
+
 /// The scene document — the single source of truth that the renderer and the
 /// physics mirror derive their state from.
 #[derive(Debug, Default)]
 pub struct Scene {
     objects: Vec<Object>,
     measurements: Vec<Measurement>,
+    reference_images: Vec<ReferenceImage>,
     next_id: u64,
     version: u64,
 }
@@ -410,6 +478,45 @@ impl Scene {
         depth
     }
 
+    // --- reference images --------------------------------------------------
+
+    pub fn reference_images(&self) -> &[ReferenceImage] {
+        &self.reference_images
+    }
+
+    /// Add a reference image; assigns a fresh id and a unique name from the
+    /// one provided. Returns the id.
+    pub fn add_reference_image(&mut self, mut image: ReferenceImage) -> u64 {
+        self.next_id += 1;
+        self.version += 1;
+        image.id = self.next_id;
+        let base = if image.name.trim().is_empty() { "Image" } else { image.name.trim() };
+        let mut name = base.to_string();
+        let mut i = 1;
+        while self.reference_images.iter().any(|r| r.name == name) {
+            name = format!("{base}.{i:03}");
+            i += 1;
+        }
+        image.name = name;
+        self.reference_images.push(image);
+        self.next_id
+    }
+
+    /// Mutable access; bumps the version (callers are expected to change
+    /// something).
+    pub fn reference_image_mut(&mut self, id: u64) -> Option<&mut ReferenceImage> {
+        self.version += 1;
+        self.reference_images.iter_mut().find(|r| r.id == id)
+    }
+
+    pub fn remove_reference_image(&mut self, id: u64) {
+        let before = self.reference_images.len();
+        self.reference_images.retain(|r| r.id != id);
+        if self.reference_images.len() != before {
+            self.version += 1;
+        }
+    }
+
     // --- measurements ----------------------------------------------------
 
     pub fn measurements(&self) -> &[Measurement] {
@@ -458,6 +565,8 @@ pub struct SceneData {
     pub objects: Vec<Object>,
     #[serde(default)]
     pub measurements: Vec<Measurement>,
+    #[serde(default)]
+    pub reference_images: Vec<ReferenceImage>,
     pub next_id: u64,
 }
 
@@ -466,6 +575,7 @@ impl Scene {
         SceneData {
             objects: self.objects.clone(),
             measurements: self.measurements.clone(),
+            reference_images: self.reference_images.clone(),
             next_id: self.next_id,
         }
     }
@@ -473,6 +583,7 @@ impl Scene {
     pub fn restore(&mut self, data: &SceneData) {
         self.objects = data.objects.clone();
         self.measurements = data.measurements.clone();
+        self.reference_images = data.reference_images.clone();
         self.next_id = data.next_id;
         self.version += 1;
     }
@@ -636,6 +747,44 @@ mod tests {
 
         scene.remove_measurement(0);
         assert!(scene.measurements().is_empty());
+    }
+
+    #[test]
+    fn reference_images_roundtrip_and_unique_names() {
+        let mut scene = Scene::default_scene();
+        let image = ReferenceImage {
+            id: 0,
+            name: "blueprint".into(),
+            plane: ImagePlane::Y,
+            location: Vec3::new(0.0, 0.0, 1.0),
+            rotation_deg: 15.0,
+            width_m: 4.0,
+            aspect: 0.5,
+            opacity: 0.6,
+            visible: true,
+            data_base64: "aGVsbG8=".into(),
+        };
+        let a = scene.add_reference_image(image.clone());
+        let b = scene.add_reference_image(image);
+        assert_ne!(a, b);
+        assert_eq!(scene.reference_images()[1].name, "blueprint.001");
+        assert!((scene.reference_images()[0].height_m() - 2.0).abs() < 1e-6);
+
+        // survives save/load
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.reference_images.len(), 2);
+        // old scene files without the field still load
+        let old: SceneData =
+            serde_json::from_str(r#"{"objects": [], "next_id": 1}"#).unwrap();
+        assert!(old.reference_images.is_empty());
+
+        scene.remove_reference_image(a);
+        assert_eq!(scene.reference_images().len(), 1);
+
+        // in-plane rotation keeps the basis orthonormal
+        let (u, v, n) = scene.reference_images()[0].oriented_basis();
+        assert!(u.dot(v).abs() < 1e-6);
+        assert!(u.cross(v).dot(n) > 0.99);
     }
 
     #[test]

@@ -11,8 +11,10 @@ use crate::physics::{PhysicsMirror, SimState};
 use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
+use crate::ref_image::{self, CalibrateTool};
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
+use modeler_core::ImagePlane;
 use modeler_core::glam::{EulerRot, Quat};
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
@@ -112,12 +114,23 @@ impl UiState {
         physics: &mut PhysicsMirror,
         undo: &mut UndoStack,
         measure: &mut MeasureTool,
+        calibrate: &mut CalibrateTool,
         settings: &mut Settings,
         snap_to_grid: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
         mcp: Option<Option<McpStatus>>,
     ) -> UiLayout {
+        // finished reference-image picks arrive here
+        if let Some((name, bytes)) = ref_image::poll_image() {
+            match ref_image::make_reference(name, &bytes) {
+                Ok(image) => {
+                    scene.add_reference_image(image);
+                    self.status_message = Some("reference image added".into());
+                }
+                Err(e) => self.status_message = Some(format!("image load failed: {e}")),
+            }
+        }
         if let Some(result) = io::poll_open() {
             match result {
                 Ok((handle, data)) => {
@@ -146,10 +159,11 @@ impl UiState {
             snap_to_grid,
         );
         let bottom_offset = self.status_bar(
-            ctx, scene, physics, measure, snap_to_grid, settings, modal_status, fps, mcp,
+            ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
+            mcp,
         );
         let right_offset = if self.show_sidebar {
-            self.sidebar(ctx, scene, selection, settings)
+            self.sidebar(ctx, scene, selection, settings, calibrate)
         } else {
             0.0
         };
@@ -157,6 +171,7 @@ impl UiState {
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
         self.settings_window.ui(ctx, settings);
+        calibrate_window(ctx, scene, calibrate, settings);
         UiLayout {
             top_offset,
             right_offset,
@@ -456,6 +471,7 @@ impl UiState {
         scene: &mut Scene,
         physics: &mut PhysicsMirror,
         measure: &MeasureTool,
+        calibrate: &CalibrateTool,
         snap_to_grid: &mut bool,
         settings: &Settings,
         modal_status: &Option<String>,
@@ -503,7 +519,12 @@ impl UiState {
                 );
                 ui.separator();
 
-                let hint = if measure.active {
+                let hint = if calibrate.picking() {
+                    format!(
+                        "Scale image: click point {} of 2 on the image · Esc cancel",
+                        calibrate.points.len() + 1
+                    )
+                } else if measure.active {
                     if measure.first.is_some() {
                         "Measure: click the second point · Esc cancel".to_string()
                     } else {
@@ -611,6 +632,7 @@ impl UiState {
         scene: &mut Scene,
         selection: &mut Selection,
         settings: &Settings,
+        calibrate: &mut CalibrateTool,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
@@ -619,6 +641,11 @@ impl UiState {
                 ui.strong("Outliner");
                 self.outliner(ui, scene, selection);
                 ui.separator();
+                if !scene.reference_images().is_empty() {
+                    ui.strong("Reference Images");
+                    reference_image_rows(ui, scene, settings, calibrate);
+                    ui.separator();
+                }
                 if !scene.measurements().is_empty() {
                     ui.strong("Measurements");
                     let mut remove: Option<usize> = None;
@@ -873,6 +900,15 @@ fn add_menu_items(ui: &mut egui::Ui, scene: &mut Scene, measure: &mut MeasureToo
     }
     ui.separator();
     if ui
+        .button("Reference Image…")
+        .on_hover_text("Place a PNG/JPEG on an axis plane as a modeling reference")
+        .clicked()
+    {
+        ref_image::request_image();
+        return true;
+    }
+    ui.separator();
+    if ui
         .button("Measure (ruler)")
         .on_hover_text("Click two points in the viewport to measure the distance")
         .clicked()
@@ -1031,6 +1067,191 @@ fn view_menu(
         close = true;
     }
     close
+}
+
+// --- reference images ---------------------------------------------------------
+
+/// Sidebar rows for every reference image: visibility, plane, placement,
+/// size, opacity, calibration and delete.
+fn reference_image_rows(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    settings: &Settings,
+    calibrate: &mut CalibrateTool,
+) {
+    let unit = settings.unit;
+    let ids: Vec<u64> = scene.reference_images().iter().map(|r| r.id).collect();
+    let mut delete: Option<u64> = None;
+
+    for id in ids {
+        let Some(image) = scene.reference_images().iter().find(|r| r.id == id) else {
+            continue;
+        };
+        // edit a copy; write back only on change (writes bump the version)
+        let mut edited = image.clone();
+        let mut changed = false;
+
+        egui::CollapsingHeader::new(&edited.name)
+            .id_salt(("ref-image", id))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let eye = if edited.visible { "●" } else { "○" };
+                    if ui.small_button(eye).on_hover_text("Show / hide").clicked() {
+                        edited.visible = !edited.visible;
+                        changed = true;
+                    }
+                    if ui.small_button("✖").on_hover_text("Delete image").clicked() {
+                        delete = Some(id);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} × {}",
+                            unit.format(edited.width_m),
+                            unit.format(edited.height_m()),
+                        ))
+                        .weak()
+                        .size(11.0),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Plane");
+                    for plane in ImagePlane::ALL {
+                        if ui
+                            .selectable_label(edited.plane == plane, plane.label())
+                            .clicked()
+                            && edited.plane != plane
+                        {
+                            edited.plane = plane;
+                            changed = true;
+                        }
+                    }
+                });
+
+                ui.label("Location");
+                ui.horizontal(|ui| {
+                    for value in [&mut edited.location.x, &mut edited.location.y, &mut edited.location.z] {
+                        changed |= ui
+                            .add(egui::DragValue::new(value).speed(0.05))
+                            .changed();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Rotation");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut edited.rotation_deg)
+                                .speed(1.0)
+                                .suffix("°"),
+                        )
+                        .changed();
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Width");
+                    let mut width = unit.from_meters(edited.width_m);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut width)
+                                .speed(0.02 * unit.per_meter() as f64)
+                                .range(unit.from_meters(0.01)..=unit.from_meters(1000.0))
+                                .suffix(format!(" {}", unit.suffix())),
+                        )
+                        .changed()
+                    {
+                        edited.width_m = unit.to_meters(width).max(0.01);
+                        changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Opacity");
+                    changed |= ui
+                        .add(egui::Slider::new(&mut edited.opacity, 0.0..=1.0))
+                        .changed();
+                });
+
+                let calibrating = calibrate.target == Some(id);
+                if calibrating {
+                    if ui.button("Cancel scale picking").clicked() {
+                        calibrate.cancel();
+                    }
+                } else if ui
+                    .button("Scale from 2 points…")
+                    .on_hover_text(
+                        "Click two points on the image in the viewport, then enter \
+                         the real distance between them",
+                    )
+                    .clicked()
+                {
+                    calibrate.start(id);
+                }
+            });
+
+        if changed {
+            if let Some(target) = scene.reference_image_mut(id) {
+                *target = edited;
+            }
+        }
+    }
+
+    if let Some(id) = delete {
+        if calibrate.target == Some(id) {
+            calibrate.cancel();
+        }
+        scene.remove_reference_image(id);
+    }
+}
+
+/// After two points are picked: ask for the real-world distance and rescale.
+fn calibrate_window(
+    ctx: &egui::Context,
+    scene: &mut Scene,
+    calibrate: &mut CalibrateTool,
+    settings: &Settings,
+) {
+    let Some(measured) = calibrate.measured() else { return };
+    let Some(id) = calibrate.target else { return };
+    let unit = settings.unit;
+
+    let mut open = true;
+    let mut done = false;
+    egui::Window::new("Scale reference image")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "Picked distance on the image: {}",
+                unit.format(measured)
+            ));
+            ui.horizontal(|ui| {
+                ui.label(format!("Real distance ({}):", unit.suffix()));
+                let response = ui.text_edit_singleline(&mut calibrate.distance_input);
+                response.request_focus();
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = true;
+                }
+            });
+            let parsed = calibrate.distance_input.trim().replace(',', ".").parse::<f32>();
+            let valid = parsed.as_ref().is_ok_and(|v| *v > 0.0);
+            if ui.add_enabled(valid, egui::Button::new("Apply")).clicked() {
+                done = true;
+            }
+            if done && valid {
+                let real_m = unit.to_meters(parsed.unwrap());
+                if let Some(image) = scene.reference_image_mut(id) {
+                    CalibrateTool::apply_scale(image, measured, real_m);
+                }
+                calibrate.cancel();
+            }
+        });
+    if !open {
+        calibrate.cancel();
+    }
 }
 
 // --- properties (N panel) ----------------------------------------------------
