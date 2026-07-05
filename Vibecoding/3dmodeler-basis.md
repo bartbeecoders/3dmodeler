@@ -109,3 +109,7 @@ In object edit mode, you can select objects and edit them.
 Use & é " (1,2,3 on a azerty keyboard) to select the edit mode: face, edge, vertex
 This will select a face, edge or vertex of the object.
 The user can then edit the selected face, edge or vertex.
+
+
+Add a snap to vertex mode. When turned on, when moving objects, they will snap to the nearest vertex.
+Add a top toolbar, with the main options. Use useful icons.

@@ -117,6 +117,7 @@ impl UiState {
         calibrate: &mut CalibrateTool,
         settings: &mut Settings,
         snap_to_grid: &mut bool,
+        snap_to_vertex: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
         mcp: Option<Option<McpStatus>>,
@@ -154,10 +155,15 @@ impl UiState {
                 Err(e) => self.status_message = Some(format!("save failed: {e}")),
             }
         }
-        let top_offset = self.menu_bar(
+        let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
             snap_to_grid,
         );
+        let top_offset = menu_offset
+            + self.toolbar(
+                ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
+                snap_to_vertex,
+            );
         let bottom_offset = self.status_bar(
             ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
             mcp,
@@ -269,6 +275,140 @@ impl UiState {
             }
         }
         bar_height
+    }
+
+    /// Top toolbar: the main actions as icon buttons with tooltips.
+    #[allow(clippy::too_many_arguments)]
+    fn toolbar(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        modal: &mut ModalTransform,
+        physics: &mut PhysicsMirror,
+        undo: &mut UndoStack,
+        settings: &Settings,
+        snap_to_grid: &mut bool,
+        snap_to_vertex: &mut bool,
+    ) -> f32 {
+        #[allow(deprecated)]
+        let response = egui::Panel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let icon = |ui: &mut egui::Ui, glyph: &str, tip: &str| {
+                    ui.add(egui::Button::new(egui::RichText::new(glyph).size(16.0)))
+                        .on_hover_text(tip)
+                        .clicked()
+                };
+                let toggle = |ui: &mut egui::Ui, on: &mut bool, glyph: &str, tip: &str| {
+                    if ui
+                        .add(egui::SelectableLabel::new(
+                            *on,
+                            egui::RichText::new(glyph).size(16.0),
+                        ))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        *on = !*on;
+                    }
+                };
+
+                if icon(ui, "🗋", "New scene (Ctrl+N)") {
+                    self.action_new_scene(scene, selection, undo);
+                }
+                if icon(ui, "📂", "Open… (Ctrl+O)") {
+                    self.action_open(settings);
+                }
+                if icon(ui, "💾", "Save (Ctrl+S)") {
+                    self.action_save(scene, settings);
+                }
+                ui.separator();
+
+                if ui
+                    .add_enabled(
+                        undo.can_undo(),
+                        egui::Button::new(egui::RichText::new("↩").size(16.0)),
+                    )
+                    .on_hover_text("Undo (Ctrl+Z)")
+                    .clicked()
+                {
+                    undo.undo(scene);
+                }
+                if ui
+                    .add_enabled(
+                        undo.can_redo(),
+                        egui::Button::new(egui::RichText::new("↪").size(16.0)),
+                    )
+                    .on_hover_text("Redo (Ctrl+Shift+Z)")
+                    .clicked()
+                {
+                    undo.redo(scene);
+                }
+                ui.separator();
+
+                // transform operators on the current selection
+                let has_selection = !selection.is_empty();
+                let op = |ui: &mut egui::Ui, label: &str, tip: &str| {
+                    ui.add_enabled(
+                        has_selection,
+                        egui::Button::new(egui::RichText::new(label).size(14.0)),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                };
+                if op(ui, "↔ G", "Move selection (G)") {
+                    modal.begin_grab(scene, selection);
+                }
+                if op(ui, "⟳ R", "Rotate selection (R)") {
+                    modal.begin_rotate(scene, selection);
+                }
+                if op(ui, "↗ S", "Scale selection (S)") {
+                    modal.begin_scale(scene, selection);
+                }
+                ui.separator();
+
+                // snapping toggles
+                toggle(
+                    ui,
+                    snap_to_grid,
+                    "#",
+                    "Snap to grid: moves land on grid positions (Ctrl inverts while dragging)",
+                );
+                toggle(
+                    ui,
+                    snap_to_vertex,
+                    "⌖",
+                    "Snap to vertex: while moving, the selection snaps so its closest                      vertex lands on the vertex nearest the cursor",
+                );
+                ui.separator();
+
+                // simulation controls
+                match physics.sim_state() {
+                    SimState::Stopped => {
+                        if icon(ui, "▶", "Play physics (Space)") {
+                            physics.play(scene);
+                        }
+                    }
+                    SimState::Playing => {
+                        if icon(ui, "⏸", "Pause (Space)") {
+                            physics.pause();
+                        }
+                        if icon(ui, "⏹", "Stop & reset (Esc)") {
+                            physics.stop(scene);
+                        }
+                    }
+                    SimState::Paused => {
+                        if icon(ui, "▶", "Resume (Space)") {
+                            physics.play(scene);
+                        }
+                        if icon(ui, "⏹", "Stop & reset (Esc)") {
+                            physics.stop(scene);
+                        }
+                    }
+                }
+            });
+        });
+        response.response.rect.height()
     }
 
     fn file_menu(

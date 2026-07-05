@@ -98,6 +98,7 @@ pub fn main() {
     let mut settings = settings::Settings::load();
     let mut saved_settings = settings.clone();
     let mut snap_to_grid = false;
+    let mut snap_to_vertex = false;
     let mut grid_built =
         (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
     #[cfg(not(target_arch = "wasm32"))]
@@ -167,6 +168,7 @@ pub fn main() {
                     &mut calibrate,
                     &mut settings,
                     &mut snap_to_grid,
+                    &mut snap_to_vertex,
                     &modal_status,
                     fps,
                     mcp_status,
@@ -425,6 +427,7 @@ pub fn main() {
                 &mut sel,
                 egui_owns_keyboard,
                 snap_to_grid,
+                snap_to_vertex,
                 settings.grid_spacing,
                 settings.unit,
             );

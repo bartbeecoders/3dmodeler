@@ -144,6 +144,14 @@ pub fn draw_modal_guides(
         5.0,
     ));
 
+    // --- vertex-snap target (Blender-style snap circle) --------------------
+    if let Some(target) = guides.snap_target {
+        if let Some(pos) = project(target) {
+            painter.circle_stroke(pos, 8.0, egui::Stroke::new(2.0, GUIDE_COLOR));
+            painter.circle_filled(pos, 2.0, GUIDE_COLOR);
+        }
+    }
+
     // --- rotation arc -------------------------------------------------------
     if guides.kind == GuideKind::Rotate {
         let start = mouse(guides.start_mouse);

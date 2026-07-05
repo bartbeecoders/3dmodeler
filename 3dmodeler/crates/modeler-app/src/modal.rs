@@ -52,6 +52,13 @@ struct ModalState {
     snap: bool,
     numeric: String,
     status: String,
+    /// Vertex-snap candidates: world-space vertices of all NON-moving
+    /// objects, collected at operator start.
+    snap_candidates: Vec<Vec3>,
+    /// World-space vertices of the moving selection (at start).
+    snap_sources: Vec<Vec3>,
+    /// Snapped-to vertex this frame (drawn by the overlay).
+    snap_target: Option<Vec3>,
     /// Rotate only: the applied angle as it appears on screen (CCW positive
     /// in bottom-left-origin pixels), after snap/numeric input. Drives the
     /// overlay's rotation arc.
@@ -77,6 +84,8 @@ pub struct Guides {
     pub start_mouse: (f32, f32),
     pub cur_mouse: (f32, f32),
     pub screen_sweep: f32,
+    /// Vertex-snap target to highlight.
+    pub snap_target: Option<Vec3>,
 }
 
 pub struct ModalTransform {
@@ -133,6 +142,7 @@ impl ModalTransform {
             start_mouse: state.start_mouse,
             cur_mouse: state.cur_mouse,
             screen_sweep: state.screen_sweep,
+            snap_target: state.snap_target,
         })
     }
 
@@ -146,6 +156,7 @@ impl ModalTransform {
         selection: &mut Selection,
         egui_owns_keyboard: bool,
         snap_to_grid: bool,
+        snap_to_vertex: bool,
         grid_spacing: f32,
         unit: Unit,
     ) {
@@ -243,7 +254,7 @@ impl ModalTransform {
             return;
         }
 
-        self.apply(camera, viewport, scene, snap_to_grid, grid_spacing, unit);
+        self.apply(camera, viewport, scene, snap_to_grid, snap_to_vertex, grid_spacing, unit);
 
         if confirm {
             self.state = None; // transforms already applied
@@ -251,9 +262,19 @@ impl ModalTransform {
     }
 
     /// Start a grab on the current selection (used by the Object menu's
-    /// Duplicate, which mirrors Shift+D).
+    /// Duplicate, which mirrors Shift+D, and the toolbar).
     pub fn begin_grab(&mut self, scene: &Scene, selection: &Selection) {
         self.start(Kind::Grab, scene, selection);
+    }
+
+    /// Start a rotate on the current selection (toolbar).
+    pub fn begin_rotate(&mut self, scene: &Scene, selection: &Selection) {
+        self.start(Kind::Rotate, scene, selection);
+    }
+
+    /// Start a scale on the current selection (toolbar).
+    pub fn begin_scale(&mut self, scene: &Scene, selection: &Selection) {
+        self.start(Kind::Scale, scene, selection);
     }
 
     /// Start an operator from a typed character, or duplicate on Shift+D.
@@ -317,6 +338,34 @@ impl ModalTransform {
         let pivot = originals.iter().map(|e| e.world.location).sum::<Vec3>()
             / originals.len() as f32;
 
+        // vertex snap: moving geometry (selection + followers) vs the rest
+        let moving: Vec<ObjectId> = scene
+            .objects()
+            .iter()
+            .filter(|o| {
+                selection.is_selected(o.id)
+                    || selected.iter().any(|&s| scene.is_ancestor(s, o.id))
+            })
+            .map(|o| o.id)
+            .collect();
+        let world_verts = |id: ObjectId| -> Vec<Vec3> {
+            let Some(object) = scene.object(id) else { return Vec::new() };
+            let world = scene.world_transform(id);
+            object
+                .render_mesh()
+                .positions
+                .iter()
+                .map(|p| world.location + world.rotation * (*p * world.scale))
+                .collect()
+        };
+        let snap_candidates: Vec<Vec3> = scene
+            .objects()
+            .iter()
+            .filter(|o| o.visible && !moving.contains(&o.id))
+            .flat_map(|o| world_verts(o.id))
+            .collect();
+        let snap_sources: Vec<Vec3> = originals.iter().flat_map(|e| world_verts(e.id)).collect();
+
         self.state = Some(ModalState {
             kind,
             constraint: Constraint::Free,
@@ -329,6 +378,9 @@ impl ModalTransform {
             numeric: String::new(),
             status: String::new(),
             screen_sweep: 0.0,
+            snap_candidates,
+            snap_sources,
+            snap_target: None,
         });
     }
 
@@ -379,6 +431,7 @@ impl ModalTransform {
         viewport: Viewport,
         scene: &mut Scene,
         snap_to_grid: bool,
+        snap_to_vertex: bool,
         grid_spacing: f32,
         unit: Unit,
     ) {
@@ -419,8 +472,37 @@ impl ModalTransform {
                         delta -= axis * delta.dot(axis);
                     }
                 }
+                // vertex snap: pull the selection so its closest vertex
+                // lands on the non-moving vertex nearest to the cursor
+                state.snap_target = None;
+                let mut vertex_snapped = false;
+                if snap_to_vertex && numeric.is_none() {
+                    let screen_of = |p: Vec3| camera.world_to_screen(viewport, cg(p));
+                    if let Some((raw, target)) = vertex_snap_delta(
+                        &state.snap_candidates,
+                        &state.snap_sources,
+                        state.cur_mouse,
+                        screen_of,
+                        30.0,
+                    ) {
+                        delta = match state.constraint {
+                            Constraint::Free => raw,
+                            Constraint::Axis(i) => {
+                                let axis = axis_vec(i);
+                                axis * raw.dot(axis)
+                            }
+                            Constraint::Plane(i) => {
+                                let axis = axis_vec(i);
+                                raw - axis * raw.dot(axis)
+                            }
+                        };
+                        state.snap_target = Some(target);
+                        vertex_snapped = true;
+                    }
+                }
+
                 // grid snap: the toggle enables it, Ctrl inverts while dragging
-                let snapping = snap_to_grid != state.snap;
+                let snapping = (snap_to_grid != state.snap) && !vertex_snapped;
                 if let Some(v) = numeric {
                     // typed value: along the constrained axis, X by default,
                     // interpreted in the display unit (Preferences ▸ Units)
@@ -439,7 +521,13 @@ impl ModalTransform {
                     unit.suffix(),
                     constraint_tag,
                     numeric_tag,
-                    if snapping && numeric.is_none() { "  [snap]" } else { "" },
+                    if vertex_snapped {
+                        "  [snap: vertex]"
+                    } else if snapping && numeric.is_none() {
+                        "  [snap]"
+                    } else {
+                        ""
+                    },
                     p = unit.decimals(),
                 );
                 for entry in &state.originals {
@@ -629,4 +717,61 @@ pub fn duplicate_selection(scene: &mut Scene, selection: &mut Selection) -> bool
     let active = new_active.or_else(|| new_ids.last().copied());
     selection.set(new_ids, active);
     true
+}
+
+/// Vertex snap: find the candidate vertex nearest to the cursor (within
+/// `max_px` on screen), then the moving-source vertex nearest to it in world
+/// space (Blender's "closest"). Returns (raw delta = target - source, target).
+fn vertex_snap_delta(
+    candidates: &[Vec3],
+    sources: &[Vec3],
+    mouse: (f32, f32),
+    screen_of: impl Fn(Vec3) -> (f32, f32),
+    max_px: f32,
+) -> Option<(Vec3, Vec3)> {
+    if sources.is_empty() {
+        return None;
+    }
+    let mut target: Option<(f32, Vec3)> = None;
+    for &c in candidates {
+        let (sx, sy) = screen_of(c);
+        let d = ((sx - mouse.0).powi(2) + (sy - mouse.1).powi(2)).sqrt();
+        if d < max_px && target.is_none_or(|(bd, _)| d < bd) {
+            target = Some((d, c));
+        }
+    }
+    let (_, target) = target?;
+    let source = sources
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (*a - target)
+                .length_squared()
+                .total_cmp(&(*b - target).length_squared())
+        })?;
+    Some((target - source, target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_snap_picks_cursor_candidate_and_closest_source() {
+        // screen mapping: x/y passthrough (z ignored)
+        let screen = |p: Vec3| (p.x, p.y);
+        let candidates = vec![Vec3::new(100.0, 100.0, 0.0), Vec3::new(500.0, 500.0, 2.0)];
+        let sources = vec![Vec3::new(90.0, 90.0, 0.0), Vec3::new(400.0, 400.0, 0.0)];
+
+        // cursor near the first candidate -> snapped to it, from the nearest source
+        let (delta, target) =
+            vertex_snap_delta(&candidates, &sources, (105.0, 98.0), screen, 30.0).unwrap();
+        assert_eq!(target, Vec3::new(100.0, 100.0, 0.0));
+        assert_eq!(delta, Vec3::new(10.0, 10.0, 0.0));
+
+        // cursor far from every candidate -> no snap
+        assert!(vertex_snap_delta(&candidates, &sources, (300.0, 0.0), screen, 30.0).is_none());
+        // no moving vertices -> no snap
+        assert!(vertex_snap_delta(&candidates, &[], (105.0, 98.0), screen, 30.0).is_none());
+    }
 }
