@@ -148,6 +148,20 @@ impl PhysicsMirror {
     ) {
         let uniform = (scale.x - scale.y).abs() < 1e-6 && (scale.x - scale.z).abs() < 1e-6;
 
+        // edited meshes lose their primitive identity: collide as a convex
+        // hull of the deformed vertices
+        if object.edited_mesh.is_some() {
+            let mesh = object.collision_mesh();
+            let points: Vec<ffi::b3Vec3> =
+                mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
+            let hull = ffi::b3CreateHull(points.as_ptr(), points.len() as i32, 32);
+            if !hull.is_null() {
+                ffi::b3CreateHullShape(body, shape_def, hull);
+                ffi::b3DestroyHull(hull); // b3CreateHullShape copies
+            }
+            return;
+        }
+
         match object.primitive {
             // exact sphere when uniformly scaled
             Primitive::UvSphere { radius, .. } | Primitive::IcoSphere { radius, .. } if uniform => {

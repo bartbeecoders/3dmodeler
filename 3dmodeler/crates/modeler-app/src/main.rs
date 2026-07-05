@@ -9,6 +9,7 @@ mod axis_widget;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
 mod camera;
+mod edit_mode;
 mod grid;
 mod modal;
 mod object_ops;
@@ -63,7 +64,7 @@ pub fn selection_bounds(scene: &Scene, selection: &Selection) -> Option<(glam::V
         .iter()
         .map(|o| {
             let max_scale = o.transform.scale.abs().max_element().max(1e-6);
-            (o.transform.location - center).length() + o.primitive.bounding_radius() * max_scale
+            (o.transform.location - center).length() + o.bounding_radius() * max_scale
         })
         .fold(0.0f32, f32::max);
     Some((center, radius))
@@ -91,6 +92,7 @@ pub fn main() {
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
+    let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
     let mut settings = settings::Settings::load();
@@ -121,10 +123,26 @@ pub fn main() {
     );
 
     let mut gui = three_d::GUI::new(&context);
+    let mut egui_kb_last_frame = false;
 
     window.render_loop(move |mut frame_input| {
-        let modal_status = modal.status_line();
+        edit_mode.sync(&mut scene);
+        // claim Tab for edit mode BEFORE egui grabs it for widget-focus
+        // traversal; when a text field had focus last frame, egui keeps it
+        let mut tab_pressed = false;
+        if !egui_kb_last_frame {
+            for event in frame_input.events.iter_mut() {
+                if let Event::KeyPress { kind: Key::Tab, handled, .. } = event {
+                    if !*handled {
+                        tab_pressed = true;
+                        *handled = true;
+                    }
+                }
+            }
+        }
+        let modal_status = edit_mode.status_line().or_else(|| modal.status_line());
         let modal_guides = modal.guides();
+        let edit_overlay = edit_mode.overlay(&scene);
         let fps = 1000.0 / frame_input.elapsed_time.max(0.001) as f32;
         #[cfg(not(target_arch = "wasm32"))]
         let mcp_status = Some(control.as_ref().map(|c| c.status()));
@@ -171,6 +189,15 @@ pub fn main() {
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
                         guides,
+                    );
+                }
+                if let Some(edit) = &edit_overlay {
+                    overlay::draw_edit_mode(
+                        gui_context,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        edit,
                     );
                 }
                 add_menu.ui(gui_context, &mut scene);
@@ -226,10 +253,11 @@ pub fn main() {
         }
 
         // did egui consume the keyboard this frame (e.g. focused text field)?
-        let egui_owns_keyboard = frame_input
-            .events
-            .iter()
-            .any(|e| matches!(e, Event::KeyPress { handled: true, .. }));
+        // (Tab was pre-claimed above, so exclude it from the heuristic)
+        let egui_owns_keyboard = frame_input.events.iter().any(|e| {
+            matches!(e, Event::KeyPress { handled: true, kind, .. } if *kind != Key::Tab)
+        });
+        egui_kb_last_frame = egui_owns_keyboard;
 
         // Ctrl+S save / Ctrl+O open / Ctrl+N new / Ctrl+Z undo /
         // Ctrl+Shift+Z or Ctrl+Y redo (note: physical key position on web —
@@ -348,8 +376,21 @@ pub fn main() {
             }
         }
 
+        // edit mode (Tab): element selection & moves on the active object
+        edit_mode.handle_events(
+            &mut frame_input.events,
+            &camera,
+            frame_input.viewport,
+            &mut scene,
+            &sel,
+            egui_owns_keyboard,
+            tab_pressed,
+            physics.is_stopped(),
+            settings.unit,
+        );
+
         // Space = play/pause, Esc = stop (when not editing)
-        if !modal.active() {
+        if !modal.active() && !edit_mode.active() {
             for event in frame_input.events.iter_mut() {
                 if let Event::KeyPress { kind, handled, .. } = event {
                     match kind {
@@ -373,7 +414,8 @@ pub fn main() {
         }
 
         // editing tools are disabled while the simulation owns the transforms
-        if physics.is_stopped() {
+        // and while edit mode owns the object
+        if physics.is_stopped() && !edit_mode.active() {
             // modal transform operators get first claim on input after the UI
             modal.handle_events(
                 &mut frame_input.events,
@@ -390,7 +432,7 @@ pub fn main() {
 
         ui_state.handle_events(&mut frame_input.events, egui_owns_keyboard, pointer_over_ui);
 
-        if !modal.active() && physics.is_stopped() {
+        if !modal.active() && physics.is_stopped() && !edit_mode.active() {
             delete_tool.handle_events(
                 &mut frame_input.events,
                 frame_input.viewport,
@@ -420,7 +462,7 @@ pub fn main() {
         sel.retain_existing(|id| scene.object(id).is_some());
 
         // batch this frame's edits into undo checkpoints once things go quiet
-        undo.on_frame(&scene, modal.active() || !physics.is_stopped());
+        undo.on_frame(&scene, modal.active() || edit_mode.grabbing() || !physics.is_stopped());
 
         // overlap warning while placing (grab/rotate/scale active)
         let overlaps = if modal.active() {
@@ -429,8 +471,11 @@ pub fn main() {
             std::collections::HashSet::new()
         };
 
-        // viewport click selection (box3d ray cast)
+        // viewport click selection (box3d ray cast) — object mode only
         for event in frame_input.events.iter_mut() {
+            if edit_mode.active() {
+                break;
+            }
             if let Event::MousePress {
                 button: MouseButton::Left,
                 position,

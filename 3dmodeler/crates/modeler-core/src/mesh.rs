@@ -3,11 +3,13 @@
 //! and torus in the XY plane).
 
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 
 /// Triangle mesh with per-vertex normals, ready for upload by the renderer.
-#[derive(Debug, Clone, Default)]
+/// Serializable so edited meshes can live in scene files.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeshData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
@@ -32,6 +34,27 @@ impl MeshData {
             out.indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
         out
+    }
+
+    /// Recompute normals from the current positions: every vertex gets the
+    /// average of its triangles' face normals. Flat-shaded meshes keep flat
+    /// faces (their vertices are unshared, so the average is one triangle);
+    /// smooth meshes stay smooth. Call after moving vertices.
+    pub fn recompute_normals(&mut self) {
+        self.normals.clear();
+        self.normals.resize(self.positions.len(), Vec3::ZERO);
+        for tri in self.indices.chunks_exact(3) {
+            let a = self.positions[tri[0] as usize];
+            let b = self.positions[tri[1] as usize];
+            let c = self.positions[tri[2] as usize];
+            let n = (b - a).cross(c - a); // area-weighted
+            for &i in tri {
+                self.normals[i as usize] += n;
+            }
+        }
+        for n in &mut self.normals {
+            *n = n.normalize_or_zero();
+        }
     }
 
     fn quad(&mut self, a: u32, b: u32, c: u32, d: u32) {

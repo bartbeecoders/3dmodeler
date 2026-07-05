@@ -186,6 +186,72 @@ pub fn draw_modal_guides(
     }
 }
 
+/// Edit-mode visuals: the object's wireframe (sharp edges), its vertices in
+/// vertex mode, and the selected element highlighted in orange.
+pub fn draw_edit_mode(
+    ctx: &egui::Context,
+    camera: &BlenderCamera,
+    viewport: Viewport,
+    device_pixel_ratio: f32,
+    overlay: &crate::edit_mode::EditOverlay,
+) {
+    use crate::edit_mode::SelectedShape;
+    const WIRE: egui::Color32 = egui::Color32::from_rgba_premultiplied(150, 160, 175, 200);
+    const VERT: egui::Color32 = egui::Color32::from_rgb(210, 215, 225);
+    const SELECTED: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
+
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
+
+    for &(a, b) in &overlay.edges {
+        if let (Some(a), Some(b)) = (project(a), project(b)) {
+            painter.line_segment([a, b], egui::Stroke::new(1.0, WIRE));
+        }
+    }
+    for &v in &overlay.verts {
+        if let Some(p) = project(v) {
+            painter.circle_filled(p, 2.5, VERT);
+        }
+    }
+    match &overlay.selected {
+        Some(SelectedShape::Point(v)) => {
+            if let Some(p) = project(*v) {
+                painter.circle_filled(p, 5.0, SELECTED);
+            }
+        }
+        Some(SelectedShape::Line(a, b)) => {
+            if let (Some(a), Some(b)) = (project(*a), project(*b)) {
+                painter.line_segment([a, b], egui::Stroke::new(3.0, SELECTED));
+                painter.circle_filled(a, 3.5, SELECTED);
+                painter.circle_filled(b, 3.5, SELECTED);
+            }
+        }
+        Some(SelectedShape::Polygon { tris, outline }) => {
+            let fill = egui::Color32::from_rgba_premultiplied(120, 80, 30, 90);
+            let mut mesh = egui::Mesh::default();
+            for tri in tris {
+                let (Some(a), Some(b), Some(c)) =
+                    (project(tri[0]), project(tri[1]), project(tri[2]))
+                else {
+                    continue;
+                };
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(a, fill);
+                mesh.colored_vertex(b, fill);
+                mesh.colored_vertex(c, fill);
+                mesh.add_triangle(base, base + 1, base + 2);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            for &(a, b) in outline {
+                if let (Some(a), Some(b)) = (project(a), project(b)) {
+                    painter.line_segment([a, b], egui::Stroke::new(2.0, SELECTED));
+                }
+            }
+        }
+        None => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     ctx: &egui::Context,
@@ -254,7 +320,7 @@ pub fn draw(
         }
         let world = scene.world_transform(object.id);
         let top = world.location
-            + Vec3::Z * (object.primitive.bounding_radius() * world.scale.z.abs() + 0.15);
+            + Vec3::Z * (object.bounding_radius() * world.scale.z.abs() + 0.15);
         let Some(anchor) = project(top) else { continue };
 
         let mut y = anchor.y;

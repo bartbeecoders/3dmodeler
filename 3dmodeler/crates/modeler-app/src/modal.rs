@@ -607,6 +607,7 @@ pub fn duplicate_selection(scene: &mut Scene, selection: &mut Selection) -> bool
             object.parent = source.parent; // remapped below if inside the set
             object.show_label = source.show_label;
             object.show_dimensions = source.show_dimensions;
+            object.edited_mesh = source.edited_mesh.clone();
         }
         id_map.insert(source.id, id);
         if selection.active() == Some(source.id) {

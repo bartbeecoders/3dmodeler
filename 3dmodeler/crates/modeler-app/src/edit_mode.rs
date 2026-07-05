@@ -1,0 +1,796 @@
+//! Blender-style object edit mode.
+//!
+//! Tab enters/leaves edit mode on the active object. Inside, the selection
+//! mode is vertex / edge / face — picked with 1 / 2 / 3, matched on the
+//! TYPED character so AZERTY's unshifted & / é / " work too. Click selects
+//! an element, G moves it (X/Y/Z constrain to an axis, LMB/Enter confirm,
+//! RMB/Esc cancel). The first edit bakes the primitive into an editable
+//! mesh stored on the object (saved with the scene).
+//!
+//! Topology is a welded view of the triangle mesh: coincident vertices are
+//! merged, faces are connected coplanar triangle groups (a cube shows 6
+//! faces, not 12 triangles) and edges are the boundaries between groups.
+
+use crate::camera::BlenderCamera;
+use crate::selection::Selection;
+use crate::settings::Unit;
+use modeler_core::glam::Vec3;
+use modeler_core::{MeshData, ObjectId, Scene, Transform};
+use three_d::{Event, Key, MouseButton, Viewport};
+
+const VERTEX_PICK_PX: f32 = 14.0;
+const EDGE_PICK_PX: f32 = 10.0;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectMode {
+    Vertex,
+    Edge,
+    Face,
+}
+
+impl SelectMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SelectMode::Vertex => "Vertex",
+            SelectMode::Edge => "Edge",
+            SelectMode::Face => "Face",
+        }
+    }
+}
+
+/// A selected element, in welded-topology indices.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Element {
+    Vertex(usize),
+    /// Welded vertex pair, sorted.
+    Edge(usize, usize),
+    /// Index into `Topology::faces`.
+    Face(usize),
+}
+
+/// One face of the welded topology: a connected, coplanar triangle group.
+pub struct FaceGroup {
+    pub tris: Vec<usize>,
+    pub verts: Vec<usize>,
+    /// Boundary edges (welded pairs) for drawing the outline.
+    pub outline: Vec<(usize, usize)>,
+}
+
+/// Welded view of a triangle mesh.
+pub struct Topology {
+    /// Unique positions (local space).
+    pub verts: Vec<Vec3>,
+    /// Welded index per mesh-position index.
+    pub weld_of: Vec<usize>,
+    /// Welded corner ids per triangle.
+    pub tris: Vec<[usize; 3]>,
+    pub faces: Vec<FaceGroup>,
+    /// Sharp edges: boundaries of the face groups, deduplicated.
+    pub edges: Vec<(usize, usize)>,
+}
+
+fn weld_key(p: Vec3) -> (i64, i64, i64) {
+    let q = 1.0 / 1e-5;
+    ((p.x * q).round() as i64, (p.y * q).round() as i64, (p.z * q).round() as i64)
+}
+
+pub fn build_topology(mesh: &MeshData) -> Topology {
+    use std::collections::HashMap;
+
+    let mut key_to_weld: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut verts: Vec<Vec3> = Vec::new();
+    let mut weld_of: Vec<usize> = Vec::with_capacity(mesh.positions.len());
+    for &p in &mesh.positions {
+        let id = *key_to_weld.entry(weld_key(p)).or_insert_with(|| {
+            verts.push(p);
+            verts.len() - 1
+        });
+        weld_of.push(id);
+    }
+
+    let tris: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| [weld_of[t[0] as usize], weld_of[t[1] as usize], weld_of[t[2] as usize]])
+        .collect();
+    let tri_normal = |t: &[usize; 3]| -> Vec3 {
+        (verts[t[1]] - verts[t[0]])
+            .cross(verts[t[2]] - verts[t[0]])
+            .normalize_or_zero()
+    };
+    let normals: Vec<Vec3> = tris.iter().map(tri_normal).collect();
+
+    // adjacency: welded edge -> triangles using it
+    let edge_key = |a: usize, b: usize| (a.min(b), a.max(b));
+    let mut edge_tris: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (ti, t) in tris.iter().enumerate() {
+        for k in 0..3 {
+            edge_tris.entry(edge_key(t[k], t[(k + 1) % 3])).or_default().push(ti);
+        }
+    }
+
+    // faces: flood-fill connected triangles with matching normals
+    let mut face_of = vec![usize::MAX; tris.len()];
+    let mut faces: Vec<FaceGroup> = Vec::new();
+    for seed in 0..tris.len() {
+        if face_of[seed] != usize::MAX {
+            continue;
+        }
+        let face_index = faces.len();
+        let mut stack = vec![seed];
+        let mut members = Vec::new();
+        face_of[seed] = face_index;
+        while let Some(ti) = stack.pop() {
+            members.push(ti);
+            let t = tris[ti];
+            for k in 0..3 {
+                for &other in &edge_tris[&edge_key(t[k], t[(k + 1) % 3])] {
+                    if face_of[other] == usize::MAX
+                        && normals[other].dot(normals[seed]) > 0.9995
+                    {
+                        face_of[other] = face_index;
+                        stack.push(other);
+                    }
+                }
+            }
+        }
+        // boundary edges: used by exactly one triangle of this group
+        let mut edge_use: HashMap<(usize, usize), u32> = HashMap::new();
+        for &ti in &members {
+            let t = tris[ti];
+            for k in 0..3 {
+                *edge_use.entry(edge_key(t[k], t[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        let outline: Vec<(usize, usize)> =
+            edge_use.iter().filter(|(_, &n)| n == 1).map(|(&e, _)| e).collect();
+        let mut group_verts: Vec<usize> = members.iter().flat_map(|&ti| tris[ti]).collect();
+        group_verts.sort_unstable();
+        group_verts.dedup();
+        faces.push(FaceGroup { tris: members, verts: group_verts, outline });
+    }
+
+    // sharp edges = union of all face outlines
+    let mut edges: Vec<(usize, usize)> = faces.iter().flat_map(|f| f.outline.iter().copied()).collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    Topology { verts, weld_of, tris, faces, edges }
+}
+
+struct Grab {
+    /// Affected welded ids with their original local positions.
+    originals: Vec<(usize, Vec3)>,
+    start_mouse: (f32, f32),
+    cur_mouse: (f32, f32),
+    /// None = screen plane, Some(axis) = world axis constraint.
+    constraint: Option<usize>,
+    /// World-space pivot at grab start (for world-per-pixel scaling).
+    pivot_world: Vec3,
+    status: String,
+}
+
+pub struct EditMode {
+    active: Option<ObjectId>,
+    pub mode: SelectMode,
+    selected: Option<Element>,
+    topo: Option<Topology>,
+    topo_revision: u64,
+    grab: Option<Grab>,
+    last_mouse: (f32, f32),
+}
+
+fn gv(v: three_d::Vec3) -> Vec3 {
+    Vec3::new(v.x, v.y, v.z)
+}
+
+fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
+    t.location + t.rotation * (p * t.scale)
+}
+
+impl EditMode {
+    pub fn new() -> Self {
+        Self {
+            active: None,
+            mode: SelectMode::Face,
+            selected: None,
+            topo: None,
+            topo_revision: 0,
+            grab: None,
+            last_mouse: (0.0, 0.0),
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn grabbing(&self) -> bool {
+        self.grab.is_some()
+    }
+
+    /// Status-bar line while edit mode is on.
+    pub fn status_line(&self) -> Option<String> {
+        let _ = self.active?;
+        Some(match &self.grab {
+            Some(grab) => grab.status.clone(),
+            None => format!(
+                "EDIT MODE ({}) · click select · G move · 1/2/3 vertex/edge/face · Tab exit",
+                self.mode.label()
+            ),
+        })
+    }
+
+    /// Leave edit mode (also called when the object vanishes).
+    pub fn exit(&mut self, scene: &mut Scene) {
+        if let Some(grab) = self.grab.take() {
+            self.cancel_grab_inner(scene, grab);
+        }
+        self.active = None;
+        self.selected = None;
+        self.topo = None;
+    }
+
+    fn enter(&mut self, id: ObjectId, scene: &Scene) {
+        self.active = Some(id);
+        self.selected = None;
+        self.grab = None;
+        self.rebuild_topology(scene);
+    }
+
+    fn rebuild_topology(&mut self, scene: &Scene) {
+        let Some(object) = self.active.and_then(|id| scene.object(id)) else {
+            self.topo = None;
+            return;
+        };
+        self.topo = Some(build_topology(&object.render_mesh()));
+        self.topo_revision = object.mesh_revision;
+    }
+
+    /// Keep state consistent with the scene (object deleted, mesh changed
+    /// by undo, …). Call once per frame before handling events.
+    pub fn sync(&mut self, scene: &mut Scene) {
+        let Some(id) = self.active else { return };
+        match scene.object(id) {
+            None => self.exit(scene),
+            Some(object) => {
+                if object.mesh_revision != self.topo_revision || self.topo.is_none() {
+                    if self.grab.is_none() {
+                        let sel = self.selected;
+                        self.rebuild_topology(scene);
+                        // keep the selection if it still exists
+                        self.selected = sel.filter(|e| self.element_exists(*e));
+                    }
+                }
+            }
+        }
+    }
+
+    fn element_exists(&self, element: Element) -> bool {
+        let Some(topo) = &self.topo else { return false };
+        match element {
+            Element::Vertex(v) => v < topo.verts.len(),
+            Element::Edge(a, b) => a < topo.verts.len() && b < topo.verts.len(),
+            Element::Face(f) => f < topo.faces.len(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_events(
+        &mut self,
+        events: &mut [Event],
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        scene: &mut Scene,
+        selection: &Selection,
+        egui_owns_keyboard: bool,
+        tab_pressed: bool,
+        sim_stopped: bool,
+        unit: Unit,
+    ) {
+        // Tab (pre-claimed in main before egui) toggles edit mode
+        if tab_pressed && sim_stopped {
+            if self.active.is_some() {
+                self.exit(scene);
+            } else if let Some(id) = selection.active() {
+                self.enter(id, scene);
+            }
+        }
+        if self.active.is_none() {
+            return;
+        }
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut click: Option<(f32, f32)> = None;
+
+        for event in events.iter_mut() {
+            match event {
+                Event::MouseMotion { position, handled, .. } => {
+                    self.last_mouse = (position.x, position.y);
+                    if let Some(grab) = &mut self.grab {
+                        grab.cur_mouse = self.last_mouse;
+                        *handled = true;
+                    }
+                }
+                Event::MousePress { button, position, handled, .. }
+                    if !*handled && *button != MouseButton::Middle =>
+                {
+                    self.last_mouse = (position.x, position.y);
+                    if self.grab.is_some() {
+                        match button {
+                            MouseButton::Left => confirm = true,
+                            MouseButton::Right => cancel = true,
+                            MouseButton::Middle => {}
+                        }
+                    } else if *button == MouseButton::Left {
+                        click = Some((position.x, position.y));
+                    }
+                    *handled = true;
+                }
+                Event::MouseRelease { button, handled, .. }
+                    if self.grab.is_some() && *button != MouseButton::Middle =>
+                {
+                    *handled = true;
+                }
+                Event::KeyPress { kind, handled, .. } if !*handled && !egui_owns_keyboard => {
+                    match kind {
+                        Key::Enter if self.grab.is_some() => {
+                            confirm = true;
+                            *handled = true;
+                        }
+                        Key::Escape if self.grab.is_some() => {
+                            cancel = true;
+                            *handled = true;
+                        }
+                        // the tool owns the keyboard while grabbing (digits
+                        // are camera views otherwise)
+                        _ if self.grab.is_some() => *handled = true,
+                        _ => {}
+                    }
+                }
+                Event::Text(text) if !egui_owns_keyboard && !text.is_empty() => {
+                    let consumed = self.text_input(text.as_str(), scene);
+                    if consumed {
+                        text.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if cancel {
+            if let Some(grab) = self.grab.take() {
+                self.cancel_grab_inner(scene, grab);
+            }
+        }
+        if let Some((x, y)) = click {
+            self.pick(scene, camera, viewport, x, y);
+        }
+        self.apply_grab(scene, camera, viewport, unit);
+        if confirm {
+            self.grab = None; // positions already applied
+        }
+    }
+
+    /// Typed characters: selection modes (AZERTY unshifted digits included)
+    /// and G. Returns true when consumed.
+    fn text_input(&mut self, text: &str, scene: &mut Scene) -> bool {
+        match text {
+            // 1 / 2 / 3 — AZERTY types & / é / " without shift
+            "1" | "&" => {
+                self.set_mode(SelectMode::Vertex);
+                true
+            }
+            "2" | "é" => {
+                self.set_mode(SelectMode::Edge);
+                true
+            }
+            "3" | "\"" => {
+                self.set_mode(SelectMode::Face);
+                true
+            }
+            "g" | "G" => {
+                self.start_grab(scene);
+                true
+            }
+            // swallow the object-mode tools so they can't fire mid-edit
+            "r" | "R" | "s" | "S" | "x" | "X" | "y" | "Y" | "z" | "Z" | "D" => {
+                if self.grab.is_some() {
+                    self.grab_constraint(text);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn set_mode(&mut self, mode: SelectMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.selected = None;
+        }
+    }
+
+    fn grab_constraint(&mut self, text: &str) {
+        let Some(grab) = &mut self.grab else { return };
+        let axis = match text.to_ascii_lowercase().as_str() {
+            "x" => Some(0),
+            "y" => Some(1),
+            "z" => Some(2),
+            _ => return,
+        };
+        grab.constraint = if grab.constraint == axis { None } else { axis };
+    }
+
+    // --- picking -----------------------------------------------------------
+
+    fn pick(
+        &mut self,
+        scene: &Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        x: f32,
+        y: f32,
+    ) {
+        let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
+        let Some(topo) = &self.topo else { return };
+        let world = scene.world_transform(object.id);
+        let to_screen = |p: Vec3| -> (f32, f32) {
+            let w = local_to_world(&world, p);
+            camera.world_to_screen(viewport, three_d::vec3(w.x, w.y, w.z))
+        };
+
+        self.selected = match self.mode {
+            SelectMode::Vertex => {
+                let mut best: Option<(f32, usize)> = None;
+                for (i, &v) in topo.verts.iter().enumerate() {
+                    let (sx, sy) = to_screen(v);
+                    let d = ((sx - x).powi(2) + (sy - y).powi(2)).sqrt();
+                    if d < VERTEX_PICK_PX && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, i));
+                    }
+                }
+                best.map(|(_, i)| Element::Vertex(i))
+            }
+            SelectMode::Edge => {
+                let mut best: Option<(f32, (usize, usize))> = None;
+                for &(a, b) in &topo.edges {
+                    let pa = to_screen(topo.verts[a]);
+                    let pb = to_screen(topo.verts[b]);
+                    let d = point_segment_distance((x, y), pa, pb);
+                    if d < EDGE_PICK_PX && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, (a, b)));
+                    }
+                }
+                best.map(|(_, (a, b))| Element::Edge(a, b))
+            }
+            SelectMode::Face => {
+                // ray-cast the object's triangles in world space
+                let (origin, direction) = camera.pick_ray(viewport, x, y);
+                let (origin, direction) = (gv(origin), gv(direction));
+                let mut best: Option<(f32, usize)> = None;
+                for (ti, t) in topo.tris.iter().enumerate() {
+                    let a = local_to_world(&world, topo.verts[t[0]]);
+                    let b = local_to_world(&world, topo.verts[t[1]]);
+                    let c = local_to_world(&world, topo.verts[t[2]]);
+                    if let Some(hit) = ray_triangle(origin, direction, a, b, c) {
+                        if best.is_none_or(|(bt, _)| hit < bt) {
+                            best = Some((hit, ti));
+                        }
+                    }
+                }
+                best.map(|(_, ti)| {
+                    Element::Face(
+                        self.topo
+                            .as_ref()
+                            .unwrap()
+                            .faces
+                            .iter()
+                            .position(|f| f.tris.contains(&ti))
+                            .unwrap_or(0),
+                    )
+                })
+            }
+        };
+    }
+
+    // --- grab (move) --------------------------------------------------------
+
+    fn affected_verts(&self) -> Vec<usize> {
+        let Some(topo) = &self.topo else { return Vec::new() };
+        match self.selected {
+            Some(Element::Vertex(v)) => vec![v],
+            Some(Element::Edge(a, b)) => vec![a, b],
+            Some(Element::Face(f)) => topo.faces.get(f).map(|g| g.verts.clone()).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    fn start_grab(&mut self, scene: &mut Scene) {
+        if self.grab.is_some() {
+            return;
+        }
+        let affected = self.affected_verts();
+        if affected.is_empty() {
+            return;
+        }
+        let Some(id) = self.active else { return };
+        // first edit bakes the primitive into an editable mesh
+        let needs_bake = scene.object(id).is_some_and(|o| o.edited_mesh.is_none());
+        if needs_bake {
+            let mesh = scene.object(id).unwrap().render_mesh();
+            if let Some(object) = scene.object_mut(id) {
+                object.edited_mesh = Some(mesh);
+            }
+        }
+        let Some(topo) = &self.topo else { return };
+        let world = scene.world_transform(id);
+        let centroid = affected.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+            / affected.len() as f32;
+        self.grab = Some(Grab {
+            originals: affected.iter().map(|&v| (v, topo.verts[v])).collect(),
+            start_mouse: self.last_mouse,
+            cur_mouse: self.last_mouse,
+            constraint: None,
+            pivot_world: local_to_world(&world, centroid),
+            status: String::new(),
+        });
+    }
+
+    fn apply_grab(
+        &mut self,
+        scene: &mut Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        unit: Unit,
+    ) {
+        let Some(id) = self.active else { return };
+        let Some(grab) = &mut self.grab else { return };
+
+        let world = scene.world_transform(id);
+        let (right, up, _) = camera.screen_basis();
+        let (right, up) = (gv(right), gv(up));
+        let wpp = camera.world_per_pixel_at(
+            viewport,
+            three_d::vec3(grab.pivot_world.x, grab.pivot_world.y, grab.pivot_world.z),
+        );
+        let dx = grab.cur_mouse.0 - grab.start_mouse.0;
+        let dy = grab.cur_mouse.1 - grab.start_mouse.1;
+        let mut delta = right * (dx * wpp) + up * (dy * wpp);
+        if let Some(axis) = grab.constraint {
+            let a = [Vec3::X, Vec3::Y, Vec3::Z][axis];
+            delta = a * delta.dot(a);
+        }
+
+        let shown = delta * unit.per_meter();
+        grab.status = format!(
+            "Move {}: ({:.p$}, {:.p$}, {:.p$}) {}{}   |   LMB/Enter confirm · RMB/Esc cancel",
+            match self.selected {
+                Some(Element::Vertex(_)) => "vertex",
+                Some(Element::Edge(..)) => "edge",
+                Some(Element::Face(_)) => "face",
+                None => "?",
+            },
+            shown.x,
+            shown.y,
+            shown.z,
+            unit.suffix(),
+            match grab.constraint {
+                Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
+                None => String::new(),
+            },
+            p = unit.decimals(),
+        );
+
+        // world delta -> local delta (mesh positions are local)
+        let inv_rot = world.rotation.inverse();
+        let safe_scale = Vec3::new(
+            if world.scale.x.abs() < 1e-9 { 1.0 } else { world.scale.x },
+            if world.scale.y.abs() < 1e-9 { 1.0 } else { world.scale.y },
+            if world.scale.z.abs() < 1e-9 { 1.0 } else { world.scale.z },
+        );
+        let local_delta = (inv_rot * delta) / safe_scale;
+
+        let originals = grab.originals.clone();
+        self.write_positions(scene, &originals, local_delta);
+    }
+
+    /// Move welded vertices to original + delta, update the topology copy
+    /// and the object's mesh (all duplicated mesh vertices follow).
+    fn write_positions(
+        &mut self,
+        scene: &mut Scene,
+        originals: &[(usize, Vec3)],
+        local_delta: Vec3,
+    ) {
+        let Some(id) = self.active else { return };
+        let Some(topo) = &mut self.topo else { return };
+        let Some(object) = scene.object_mut(id) else { return };
+        let Some(mesh) = &mut object.edited_mesh else { return };
+
+        for &(weld, original) in originals {
+            let new_pos = original + local_delta;
+            topo.verts[weld] = new_pos;
+            for (i, &w) in topo.weld_of.iter().enumerate() {
+                if w == weld {
+                    mesh.positions[i] = new_pos;
+                }
+            }
+        }
+        mesh.recompute_normals();
+        object.mesh_revision += 1;
+        self.topo_revision = object.mesh_revision;
+    }
+
+    fn cancel_grab_inner(&mut self, scene: &mut Scene, grab: Grab) {
+        self.write_positions(scene, &grab.originals, Vec3::ZERO);
+    }
+
+    // --- overlay data --------------------------------------------------------
+
+    /// World-space geometry for the viewport overlay.
+    pub fn overlay(&self, scene: &Scene) -> Option<EditOverlay> {
+        let object = self.active.and_then(|id| scene.object(id))?;
+        let topo = self.topo.as_ref()?;
+        let world = scene.world_transform(object.id);
+        let vert = |v: usize| local_to_world(&world, topo.verts[v]);
+
+        let edges: Vec<(Vec3, Vec3)> =
+            topo.edges.iter().map(|&(a, b)| (vert(a), vert(b))).collect();
+        let verts: Vec<Vec3> = match self.mode {
+            SelectMode::Vertex => topo.verts.iter().enumerate().map(|(i, _)| vert(i)).collect(),
+            _ => Vec::new(),
+        };
+        let selected = self.selected.map(|element| match element {
+            Element::Vertex(v) => SelectedShape::Point(vert(v)),
+            Element::Edge(a, b) => SelectedShape::Line(vert(a), vert(b)),
+            Element::Face(f) => {
+                let group = &topo.faces[f];
+                SelectedShape::Polygon {
+                    tris: group
+                        .tris
+                        .iter()
+                        .map(|&ti| {
+                            let t = topo.tris[ti];
+                            [vert(t[0]), vert(t[1]), vert(t[2])]
+                        })
+                        .collect(),
+                    outline: group.outline.iter().map(|&(a, b)| (vert(a), vert(b))).collect(),
+                }
+            }
+        });
+        Some(EditOverlay { edges, verts, selected })
+    }
+}
+
+/// What the overlay should draw, world space.
+pub struct EditOverlay {
+    pub edges: Vec<(Vec3, Vec3)>,
+    pub verts: Vec<Vec3>,
+    pub selected: Option<SelectedShape>,
+}
+
+pub enum SelectedShape {
+    Point(Vec3),
+    Line(Vec3, Vec3),
+    Polygon { tris: Vec<[Vec3; 3]>, outline: Vec<(Vec3, Vec3)> },
+}
+
+fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (px, py) = p;
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 < 1e-9 {
+        0.0
+    } else {
+        (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (ax + t * dx, ay + t * dy);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// Möller–Trumbore; returns t along the ray.
+fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let e1 = b - a;
+    let e2 = c - a;
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = origin - a;
+    let u = s.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > 1e-5).then_some(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modeler_core::Primitive;
+
+    #[test]
+    fn cube_topology_welds_to_blender_counts() {
+        let mesh = Primitive::Cube { size: 2.0 }.generate(false); // flat: 24 verts
+        let topo = build_topology(&mesh);
+        assert_eq!(topo.verts.len(), 8, "welded corners");
+        assert_eq!(topo.faces.len(), 6, "coplanar quads, not 12 triangles");
+        assert_eq!(topo.edges.len(), 12, "sharp edges, no diagonals");
+        for face in &topo.faces {
+            assert_eq!(face.verts.len(), 4);
+            assert_eq!(face.outline.len(), 4);
+        }
+    }
+
+    #[test]
+    fn moving_a_welded_vertex_moves_all_duplicates() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mesh = scene.object(id).unwrap().render_mesh();
+        scene.object_mut(id).unwrap().edited_mesh = Some(mesh);
+
+        let mut edit = EditMode::new();
+        edit.active = Some(id);
+        edit.rebuild_topology(&scene);
+
+        // pick the corner at (1,1,1) and move it +0.5 in z
+        let topo = edit.topo.as_ref().unwrap();
+        let corner = topo
+            .verts
+            .iter()
+            .position(|v| (*v - Vec3::ONE).length() < 1e-4)
+            .expect("corner");
+        let originals = vec![(corner, Vec3::ONE)];
+        edit.write_positions(&mut scene, &originals, Vec3::new(0.0, 0.0, 0.5));
+
+        let mesh = scene.object(id).unwrap().edited_mesh.as_ref().unwrap();
+        let moved: Vec<&Vec3> = mesh
+            .positions
+            .iter()
+            .filter(|p| (**p - Vec3::new(1.0, 1.0, 1.5)).length() < 1e-4)
+            .collect();
+        assert!(moved.len() >= 3, "every duplicated corner copy must move");
+        assert!(
+            !mesh.positions.iter().any(|p| (*p - Vec3::ONE).length() < 1e-4),
+            "no copy may remain at the old position"
+        );
+        // normals were recomputed and stay unit length
+        assert!(mesh.normals.iter().all(|n| (n.length() - 1.0).abs() < 1e-3));
+        // revision bumped so caches resync
+        assert_eq!(scene.object(id).unwrap().mesh_revision, 1);
+    }
+
+    #[test]
+    fn ray_triangle_hits_and_misses() {
+        let a = Vec3::new(-1.0, -1.0, 0.0);
+        let b = Vec3::new(1.0, -1.0, 0.0);
+        let c = Vec3::new(0.0, 1.0, 0.0);
+        let hit = ray_triangle(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0), a, b, c);
+        assert!((hit.unwrap() - 5.0).abs() < 1e-5);
+        let miss = ray_triangle(Vec3::new(5.0, 5.0, 5.0), Vec3::new(0.0, 0.0, -1.0), a, b, c);
+        assert!(miss.is_none());
+    }
+
+    #[test]
+    fn sphere_face_groups_follow_smooth_surface() {
+        // a smooth uv-sphere has no coplanar neighbors: every quad/tri is its
+        // own face and every edge is sharp — the tool still works, it just
+        // shows the true tessellation
+        let mesh = Primitive::UvSphere { segments: 8, rings: 4, radius: 1.0 }.generate(false);
+        let topo = build_topology(&mesh);
+        assert!(topo.faces.len() > 8);
+        assert!(!topo.edges.is_empty());
+    }
+}

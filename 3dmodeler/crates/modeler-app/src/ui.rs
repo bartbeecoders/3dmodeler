@@ -841,6 +841,9 @@ impl UiState {
                         ("Ctrl (modal)", "Snap 1 m / 5° / 0.1"),
                         ("Shift+D", "Duplicate"),
                         ("X / Delete", "Delete (confirm / immediate)"),
+                        ("Tab", "Object edit mode (active object)"),
+                        ("1 / 2 / 3 (edit)", "Vertex / Edge / Face select"),
+                        ("G (edit)", "Move selected element (X/Y/Z axis)"),
                         ("N", "Toggle sidebar"),
                         ("Space", "Play / pause physics"),
                         ("Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y", "Undo / redo"),
@@ -1316,12 +1319,30 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
             changed |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
         });
 
-    egui::CollapsingHeader::new("Primitive")
-        .default_open(true)
-        .show(ui, |ui| {
-            changed |= primitive_params(ui, &mut primitive);
-            changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
-        });
+    let mut revert_mesh = false;
+    if let Some(mesh) = &object.edited_mesh {
+        let (verts, tris) = (mesh.positions.len(), mesh.indices.len() / 3);
+        egui::CollapsingHeader::new("Mesh (edited)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{verts} vertices · {tris} triangles"))
+                        .weak()
+                        .size(11.0),
+                );
+                revert_mesh = ui
+                    .button("Revert to primitive")
+                    .on_hover_text("Discard all mesh edits and restore the parametric shape")
+                    .clicked();
+            });
+    } else {
+        egui::CollapsingHeader::new("Primitive")
+            .default_open(true)
+            .show(ui, |ui| {
+                changed |= primitive_params(ui, &mut primitive);
+                changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+            });
+    }
 
     egui::CollapsingHeader::new("Adornments")
         .default_open(false)
@@ -1376,6 +1397,12 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
             object.density = phys.1;
             object.show_label = adorn.0;
             object.show_dimensions = adorn.1;
+        }
+    }
+    if revert_mesh {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.edited_mesh = None;
+            object.mesh_revision += 1;
         }
     }
 }

@@ -212,6 +212,44 @@ pub struct Object {
     pub show_label: bool,
     #[serde(default)]
     pub show_dimensions: bool,
+    /// Result of mesh editing (Tab edit mode): when present it replaces the
+    /// primitive's generated mesh. Local space, saved with the scene.
+    #[serde(default)]
+    pub edited_mesh: Option<MeshData>,
+    /// Bumped on every mesh edit so caches (renderer, physics) resync.
+    /// Not saved: a fresh session starts with fresh caches anyway.
+    #[serde(skip)]
+    pub mesh_revision: u64,
+}
+
+impl Object {
+    /// The mesh to draw: the edited mesh if any, else the primitive.
+    pub fn render_mesh(&self) -> MeshData {
+        match &self.edited_mesh {
+            Some(mesh) => mesh.clone(),
+            None => self.primitive.generate(self.smooth),
+        }
+    }
+
+    /// The mesh for collision building (shared-vertex topology preferred).
+    pub fn collision_mesh(&self) -> MeshData {
+        match &self.edited_mesh {
+            Some(mesh) => mesh.clone(),
+            None => self.primitive.generate(true),
+        }
+    }
+
+    /// Radius of the bounding sphere around the local origin.
+    pub fn bounding_radius(&self) -> f32 {
+        match &self.edited_mesh {
+            Some(mesh) => mesh
+                .positions
+                .iter()
+                .map(|p| p.length())
+                .fold(0.0f32, f32::max),
+            None => self.primitive.bounding_radius(),
+        }
+    }
 }
 
 /// A ruler measurement between two world-space points.
@@ -342,6 +380,8 @@ impl Scene {
             parent: None,
             show_label: false,
             show_dimensions: false,
+            edited_mesh: None,
+            mesh_revision: 0,
         });
         id
     }
@@ -543,7 +583,7 @@ impl Scene {
         let worlds: Vec<(Transform, f32)> = self
             .objects
             .iter()
-            .map(|o| (self.world_transform(o.id), o.primitive.bounding_radius()))
+            .map(|o| (self.world_transform(o.id), o.bounding_radius()))
             .collect();
         let center =
             worlds.iter().map(|(t, _)| t.location).sum::<Vec3>() / worlds.len() as f32;
@@ -606,7 +646,7 @@ pub fn export_obj(scene: &Scene) -> String {
         if !object.visible {
             continue;
         }
-        let mesh = object.primitive.generate(object.smooth);
+        let mesh = object.render_mesh();
         let t = scene.world_transform(object.id);
         out.push_str(&format!("o {}\n", object.name.replace(' ', "_")));
         for p in &mesh.positions {

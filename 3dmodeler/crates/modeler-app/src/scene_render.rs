@@ -20,6 +20,7 @@ const OUTLINE_SCALE: f32 = 1.03;
 struct CachedModel {
     primitive: Primitive,
     smooth: bool,
+    mesh_revision: u64,
     material: Material,
     cpu_mesh: CpuMesh,
     model: Gm<Mesh, PhysicalMaterial>,
@@ -88,7 +89,9 @@ impl SceneRender {
 
             let rebuild_mesh = match self.cache.get(&object.id) {
                 Some(cached) => {
-                    cached.primitive != object.primitive || cached.smooth != object.smooth
+                    cached.primitive != object.primitive
+                        || cached.smooth != object.smooth
+                        || cached.mesh_revision != object.mesh_revision
                 }
                 None => true,
             };
@@ -98,7 +101,7 @@ impl SceneRender {
             };
 
             if rebuild_mesh {
-                let cpu_mesh = to_cpu_mesh(&object.primitive.generate(object.smooth));
+                let cpu_mesh = to_cpu_mesh(&object.render_mesh());
                 let model = Gm::new(
                     Mesh::new(context, &cpu_mesh),
                     physical_material(context, &object.material),
@@ -108,6 +111,7 @@ impl SceneRender {
                     CachedModel {
                         primitive: object.primitive,
                         smooth: object.smooth,
+                        mesh_revision: object.mesh_revision,
                         material: object.material,
                         cpu_mesh,
                         model,
