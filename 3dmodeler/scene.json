@@ -1,0 +1,49 @@
+{
+  "objects": [
+    {
+      "id": 1,
+      "name": "Cube",
+      "transform": {
+        "location": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "primitive": {
+        "Cube": {
+          "size": 2.0
+        }
+      },
+      "smooth": false,
+      "visible": true,
+      "material": {
+        "base_color": [
+          0.8,
+          0.8,
+          0.8
+        ],
+        "roughness": 0.7,
+        "metallic": 0.0
+      },
+      "dynamic": false,
+      "density": 1.0,
+      "parent": null,
+      "show_label": false,
+      "show_dimensions": false
+    }
+  ],
+  "measurements": [],
+  "next_id": 1
+}

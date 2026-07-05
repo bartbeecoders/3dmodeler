@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/box3d-sys",
+    "crates/phase0-spike",
+    "crates/modeler-core",
+    "crates/modeler-app",
+    "crates/modeler-mcp",
+]
+
+[profile.release]
+opt-level = 2
+
+# Keep dev builds fast enough to be usable in the browser
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,1199 @@
+//! Blender-style editor UI: top menu bar, outliner, properties sidebar
+//! (N panel), bottom status bar and the keymap overlay.
+//!
+//! Menus are hand-rolled egui Areas rather than `menu_button` — the built-in
+//! popups misbehave inside the deprecated panel API (see plan.md, Phase 3).
+
+use crate::camera::BlenderCamera;
+use crate::modal::{self, ModalTransform};
+use crate::object_ops;
+use crate::physics::{PhysicsMirror, SimState};
+use crate::undo::UndoStack;
+use crate::io;
+use crate::overlay::MeasureTool;
+use crate::selection::Selection;
+use modeler_core::glam::{EulerRot, Quat};
+use modeler_core::{ObjectId, Primitive, Scene, Transform};
+use three_d::egui;
+use three_d::Event;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    File,
+    Edit,
+    Add,
+    Object,
+    View,
+    Help,
+}
+
+pub struct UiState {
+    open_menu: Option<Menu>,
+    menu_origin: egui::Pos2,
+    rename: Option<(ObjectId, String)>,
+    pub show_sidebar: bool,
+    show_keymap: bool,
+    import_open: bool,
+    import_buffer: String,
+    pub status_message: Option<String>,
+    current_file: Option<io::FileHandle>,
+    #[cfg(target_arch = "wasm32")]
+    save_as_open: bool,
+    #[cfg(target_arch = "wasm32")]
+    save_as_buffer: String,
+}
+
+/// State of the MCP control API, shown in the status bar (native only).
+/// None = web build (no control server). Some(None inside) = port taken.
+#[derive(Clone, Copy)]
+pub struct McpStatus {
+    pub port: u16,
+    pub commands_handled: u64,
+    pub seconds_since_last: Option<f32>,
+}
+
+/// Layout info the viewport overlays need to avoid the UI chrome.
+pub struct UiLayout {
+    pub top_offset: f32,     // menu bar height (logical)
+    pub right_offset: f32,   // sidebar width (logical)
+    #[allow(dead_code)] // overlays may want it later
+    pub bottom_offset: f32, // status bar height (logical)
+}
+
+impl UiState {
+    pub fn new() -> Self {
+        Self {
+            open_menu: None,
+            menu_origin: egui::Pos2::ZERO,
+            rename: None,
+            show_sidebar: true,
+            show_keymap: false,
+            import_open: false,
+            import_buffer: String::new(),
+            status_message: None,
+            current_file: None,
+            #[cfg(target_arch = "wasm32")]
+            save_as_open: false,
+            #[cfg(target_arch = "wasm32")]
+            save_as_buffer: String::new(),
+        }
+    }
+
+    /// Non-egui inputs: N toggles the sidebar, clicks into the viewport close
+    /// any open menu.
+    pub fn handle_events(
+        &mut self,
+        events: &mut [Event],
+        egui_owns_keyboard: bool,
+        _pointer_over_ui: bool,
+    ) {
+        for event in events.iter_mut() {
+            match event {
+                Event::Text(text) if text == "n" && !egui_owns_keyboard => {
+                    self.show_sidebar = !self.show_sidebar;
+                    text.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        camera: &mut BlenderCamera,
+        modal: &mut ModalTransform,
+        physics: &mut PhysicsMirror,
+        undo: &mut UndoStack,
+        measure: &mut MeasureTool,
+        grid_spacing: &mut f32,
+        snap_to_grid: &mut bool,
+        modal_status: &Option<String>,
+        fps: f32,
+        mcp: Option<Option<McpStatus>>,
+    ) -> UiLayout {
+        if let Some(result) = io::poll_open() {
+            match result {
+                Ok((handle, data)) => {
+                    scene.restore(&data);
+                    selection.set(Vec::new(), None);
+                    undo.reset(scene);
+                    io::add_recent(&handle, scene);
+                    self.status_message = Some(format!("loaded {}", io::display_name(&handle)));
+                    self.current_file = Some(handle);
+                }
+                Err(e) => self.status_message = Some(format!("open failed: {e}")),
+            }
+        }
+        if let Some(result) = io::poll_save() {
+            match result {
+                Ok(handle) => {
+                    io::add_recent(&handle, scene);
+                    self.status_message = Some(format!("saved {}", io::display_name(&handle)));
+                    self.current_file = Some(handle);
+                }
+                Err(e) => self.status_message = Some(format!("save failed: {e}")),
+            }
+        }
+        let top_offset = self.menu_bar(
+            ctx, scene, selection, camera, modal, physics, undo, measure, grid_spacing,
+            snap_to_grid,
+        );
+        let bottom_offset = self.status_bar(
+            ctx, scene, physics, measure, snap_to_grid, *grid_spacing, modal_status, fps, mcp,
+        );
+        let right_offset = if self.show_sidebar {
+            self.sidebar(ctx, scene, selection)
+        } else {
+            0.0
+        };
+        self.keymap_window(ctx);
+        self.import_window(ctx, scene, undo);
+        self.save_as_window(ctx, scene);
+        UiLayout {
+            top_offset,
+            right_offset,
+            bottom_offset,
+        }
+    }
+
+    // --- menu bar --------------------------------------------------------
+
+    fn menu_bar(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        camera: &mut BlenderCamera,
+        modal: &mut ModalTransform,
+        physics: &mut PhysicsMirror,
+        undo: &mut UndoStack,
+        measure: &mut MeasureTool,
+        grid_spacing: &mut f32,
+        snap_to_grid: &mut bool,
+    ) -> f32 {
+        let mut bar_height = 24.0;
+        let mut opened_this_frame = false;
+        #[allow(deprecated)]
+        let response = egui::Panel::top("menu_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (menu, label) in [
+                    (Menu::File, "File"),
+                    (Menu::Edit, "Edit"),
+                    (Menu::Add, "Add"),
+                    (Menu::Object, "Object"),
+                    (Menu::View, "View"),
+                    (Menu::Help, "Help"),
+                ] {
+                    let button = ui.selectable_label(self.open_menu == Some(menu), label);
+                    if button.clicked() {
+                        self.open_menu = if self.open_menu == Some(menu) {
+                            None
+                        } else {
+                            opened_this_frame = true;
+                            Some(menu)
+                        };
+                        self.menu_origin = button.rect.left_bottom();
+                    } else if button.hovered() && self.open_menu.is_some() {
+                        // Blender-style: hovering neighbors switches menus
+                        if self.open_menu != Some(menu) {
+                            opened_this_frame = true;
+                        }
+                        self.open_menu = Some(menu);
+                        self.menu_origin = button.rect.left_bottom();
+                    }
+                }
+            });
+        });
+        bar_height = response.response.rect.height().max(bar_height);
+
+        if let Some(menu) = self.open_menu {
+            let mut close = false;
+            let area = egui::Area::new(egui::Id::new("menu-dropdown"))
+                .fixed_pos(self.menu_origin + egui::vec2(0.0, 2.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(160.0);
+                        close = match menu {
+                            Menu::File => self.file_menu(ui, scene, selection, undo),
+                            Menu::Edit => edit_menu(ui, scene, undo),
+                            Menu::Add => add_menu_items(ui, scene, measure),
+                            Menu::Object => object_menu(ui, scene, selection, modal, physics),
+                            Menu::View => {
+                                view_menu(ui, camera, scene, selection, grid_spacing, snap_to_grid)
+                            }
+                            Menu::Help => {
+                                let mut close = false;
+                                if ui.button("Keymap").clicked() {
+                                    self.show_keymap = !self.show_keymap;
+                                    close = true;
+                                }
+                                close
+                            }
+                        };
+                    });
+                });
+            // close when clicking anywhere outside the dropdown (egui's own
+            // hit-testing — event-space based closing proved unreliable),
+            // except on the very frame a menu button opened it
+            if !opened_this_frame && area.response.clicked_elsewhere() {
+                close = true;
+            }
+            if close {
+                self.open_menu = None;
+            }
+        }
+        bar_height
+    }
+
+    fn file_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        undo: &mut UndoStack,
+    ) -> bool {
+        let mut close = false;
+        if ui.button("New scene  (Ctrl+N)").clicked() {
+            self.action_new_scene(scene, selection, undo);
+            close = true;
+        }
+        ui.separator();
+        if ui.button("Open…  (Ctrl+O)").clicked() {
+            self.action_open();
+            close = true;
+        }
+        if ui.button("Save  (Ctrl+S)").clicked() {
+            self.action_save(scene);
+            close = true;
+        }
+        if ui.button("Save As…").clicked() {
+            let default_name = self
+                .current_file
+                .as_ref()
+                .map(io::display_name)
+                .unwrap_or_else(|| io::DEFAULT_NAME.to_string());
+            #[cfg(not(target_arch = "wasm32"))]
+            io::request_save(scene.to_json(), default_name);
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.save_as_buffer = default_name;
+                self.save_as_open = true;
+            }
+            close = true;
+        }
+
+        let recents = io::recent_entries();
+        if !recents.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Recent").weak());
+            for entry in recents {
+                if ui.button(&entry.label).clicked() {
+                    match io::load(&entry.handle) {
+                        Ok(data) => {
+                            scene.restore(&data);
+                            selection.set(Vec::new(), None);
+                            undo.reset(scene);
+                            self.status_message = Some(format!("loaded {}", entry.label));
+                            self.current_file = Some(entry.handle);
+                        }
+                        Err(e) => self.status_message = Some(format!("load failed: {e}")),
+                    }
+                    close = true;
+                }
+            }
+        }
+
+        ui.separator();
+        if ui.button("Export .obj").clicked() {
+            let obj = modeler_core::export_obj(scene);
+            self.status_message =
+                Some(io::export_file("export.obj", &obj).unwrap_or_else(|e| e));
+            close = true;
+        }
+        if ui.button("Import .json (paste)…").clicked() {
+            self.import_open = true;
+            self.import_buffer.clear();
+            close = true;
+        }
+        close
+    }
+
+    fn do_save(&mut self, scene: &Scene, handle: io::FileHandle) {
+        match io::save(scene, &handle) {
+            Ok(()) => {
+                io::add_recent(&handle, scene);
+                self.status_message = Some(format!("saved {}", io::display_name(&handle)));
+                self.current_file = Some(handle);
+            }
+            Err(e) => self.status_message = Some(format!("save failed: {e}")),
+        }
+    }
+
+    /// File > New scene, also reachable via Ctrl+N.
+    pub fn action_new_scene(&mut self, scene: &mut Scene, selection: &mut Selection, undo: &mut UndoStack) {
+        *scene = Scene::default_scene();
+        selection.set(Vec::new(), None);
+        self.rename = None;
+        undo.reset(scene);
+        self.current_file = None;
+    }
+
+    /// File > Save, also reachable via Ctrl+S: writes to the current file
+    /// directly, or opens a Save dialog (async — the result arrives via
+    /// `io::poll_save` on a later frame) if there isn't one yet.
+    pub fn action_save(&mut self, scene: &Scene) {
+        if let Some(handle) = self.current_file.clone() {
+            self.do_save(scene, handle);
+        } else {
+            io::request_save(scene.to_json(), io::DEFAULT_NAME.to_string());
+        }
+    }
+
+    /// File > Open…, also reachable via Ctrl+O.
+    pub fn action_open(&mut self) {
+        io::request_open();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn save_as_window(&mut self, ctx: &egui::Context, scene: &Scene) {
+        if !self.save_as_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        egui::Window::new("Save As")
+            .open(&mut open)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("File name:");
+                let response = ui.text_edit_singleline(&mut self.save_as_buffer);
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    do_save = true;
+                }
+                if ui.button("Save").clicked() {
+                    do_save = true;
+                }
+            });
+        if do_save {
+            let mut name = self.save_as_buffer.trim().to_string();
+            if name.is_empty() {
+                name = io::DEFAULT_NAME.to_string();
+            }
+            if !name.ends_with(&format!(".{}", io::EXTENSION)) {
+                name.push('.');
+                name.push_str(io::EXTENSION);
+            }
+            io::request_save(scene.to_json(), name);
+            self.save_as_open = false;
+        } else if !open {
+            self.save_as_open = false;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_as_window(&mut self, _ctx: &egui::Context, _scene: &Scene) {}
+
+    fn import_window(&mut self, ctx: &egui::Context, scene: &mut Scene, undo: &mut UndoStack) {
+        if !self.import_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Import scene JSON")
+            .open(&mut open)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Paste a scene .json below:");
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.import_buffer)
+                            .desired_rows(10)
+                            .desired_width(360.0)
+                            .code_editor(),
+                    );
+                });
+                if ui.button("Load").clicked() {
+                    match Scene::from_json(&self.import_buffer) {
+                        Ok(data) => {
+                            scene.restore(&data);
+                            undo.reset(scene);
+                            self.status_message = Some("scene imported".into());
+                            self.import_open = false;
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("import failed: {e}"));
+                        }
+                    }
+                }
+            });
+        if !open {
+            self.import_open = false;
+        }
+    }
+
+    // --- status bar ------------------------------------------------------
+
+    fn status_bar(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        physics: &mut PhysicsMirror,
+        measure: &MeasureTool,
+        snap_to_grid: &mut bool,
+        grid_spacing: f32,
+        modal_status: &Option<String>,
+        fps: f32,
+        mcp: Option<Option<McpStatus>>,
+    ) -> f32 {
+        #[allow(deprecated)]
+        let response = egui::Panel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // physics playback controls (Space toggles, Esc stops)
+                match physics.sim_state() {
+                    SimState::Stopped => {
+                        if ui.button("▶").on_hover_text("Play physics (Space)").clicked() {
+                            physics.play(scene);
+                        }
+                    }
+                    SimState::Playing => {
+                        if ui.button("⏸").on_hover_text("Pause (Space)").clicked() {
+                            physics.pause();
+                        }
+                        if ui.button("⏹").on_hover_text("Stop & reset (Esc)").clicked() {
+                            physics.stop(scene);
+                        }
+                    }
+                    SimState::Paused => {
+                        if ui.button("▶").on_hover_text("Resume (Space)").clicked() {
+                            physics.play(scene);
+                        }
+                        if ui.button("⏹").on_hover_text("Stop & reset (Esc)").clicked() {
+                            physics.stop(scene);
+                        }
+                    }
+                }
+                ui.checkbox(&mut physics.ground_plane, "ground")
+                    .on_hover_text("Static ground plane at z=0 during simulation");
+                ui.checkbox(snap_to_grid, "snap")
+                    .on_hover_text("Snap moves to absolute grid positions (Ctrl inverts)");
+                ui.label(
+                    egui::RichText::new(format!("grid {grid_spacing} m")).size(12.0).weak(),
+                );
+                ui.separator();
+
+                let hint = if measure.active {
+                    if measure.first.is_some() {
+                        "Measure: click the second point · Esc cancel".to_string()
+                    } else {
+                        "Measure: click the first point · Esc cancel".to_string()
+                    }
+                } else {
+                    match physics.sim_state() {
+                    SimState::Playing => "SIMULATING · Space pause · Esc stop".to_string(),
+                    SimState::Paused => "PAUSED · Space resume · Esc stop".to_string(),
+                    SimState::Stopped => match modal_status {
+                        Some(status) => format!("{status}   |   LMB/Enter confirm · RMB/Esc cancel"),
+                        None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Sidebar"
+                            .to_string(),
+                    },
+                }
+                };
+                ui.label(egui::RichText::new(hint).size(12.0));
+                if let Some(message) = &self.status_message {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(message)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(140, 200, 255)),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} objects · {fps:.0} fps",
+                            scene.objects().len()
+                        ))
+                        .size(12.0)
+                        .weak(),
+                    );
+
+                    // MCP control API indicator (native builds)
+                    if let Some(mcp) = mcp {
+                        ui.separator();
+                        match mcp {
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("● MCP off")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(200, 90, 80)),
+                                )
+                                .on_hover_text(
+                                    "Control port already in use — agents cannot connect                                      to this instance",
+                                );
+                            }
+                            Some(status) => {
+                                let active =
+                                    status.seconds_since_last.is_some_and(|s| s < 3.0);
+                                let (color, text) = if active {
+                                    (
+                                        egui::Color32::from_rgb(90, 220, 110),
+                                        "● MCP active".to_string(),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(110, 150, 115),
+                                        format!("● MCP :{}", status.port),
+                                    )
+                                };
+                                let hover = if status.commands_handled == 0 {
+                                    format!(
+                                        "MCP control API listening on 127.0.0.1:{} —                                          no agent commands yet. Register with:
+                                         claude mcp add modeler -- <repo>/3dmodeler/target/release/modeler-mcp",
+                                        status.port
+                                    )
+                                } else {
+                                    format!(
+                                        "MCP control API on 127.0.0.1:{} — {} agent command{} handled",
+                                        status.port,
+                                        status.commands_handled,
+                                        if status.commands_handled == 1 { "" } else { "s" }
+                                    )
+                                };
+                                ui.label(egui::RichText::new(text).size(12.0).color(color))
+                                    .on_hover_text(hover);
+                                if active {
+                                    ui.ctx().request_repaint(); // keep the glow fresh
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        response.response.rect.height()
+    }
+
+    // --- sidebar: outliner + properties -----------------------------------
+
+    fn sidebar(&mut self, ctx: &egui::Context, scene: &mut Scene, selection: &mut Selection) -> f32 {
+        #[allow(deprecated)]
+        let response = egui::Panel::right("sidebar")
+            .default_size(250.0)
+            .show(ctx, |ui| {
+                ui.strong("Outliner");
+                self.outliner(ui, scene, selection);
+                ui.separator();
+                if !scene.measurements().is_empty() {
+                    ui.strong("Measurements");
+                    let mut remove: Option<usize> = None;
+                    for (i, m) in scene.measurements().iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✖").on_hover_text("Delete measurement").clicked() {
+                                remove = Some(i);
+                            }
+                            ui.label(format!("{:.3} m", m.length()));
+                        });
+                    }
+                    if let Some(i) = remove {
+                        scene.remove_measurement(i);
+                    }
+                    ui.separator();
+                }
+                properties(ui, scene, selection);
+            });
+        response.response.rect.width()
+    }
+
+    fn outliner(&mut self, ui: &mut egui::Ui, scene: &mut Scene, selection: &mut Selection) {
+        let mut visibility_toggle: Option<ObjectId> = None;
+        let mut clicked: Option<ObjectId> = None;
+        let mut start_rename: Option<(ObjectId, String)> = None;
+        let mut commit_rename: Option<(ObjectId, String)> = None;
+        let mut reparent: Option<(ObjectId, Option<ObjectId>)> = None;
+
+        // hierarchy view: roots first, children indented beneath their parent
+        let mut display: Vec<(ObjectId, u32)> = Vec::new();
+        fn push_children(
+            scene: &Scene,
+            parent: Option<ObjectId>,
+            depth: u32,
+            out: &mut Vec<(ObjectId, u32)>,
+        ) {
+            for object in scene.objects() {
+                let is_child = match parent {
+                    None => object.parent.is_none()
+                        || object
+                            .parent
+                            .is_some_and(|p| scene.object(p).is_none()),
+                    Some(p) => object.parent == Some(p),
+                };
+                if is_child {
+                    out.push((object.id, depth));
+                    if depth < 32 {
+                        push_children(scene, Some(object.id), depth + 1, out);
+                    }
+                }
+            }
+        }
+        push_children(scene, None, 0, &mut display);
+
+        for (id, depth) in display {
+            let Some(object) = scene.object(id) else { continue };
+            ui.horizontal(|ui| {
+                ui.add_space(12.0 * depth as f32);
+                // visibility "eye"
+                let eye = if object.visible { "●" } else { "○" };
+                if ui
+                    .small_button(eye)
+                    .on_hover_text("Show / hide (hidden objects are not selectable)")
+                    .clicked()
+                {
+                    visibility_toggle = Some(object.id);
+                }
+
+                if let Some((rename_id, buffer)) = &mut self.rename {
+                    if *rename_id == object.id {
+                        let edit = ui.text_edit_singleline(buffer);
+                        edit.request_focus();
+                        if edit.lost_focus() {
+                            commit_rename = Some((object.id, buffer.clone()));
+                        }
+                        return;
+                    }
+                }
+
+                let is_selected = selection.is_selected(object.id);
+                let label = if selection.active() == Some(object.id) {
+                    egui::RichText::new(&object.name).strong()
+                } else {
+                    egui::RichText::new(&object.name)
+                };
+
+                // drag a row onto another row to parent it there
+                let source = ui.dnd_drag_source(
+                    egui::Id::new(("outliner-drag", object.id.0)),
+                    object.id,
+                    |ui| {
+                        let row = ui.selectable_label(is_selected, label);
+                        if row.double_clicked() {
+                            start_rename = Some((object.id, object.name.clone()));
+                        } else if row.clicked() {
+                            clicked = Some(object.id);
+                        }
+                    },
+                );
+
+                // drop target: another object released on this row
+                if let Some(dragged) = source.response.dnd_release_payload::<ObjectId>() {
+                    if *dragged != object.id {
+                        reparent = Some((*dragged, Some(object.id)));
+                    }
+                }
+                // highlight while a compatible drag hovers this row
+                if let Some(dragged) = source.response.dnd_hover_payload::<ObjectId>() {
+                    if *dragged != object.id {
+                        ui.painter().rect_stroke(
+                            source.response.rect.expand(2.0),
+                            3.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 170, 64)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+            });
+        }
+
+        // drop here (or on empty space below the tree) to clear the parent
+        let any_parented = scene.objects().iter().any(|o| o.parent.is_some());
+        let drag_active =
+            egui::DragAndDrop::has_payload_of_type::<ObjectId>(ui.ctx());
+        if any_parented || drag_active {
+            let frame = egui::Frame::default()
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                .inner_margin(4.0)
+                .corner_radius(3.0);
+            let (_, dropped) = ui.dnd_drop_zone::<ObjectId, ()>(frame, |ui| {
+                ui.weak("⤒ drop here to unparent");
+            });
+            if let Some(dragged) = dropped {
+                reparent = Some((*dragged, None));
+            }
+        }
+
+        if let Some((child, parent)) = reparent {
+            if !scene.set_parent(child, parent) {
+                self.status_message =
+                    Some("can't parent an object to its own child".to_string());
+            }
+        }
+
+        if let Some(id) = visibility_toggle {
+            if let Some(object) = scene.object_mut(id) {
+                object.visible = !object.visible;
+            }
+        }
+        if let Some(id) = clicked {
+            let shift = ui.input(|i| i.modifiers.shift);
+            selection.click(Some(id), shift);
+        }
+        if let Some((id, name)) = start_rename {
+            self.rename = Some((id, name));
+        }
+        if let Some((id, name)) = commit_rename {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                if let Some(object) = scene.object_mut(id) {
+                    object.name = trimmed.to_string();
+                }
+            }
+            self.rename = None;
+        }
+    }
+
+    fn keymap_window(&mut self, ctx: &egui::Context) {
+        if !self.show_keymap {
+            return;
+        }
+        let mut open = self.show_keymap;
+        egui::Window::new("Keymap")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("keymap-grid").striped(true).show(ui, |ui| {
+                    for (keys, action) in [
+                        ("LMB / Shift+LMB", "Select / extend selection"),
+                        ("MMB drag", "Orbit"),
+                        ("Shift+MMB", "Pan"),
+                        ("Wheel / Ctrl+MMB", "Zoom"),
+                        ("1 / 3 / 7 (+Ctrl)", "Front / Right / Top views"),
+                        ("4 / 6 / 8 / 2", "Step-rotate view"),
+                        ("5", "Orthographic / perspective"),
+                        (". / Home", "Frame selection / scene"),
+                        ("Shift+A", "Add mesh"),
+                        ("G / R / S", "Move / Rotate / Scale"),
+                        ("X / Y / Z (modal)", "Axis constraint (Shift: plane)"),
+                        ("digits (modal)", "Exact value, Enter applies"),
+                        ("Ctrl (modal)", "Snap 1 m / 5° / 0.1"),
+                        ("Shift+D", "Duplicate"),
+                        ("X / Delete", "Delete (confirm / immediate)"),
+                        ("N", "Toggle sidebar"),
+                        ("Space", "Play / pause physics"),
+                        ("Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y", "Undo / redo"),
+                        ("Ctrl+S / Ctrl+O / Ctrl+N", "Save / Open / New scene"),
+                        ("Ctrl+P / Alt+P", "Parent to active / clear parent"),
+                        ("Add ▸ Measure", "Ruler: click two points"),
+                        ("Esc", "Stop physics (restore)"),
+                    ] {
+                        ui.label(egui::RichText::new(keys).monospace());
+                        ui.label(action);
+                        ui.end_row();
+                    }
+                });
+            });
+        self.show_keymap = open;
+    }
+}
+
+// --- menu contents ---------------------------------------------------------
+
+fn edit_menu(ui: &mut egui::Ui, scene: &mut Scene, undo: &mut UndoStack) -> bool {
+    let mut close = false;
+    if ui
+        .add_enabled(undo.can_undo(), egui::Button::new("Undo  (Ctrl+Z)"))
+        .clicked()
+    {
+        undo.undo(scene);
+        close = true;
+    }
+    if ui
+        .add_enabled(
+            undo.can_redo(),
+            egui::Button::new("Redo  (Ctrl+Shift+Z / Ctrl+Y)"),
+        )
+        .clicked()
+    {
+        undo.redo(scene);
+        close = true;
+    }
+    close
+}
+
+fn add_menu_items(ui: &mut egui::Ui, scene: &mut Scene, measure: &mut MeasureTool) -> bool {
+    if let Some(primitive) = crate::add_menu::mesh_menu_buttons(ui) {
+        scene.add_object(primitive, Transform::default());
+        return true;
+    }
+    ui.separator();
+    if ui
+        .button("Measure (ruler)")
+        .on_hover_text("Click two points in the viewport to measure the distance")
+        .clicked()
+    {
+        measure.start();
+        return true;
+    }
+    false
+}
+
+fn object_menu(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    selection: &mut Selection,
+    modal: &mut ModalTransform,
+    physics: &mut PhysicsMirror,
+) -> bool {
+    let has_selection = !selection.is_empty();
+    let mut close = false;
+
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Duplicate  (Shift+D)"))
+        .clicked()
+    {
+        if modal::duplicate_selection(scene, selection) {
+            modal.begin_grab(scene, selection);
+        }
+        close = true;
+    }
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Drop to Floor"))
+        .clicked()
+    {
+        physics.sync(scene); // mirror must match before ray casting
+        physics.drop_to_floor(scene, selection);
+        close = true;
+    }
+    ui.separator();
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Shade Smooth"))
+        .clicked()
+    {
+        set_selected_smooth(scene, selection, true);
+        close = true;
+    }
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Shade Flat"))
+        .clicked()
+    {
+        set_selected_smooth(scene, selection, false);
+        close = true;
+    }
+    ui.separator();
+    let can_parent = selection.selected().len() >= 2 && selection.active().is_some();
+    if ui
+        .add_enabled(can_parent, egui::Button::new("Parent to Active  (Ctrl+P)"))
+        .clicked()
+    {
+        parent_selected_to_active(scene, selection);
+        close = true;
+    }
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Clear Parent  (Alt+P)"))
+        .clicked()
+    {
+        for id in selection.selected().to_vec() {
+            scene.set_parent(id, None);
+        }
+        close = true;
+    }
+    ui.separator();
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Delete  (X)"))
+        .clicked()
+    {
+        object_ops::delete_selected(scene, selection);
+        close = true;
+    }
+    close
+}
+
+/// Blender Ctrl+P: every selected object (except the active one) becomes a
+/// child of the active object, keeping its world transform.
+pub fn parent_selected_to_active(scene: &mut Scene, selection: &Selection) {
+    let Some(active) = selection.active() else { return };
+    for id in selection.selected().to_vec() {
+        if id != active {
+            scene.set_parent(id, Some(active));
+        }
+    }
+}
+
+fn set_selected_smooth(scene: &mut Scene, selection: &Selection, smooth: bool) {
+    let ids: Vec<ObjectId> = selection.selected().to_vec();
+    for id in ids {
+        if let Some(object) = scene.object_mut(id) {
+            object.smooth = smooth;
+        }
+    }
+}
+
+fn view_menu(
+    ui: &mut egui::Ui,
+    camera: &mut BlenderCamera,
+    scene: &Scene,
+    selection: &Selection,
+    grid_spacing: &mut f32,
+    snap_to_grid: &mut bool,
+) -> bool {
+    let mut close = false;
+    ui.label(egui::RichText::new("Grid spacing").weak().size(11.0));
+    ui.horizontal(|ui| {
+        for spacing in [0.1f32, 0.25, 0.5, 1.0, 2.0] {
+            let selected = (*grid_spacing - spacing).abs() < 1e-6;
+            if ui.selectable_label(selected, format!("{spacing}")).clicked() {
+                *grid_spacing = spacing;
+            }
+        }
+        ui.label(egui::RichText::new("m").weak());
+    });
+    ui.checkbox(snap_to_grid, "Snap to grid");
+    ui.separator();
+    for (label, yaw, pitch) in [
+        ("Front  (1)", 0.0, 0.0),
+        ("Right  (3)", 90.0, 0.0),
+        ("Top  (7)", 0.0, 90.0),
+    ] {
+        if ui.button(label).clicked() {
+            camera.set_view(yaw, pitch);
+            close = true;
+        }
+    }
+    ui.separator();
+    let projection = if camera.ortho {
+        "Perspective  (5)"
+    } else {
+        "Orthographic  (5)"
+    };
+    if ui.button(projection).clicked() {
+        camera.toggle_ortho();
+        close = true;
+    }
+    ui.separator();
+    if ui.button("Frame Selection  (.)").clicked() {
+        if let Some((center, radius)) = crate::selection_bounds(scene, selection) {
+            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+        }
+        close = true;
+    }
+    if ui.button("Frame All  (Home)").clicked() {
+        if let Some((center, radius)) = scene.bounds() {
+            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+        }
+        close = true;
+    }
+    close
+}
+
+// --- properties (N panel) ----------------------------------------------------
+
+fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection) {
+    let Some(active_id) = selection.active() else {
+        ui.weak("No active object");
+        return;
+    };
+    let Some(object) = scene.object(active_id) else {
+        return;
+    };
+
+    ui.strong(object.name.clone());
+    if let Some(parent) = object.parent {
+        if let Some(parent_object) = scene.object(parent) {
+            ui.label(
+                egui::RichText::new(format!("child of {} (transform is local)", parent_object.name))
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    }
+
+    // edit copies; write back only when something changed (writes bump the
+    // scene version and trigger rebuilds)
+    let mut transform = object.transform;
+    let mut primitive = object.primitive;
+    let mut material = object.material;
+    let mut smooth = object.smooth;
+    let mut phys = (object.dynamic, object.density);
+    let mut adorn = (object.show_label, object.show_dimensions);
+    let mut changed = false;
+
+    egui::CollapsingHeader::new("Transform")
+        .default_open(true)
+        .show(ui, |ui| {
+            changed |= vec3_row(ui, "Location", &mut transform.location, 0.05);
+
+            // display rotation as XYZ Euler degrees like Blender
+            let (rx, ry, rz) = transform.rotation.to_euler(EulerRot::XYZ);
+            let mut degrees = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
+            let mut rot_changed = false;
+            ui.label("Rotation");
+            ui.horizontal(|ui| {
+                for value in &mut degrees {
+                    rot_changed |= ui
+                        .add(egui::DragValue::new(value).speed(1.0).suffix("°"))
+                        .changed();
+                }
+            });
+            if rot_changed {
+                transform.rotation = Quat::from_euler(
+                    EulerRot::XYZ,
+                    degrees[0].to_radians(),
+                    degrees[1].to_radians(),
+                    degrees[2].to_radians(),
+                );
+                changed = true;
+            }
+
+            changed |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+        });
+
+    egui::CollapsingHeader::new("Primitive")
+        .default_open(true)
+        .show(ui, |ui| {
+            changed |= primitive_params(ui, &mut primitive);
+            changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+        });
+
+    egui::CollapsingHeader::new("Adornments")
+        .default_open(false)
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut adorn.0, "Show name label").changed();
+            changed |= ui.checkbox(&mut adorn.1, "Show dimensions (m)").changed();
+        });
+
+    egui::CollapsingHeader::new("Physics")
+        .default_open(true)
+        .show(ui, |ui| {
+            let mut dynamic = object.dynamic;
+            let mut density = object.density;
+            if ui
+                .checkbox(&mut dynamic, "Dynamic")
+                .on_hover_text("Falls and collides during simulation (▶)")
+                .changed()
+            {
+                changed = true;
+            }
+            ui.add_enabled_ui(dynamic, |ui| {
+                if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
+                    changed = true;
+                }
+            });
+            phys = (dynamic, density);
+        });
+
+    egui::CollapsingHeader::new("Material")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Base color");
+                changed |= ui.color_edit_button_rgb(&mut material.base_color).changed();
+            });
+            changed |= slider_row(ui, "Roughness", &mut material.roughness, 0.0..=1.0);
+            changed |= slider_row(ui, "Metallic", &mut material.metallic, 0.0..=1.0);
+        });
+
+    if changed {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.transform = transform;
+            object.primitive = primitive;
+            object.material = material;
+            object.smooth = smooth;
+            object.dynamic = phys.0;
+            object.density = phys.1;
+            object.show_label = adorn.0;
+            object.show_dimensions = adorn.1;
+        }
+    }
+}
+
+fn vec3_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut modeler_core::glam::Vec3,
+    speed: f64,
+) -> bool {
+    let mut changed = false;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        changed |= ui.add(egui::DragValue::new(&mut value.x).speed(speed)).changed();
+        changed |= ui.add(egui::DragValue::new(&mut value.y).speed(speed)).changed();
+        changed |= ui.add(egui::DragValue::new(&mut value.z).speed(speed)).changed();
+    });
+    changed
+}
+
+fn slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::Slider::new(value, range)).changed()
+    })
+    .inner
+}
+
+fn int_row(ui: &mut egui::Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(value).speed(0.2).range(range)).changed()
+    })
+    .inner
+}
+
+fn float_row(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(value).speed(speed).range(0.001..=1000.0)).changed()
+    })
+    .inner
+}
+
+fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
+    let mut changed = false;
+    match primitive {
+        Primitive::Plane { size } | Primitive::Cube { size } => {
+            changed |= float_row(ui, "Size", size, 0.02);
+        }
+        Primitive::UvSphere { segments, rings, radius } => {
+            changed |= int_row(ui, "Segments", segments, 3..=128);
+            changed |= int_row(ui, "Rings", rings, 2..=64);
+            changed |= float_row(ui, "Radius", radius, 0.02);
+        }
+        Primitive::IcoSphere { subdivisions, radius } => {
+            changed |= int_row(ui, "Subdivisions", subdivisions, 0..=5);
+            changed |= float_row(ui, "Radius", radius, 0.02);
+        }
+        Primitive::Cylinder { vertices, radius, depth } => {
+            changed |= int_row(ui, "Vertices", vertices, 3..=128);
+            changed |= float_row(ui, "Radius", radius, 0.02);
+            changed |= float_row(ui, "Depth", depth, 0.02);
+        }
+        Primitive::Cone { vertices, radius_bottom, radius_top, depth } => {
+            changed |= int_row(ui, "Vertices", vertices, 3..=128);
+            changed |= float_row(ui, "Radius bottom", radius_bottom, 0.02);
+            ui.horizontal(|ui| {
+                ui.label("Radius top");
+                changed |= ui
+                    .add(egui::DragValue::new(radius_top).speed(0.02).range(0.0..=1000.0))
+                    .changed();
+            });
+            changed |= float_row(ui, "Depth", depth, 0.02);
+        }
+        Primitive::Torus { major_segments, minor_segments, major_radius, minor_radius } => {
+            changed |= int_row(ui, "Major segments", major_segments, 3..=256);
+            changed |= int_row(ui, "Minor segments", minor_segments, 3..=64);
+            changed |= float_row(ui, "Major radius", major_radius, 0.02);
+            changed |= float_row(ui, "Minor radius", minor_radius, 0.02);
+        }
+    }
+    changed
+}

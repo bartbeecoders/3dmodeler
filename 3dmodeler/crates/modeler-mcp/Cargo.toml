@@ -1,0 +1,9 @@
+[package]
+name = "modeler-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP (Model Context Protocol) server bridging coding agents to the running 3D modeler"
+
+[dependencies]
+serde_json = "1"
+minreq = "2"

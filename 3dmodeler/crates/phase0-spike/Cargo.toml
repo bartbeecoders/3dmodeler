@@ -1,0 +1,15 @@
+[package]
+name = "phase0-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 feasibility spike: box3d running in browser WASM"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "phase0-native"
+path = "src/main.rs"
+
+[dependencies]
+box3d-sys = { path = "../box3d-sys" }

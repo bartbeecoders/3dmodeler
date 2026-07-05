@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>box3d WASM spike — Phase 0</title>
+  <style>
+    body { font-family: monospace; background: #1e1e24; color: #d8d8e0; padding: 2rem; }
+    h1 { font-size: 1.2rem; }
+    pre { background: #14141a; padding: 1rem; border-radius: 6px; white-space: pre-wrap; }
+    .pass { color: #7be07b; }
+    .fail { color: #ff7070; }
+    .dim { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>box3d → WebAssembly feasibility spike (Phase 0)</h1>
+  <p>Creates a box3d world, drops a sphere onto a box, steps 120 frames and ray-picks the sphere — all inside this browser tab.</p>
+  <pre id="out">loading phase0_spike.wasm…</pre>
+  <script type="module">
+    import { runSpike } from './spike-glue.mjs';
+
+    const out = document.getElementById('out');
+    out.textContent = '';
+    const append = (msg, cls) => {
+      const span = document.createElement('span');
+      span.textContent = msg + '\n';
+      if (cls) span.className = cls;
+      out.appendChild(span);
+    };
+
+    try {
+      const response = await fetch('../target/wasm32-unknown-unknown/release/phase0_spike.wasm');
+      if (!response.ok) throw new Error(`fetch failed: ${response.status} — build first with cargo build --target wasm32-unknown-unknown --release`);
+      const bytes = await response.arrayBuffer();
+      const rc = await runSpike(bytes, {
+        log: (m) => append(m, m.includes('FAIL') ? 'fail' : m.includes('PASS') ? 'pass' : undefined),
+        warn: (m) => append(m, 'dim'),
+      });
+      append(rc === 0 ? '✔ box3d works in the browser' : '✘ spike failed', rc === 0 ? 'pass' : 'fail');
+    } catch (e) {
+      append(String(e), 'fail');
+    }
+  </script>
+</body>
+</html>

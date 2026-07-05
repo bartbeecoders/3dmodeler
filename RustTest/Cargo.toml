@@ -1,0 +1,14 @@
+[package]
+name = "box3d-rust-test"
+version = "0.1.0"
+edition = "2021"
+description = "Test application for the box3d physics library: landscape, house and ragdoll"
+
+[dependencies]
+macroquad = "0.4"
+
+[build-dependencies]
+bindgen = "0.71"
+
+[profile.dev]
+opt-level = 1

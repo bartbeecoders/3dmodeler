@@ -1,0 +1,10 @@
+[package]
+name = "box3d-sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to the box3d physics library (native + wasm32)"
+links = "box3d"
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1.2"
