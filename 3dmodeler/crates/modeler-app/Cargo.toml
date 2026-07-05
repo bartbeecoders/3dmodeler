@@ -8,12 +8,13 @@ description = "3D modeler application: viewport, tools, UI (native + browser)"
 modeler-core = { path = "../modeler-core" }
 box3d-sys = { path = "../box3d-sys" }
 three-d = { version = "0.19", features = ["egui-gui"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tiny_http = "0.12"
 png = "0.17"
 base64 = "0.22"
-serde_json = "1"
 rfd = "0.15"
 dirs = "5"
 

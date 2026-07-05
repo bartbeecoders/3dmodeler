@@ -8,8 +8,6 @@ use three_d::*;
 const EXTENT: f32 = 50.0;
 const MAJOR_EVERY: i32 = 10;
 
-const MINOR_COLOR: Srgba = Srgba::new(58, 61, 66, 255);
-const MAJOR_COLOR: Srgba = Srgba::new(76, 80, 87, 255);
 const X_AXIS_COLOR: Srgba = Srgba::new(174, 66, 55, 255); // Blender-ish red
 const Y_AXIS_COLOR: Srgba = Srgba::new(96, 148, 58, 255); // Blender-ish green
 
@@ -55,8 +53,15 @@ impl GridBuilder {
     }
 }
 
-pub fn build_grid(context: &Context, spacing: f32) -> Gm<Mesh, ColorMaterial> {
+pub fn build_grid(
+    context: &Context,
+    spacing: f32,
+    minor: [u8; 3],
+    major: [u8; 3],
+) -> Gm<Mesh, ColorMaterial> {
     let spacing = spacing.clamp(0.05, 10.0);
+    let minor = Srgba::new(minor[0], minor[1], minor[2], 255);
+    let major = Srgba::new(major[0], major[1], major[2], 255);
     let mut builder = GridBuilder {
         positions: Vec::new(),
         colors: Vec::new(),
@@ -70,9 +75,9 @@ pub fn build_grid(context: &Context, spacing: f32) -> Gm<Mesh, ColorMaterial> {
         }
         let offset = i as f32 * spacing;
         let (half_width, color) = if i % MAJOR_EVERY == 0 {
-            (0.014, MAJOR_COLOR)
+            (0.014, major)
         } else {
-            (0.010, MINOR_COLOR)
+            (0.010, minor)
         };
         builder.line_x(offset, half_width, color);
         builder.line_y(offset, half_width, color);

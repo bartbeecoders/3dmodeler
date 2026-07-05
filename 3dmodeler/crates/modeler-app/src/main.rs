@@ -17,6 +17,7 @@ mod overlay;
 mod physics;
 mod scene_render;
 mod selection;
+mod settings;
 mod ui;
 mod undo;
 
@@ -89,15 +90,22 @@ pub fn main() {
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
-    let mut grid_spacing: f32 = 1.0;
+    let mut settings = settings::Settings::load();
+    let mut saved_settings = settings.clone();
     let mut snap_to_grid = false;
-    let mut grid_built_spacing = grid_spacing;
+    let mut grid_built =
+        (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
     #[cfg(not(target_arch = "wasm32"))]
     let mut control = control::ControlServer::start();
 
     info("box3d physics mirror created");
 
-    let mut grid = grid::build_grid(&context, grid_spacing);
+    let mut grid = grid::build_grid(
+        &context,
+        settings.grid_spacing,
+        settings.grid_minor_color,
+        settings.grid_major_color,
+    );
 
     // Z-up lighting: key light from above-left, cool fill from the opposite side.
     let ambient = AmbientLight::new(&context, 0.35, Srgba::WHITE);
@@ -135,7 +143,7 @@ pub fn main() {
                     &mut physics,
                     &mut undo,
                     &mut measure,
-                    &mut grid_spacing,
+                    &mut settings,
                     &mut snap_to_grid,
                     &modal_status,
                     fps,
@@ -149,6 +157,7 @@ pub fn main() {
                     frame_input.device_pixel_ratio,
                     &scene,
                     &measure,
+                    settings.unit,
                 );
                 if let Some(guides) = &modal_guides {
                     overlay::draw_modal_guides(
@@ -194,9 +203,21 @@ pub fn main() {
             },
         );
 
-        if (grid_built_spacing - grid_spacing).abs() > 1e-6 {
-            grid = grid::build_grid(&context, grid_spacing);
-            grid_built_spacing = grid_spacing;
+        // rebuild the grid when its settings change; persist settings edits
+        let grid_wanted =
+            (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
+        if grid_built != grid_wanted {
+            grid = grid::build_grid(
+                &context,
+                settings.grid_spacing,
+                settings.grid_minor_color,
+                settings.grid_major_color,
+            );
+            grid_built = grid_wanted;
+        }
+        if settings != saved_settings {
+            settings.save();
+            saved_settings = settings.clone();
         }
 
         // did egui consume the keyboard this frame (e.g. focused text field)?
@@ -228,11 +249,11 @@ pub fn main() {
                             *handled = true;
                         }
                         Key::S => {
-                            ui_state.action_save(&scene);
+                            ui_state.action_save(&scene, &settings);
                             *handled = true;
                         }
                         Key::O => {
-                            ui_state.action_open();
+                            ui_state.action_open(&settings);
                             *handled = true;
                         }
                         Key::N => {
@@ -329,7 +350,8 @@ pub fn main() {
                 &mut sel,
                 egui_owns_keyboard,
                 snap_to_grid,
-                grid_spacing,
+                settings.grid_spacing,
+                settings.unit,
             );
         }
 

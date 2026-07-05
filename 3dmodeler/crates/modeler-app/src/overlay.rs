@@ -4,6 +4,7 @@
 
 use crate::camera::BlenderCamera;
 use crate::modal::{GuideKind, Guides};
+use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::Scene;
 use three_d::egui;
@@ -192,6 +193,7 @@ pub fn draw(
     device_pixel_ratio: f32,
     scene: &Scene,
     measure: &MeasureTool,
+    unit: Unit,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
@@ -209,7 +211,7 @@ pub fn draw(
             &painter,
             mid + egui::vec2(0.0, -6.0),
             egui::Align2::CENTER_BOTTOM,
-            &format!("{:.3} m", m.length()),
+            &unit.format(m.length()),
             12.0,
             MEASURE_COLOR,
         );
@@ -245,12 +247,19 @@ pub fn draw(
             y -= 16.0;
         }
         if object.show_dimensions {
-            let d = object.primitive.dimensions() * world.scale.abs();
+            let d = object.primitive.dimensions() * world.scale.abs() * unit.per_meter();
             text_with_bg(
                 &painter,
                 egui::Pos2::new(anchor.x, y),
                 egui::Align2::CENTER_BOTTOM,
-                &format!("{:.2} × {:.2} × {:.2} m", d.x, d.y, d.z),
+                &format!(
+                    "{:.p$} × {:.p$} × {:.p$} {}",
+                    d.x,
+                    d.y,
+                    d.z,
+                    unit.suffix(),
+                    p = unit.decimals().min(2),
+                ),
                 11.0,
                 DIM_COLOR,
             );

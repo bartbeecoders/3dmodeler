@@ -89,17 +89,20 @@ pub fn load(handle: &FileHandle) -> Result<SceneData, String> {
 }
 
 /// Show the Open dialog on a background thread; result lands in `poll_open`.
+/// `start_dir` (the Preferences default save location) sets where the dialog
+/// opens; None keeps the platform's last-used location.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn request_open() {
+pub fn request_open(start_dir: Option<std::path::PathBuf>) {
     use std::sync::atomic::Ordering;
     if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
         return; // a dialog is already up
     }
-    std::thread::spawn(|| {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Bee3D scene", &[EXTENSION])
-            .pick_file()
-        {
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new().add_filter("Bee3D scene", &[EXTENSION]);
+        if let Some(dir) = start_dir.filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
             let result = load(&path).map(|data| (path, data));
             if let Ok(mut pending) = PENDING_OPEN.lock() {
                 *pending = Some(result);
@@ -113,16 +116,19 @@ pub fn request_open() {
 /// chosen path; result lands in `poll_save`. The scene is snapshotted as
 /// JSON at request time, so edits made while the dialog is up are not saved.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn request_save(json: String, default_name: String) {
+pub fn request_save(json: String, default_name: String, start_dir: Option<std::path::PathBuf>) {
     use std::sync::atomic::Ordering;
     if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
         return; // a dialog is already up
     }
     std::thread::spawn(move || {
-        let picked = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("Bee3D scene", &[EXTENSION])
-            .set_file_name(&default_name)
-            .save_file();
+            .set_file_name(&default_name);
+        if let Some(dir) = start_dir.filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.save_file();
         if let Some(mut path) = picked {
             if path.extension().is_none() {
                 path.set_extension(EXTENSION);
@@ -245,7 +251,7 @@ pub fn load(handle: &FileHandle) -> Result<SceneData, String> {
 /// filename and the "dialog" completes immediately (result via `poll_save`,
 /// same flow as native).
 #[cfg(target_arch = "wasm32")]
-pub fn request_save(json: String, name: String) {
+pub fn request_save(json: String, name: String, _start_dir: Option<std::path::PathBuf>) {
     let result = download(&name, &json).map(|_| name);
     if let Ok(mut pending) = PENDING_SAVE.lock() {
         *pending = Some(result);
@@ -253,7 +259,7 @@ pub fn request_save(json: String, name: String) {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn request_open() {
+pub fn request_open(_start_dir: Option<std::path::PathBuf>) {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 

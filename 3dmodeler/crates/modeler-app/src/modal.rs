@@ -11,6 +11,7 @@
 
 use crate::camera::BlenderCamera;
 use crate::selection::Selection;
+use crate::settings::Unit;
 use modeler_core::glam::{Quat, Vec3};
 use modeler_core::{ObjectId, Scene, Transform};
 use three_d::{Event, Key, MouseButton, Viewport};
@@ -33,13 +34,18 @@ struct OriginalEntry {
     id: ObjectId,
     local: Transform,
     world: Transform,
-    parent_world: Option<Transform>,
+    parent: Option<ObjectId>,
 }
 
 struct ModalState {
     kind: Kind,
     constraint: Constraint,
     originals: Vec<OriginalEntry>,
+    /// Non-selected descendants of transformed objects (rotate/scale only —
+    /// empty for grab, where children follow the parent). These keep their
+    /// world placement: their local transforms are re-derived every frame to
+    /// cancel the ancestor's motion.
+    frozen: Vec<OriginalEntry>,
     pivot: Vec3,
     start_mouse: (f32, f32), // physical px, bottom-left origin
     cur_mouse: (f32, f32),
@@ -141,6 +147,7 @@ impl ModalTransform {
         egui_owns_keyboard: bool,
         snap_to_grid: bool,
         grid_spacing: f32,
+        unit: Unit,
     ) {
         let mut confirm = false;
         let mut cancel = false;
@@ -227,7 +234,7 @@ impl ModalTransform {
 
         if cancel {
             if let Some(state) = self.state.take() {
-                for entry in &state.originals {
+                for entry in state.originals.iter().chain(&state.frozen) {
                     if let Some(object) = scene.object_mut(entry.id) {
                         object.transform = entry.local;
                     }
@@ -236,7 +243,7 @@ impl ModalTransform {
             return;
         }
 
-        self.apply(camera, viewport, scene, snap_to_grid, grid_spacing);
+        self.apply(camera, viewport, scene, snap_to_grid, grid_spacing, unit);
 
         if confirm {
             self.state = None; // transforms already applied
@@ -272,31 +279,41 @@ impl ModalTransform {
             return;
         }
 
-        // when a parent and its descendant are both selected, only the parent
-        // moves — the child follows through the hierarchy (Blender behavior)
+        // Grab moves the whole hierarchy (children follow, like Blender);
+        // Rotate/Scale apply ONLY to the selected objects — linked children
+        // keep their world placement (explicit deviation from Blender)
         let selected: Vec<ObjectId> = selection.selected().to_vec();
+        let entry = |o: &modeler_core::Object| OriginalEntry {
+            id: o.id,
+            local: o.transform,
+            world: scene.world_transform(o.id),
+            parent: o.parent.filter(|p| scene.object(*p).is_some()),
+        };
         let originals: Vec<OriginalEntry> = scene
             .objects()
             .iter()
-            .filter(|o| {
-                selection.is_selected(o.id)
-                    && !selected.iter().any(|&other| {
-                        other != o.id && scene.is_ancestor(other, o.id)
-                    })
-            })
-            .map(|o| OriginalEntry {
-                id: o.id,
-                local: o.transform,
-                world: scene.world_transform(o.id),
-                parent_world: o
-                    .parent
-                    .filter(|p| scene.object(*p).is_some())
-                    .map(|p| scene.world_transform(p)),
-            })
+            .filter(|o| selection.is_selected(o.id))
+            .map(entry)
             .collect();
         if originals.is_empty() {
             return;
         }
+        // rotate/scale: non-selected descendants must keep their world
+        // placement while their ancestors transform — capture where they are.
+        // grab: leave empty so children ride along through the hierarchy.
+        let frozen: Vec<OriginalEntry> = if kind == Kind::Grab {
+            Vec::new()
+        } else {
+            scene
+                .objects()
+                .iter()
+                .filter(|o| {
+                    !selection.is_selected(o.id)
+                        && selected.iter().any(|&s| scene.is_ancestor(s, o.id))
+                })
+                .map(entry)
+                .collect()
+        };
         let pivot = originals.iter().map(|e| e.world.location).sum::<Vec3>()
             / originals.len() as f32;
 
@@ -304,6 +321,7 @@ impl ModalTransform {
             kind,
             constraint: Constraint::Free,
             originals,
+            frozen,
             pivot,
             start_mouse: self.last_mouse,
             cur_mouse: self.last_mouse,
@@ -362,19 +380,9 @@ impl ModalTransform {
         scene: &mut Scene,
         snap_to_grid: bool,
         grid_spacing: f32,
+        unit: Unit,
     ) {
         let Some(state) = &mut self.state else { return };
-
-        // writes a WORLD transform back as the object's local transform
-        fn write(scene: &mut Scene, entry: &OriginalEntry, world: Transform) {
-            let local = match &entry.parent_world {
-                Some(pw) => pw.to_local(&world),
-                None => world,
-            };
-            if let Some(object) = scene.object_mut(entry.id) {
-                object.transform = local;
-            }
-        }
 
         let (right, up, forward) = camera.screen_basis();
         let (right, up, forward) = (gv(right), gv(up), gv(forward));
@@ -392,6 +400,9 @@ impl ModalTransform {
         } else {
             format!("  [{}]", state.numeric)
         };
+
+        // target WORLD transform per selected object, parallel to `originals`
+        let mut targets: Vec<Transform> = Vec::with_capacity(state.originals.len());
 
         match state.kind {
             Kind::Grab => {
@@ -411,21 +422,25 @@ impl ModalTransform {
                 // grid snap: the toggle enables it, Ctrl inverts while dragging
                 let snapping = snap_to_grid != state.snap;
                 if let Some(v) = numeric {
-                    // typed value: along the constrained axis, X by default
+                    // typed value: along the constrained axis, X by default,
+                    // interpreted in the display unit (Preferences ▸ Units)
                     let axis = match state.constraint {
                         Constraint::Axis(i) => axis_vec(i),
                         Constraint::Plane(_) | Constraint::Free => Vec3::X,
                     };
-                    delta = axis * v;
+                    delta = axis * unit.to_meters(v);
                 }
+                let shown = delta * unit.per_meter();
                 state.status = format!(
-                    "Move: ({:.3}, {:.3}, {:.3}) m{}{}{}",
-                    delta.x,
-                    delta.y,
-                    delta.z,
+                    "Move: ({:.p$}, {:.p$}, {:.p$}) {}{}{}{}",
+                    shown.x,
+                    shown.y,
+                    shown.z,
+                    unit.suffix(),
                     constraint_tag,
                     numeric_tag,
-                    if snapping && numeric.is_none() { "  [snap]" } else { "" }
+                    if snapping && numeric.is_none() { "  [snap]" } else { "" },
+                    p = unit.decimals(),
                 );
                 for entry in &state.originals {
                     let mut world = entry.world;
@@ -435,7 +450,7 @@ impl ModalTransform {
                         world.location =
                             (world.location / grid_spacing).round() * grid_spacing;
                     }
-                    write(scene, entry, world);
+                    targets.push(world);
                 }
             }
             Kind::Rotate => {
@@ -477,7 +492,7 @@ impl ModalTransform {
                     let mut world = entry.world;
                     world.location = state.pivot + rotation * (entry.world.location - state.pivot);
                     world.rotation = (rotation * entry.world.rotation).normalize();
-                    write(scene, entry, world);
+                    targets.push(world);
                 }
             }
             Kind::Scale => {
@@ -514,9 +529,54 @@ impl ModalTransform {
                     let mut world = entry.world;
                     world.location = state.pivot + (entry.world.location - state.pivot) * factors;
                     world.scale = entry.world.scale * factors;
-                    write(scene, entry, world);
+                    targets.push(world);
                 }
             }
+        }
+
+        write_targets(scene, &state.originals, &targets, &state.frozen);
+    }
+}
+
+/// Write each target WORLD transform back as a local transform. A parent may
+/// itself be transformed (selected) or frozen, so locals are derived from
+/// the parent's NEW world — then frozen descendants are re-pinned so linked
+/// children keep their world placement while only the selection moves.
+fn write_targets(
+    scene: &mut Scene,
+    originals: &[OriginalEntry],
+    targets: &[Transform],
+    frozen: &[OriginalEntry],
+) {
+    // the new world of any object: its target (selected), its captured world
+    // (frozen), or its current scene world (untouched by the operator)
+    let new_world = |scene: &Scene, id: ObjectId| -> Transform {
+        if let Some(i) = originals.iter().position(|e| e.id == id) {
+            targets[i]
+        } else if let Some(f) = frozen.iter().find(|f| f.id == id) {
+            f.world
+        } else {
+            scene.world_transform(id)
+        }
+    };
+
+    let mut writes: Vec<(ObjectId, Transform)> =
+        Vec::with_capacity(originals.len() + frozen.len());
+    for (entry, target) in originals.iter().zip(targets) {
+        let local = match entry.parent {
+            Some(p) => new_world(scene, p).to_local(target),
+            None => *target,
+        };
+        writes.push((entry.id, local));
+    }
+    for f in frozen {
+        // frozen objects always have a parent (they are descendants)
+        let Some(p) = f.parent else { continue };
+        writes.push((f.id, new_world(scene, p).to_local(&f.world)));
+    }
+    for (id, local) in writes {
+        if let Some(object) = scene.object_mut(id) {
+            object.transform = local;
         }
     }
 }

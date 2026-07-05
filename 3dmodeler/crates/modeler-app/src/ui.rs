@@ -12,6 +12,7 @@ use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
 use crate::selection::Selection;
+use crate::settings::{Settings, SettingsWindow};
 use modeler_core::glam::{EulerRot, Quat};
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
@@ -37,6 +38,7 @@ pub struct UiState {
     import_buffer: String,
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
+    settings_window: SettingsWindow,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
     #[cfg(target_arch = "wasm32")]
@@ -72,6 +74,7 @@ impl UiState {
             import_buffer: String::new(),
             status_message: None,
             current_file: None,
+            settings_window: SettingsWindow::new(),
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
             #[cfg(target_arch = "wasm32")]
@@ -109,7 +112,7 @@ impl UiState {
         physics: &mut PhysicsMirror,
         undo: &mut UndoStack,
         measure: &mut MeasureTool,
-        grid_spacing: &mut f32,
+        settings: &mut Settings,
         snap_to_grid: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
@@ -139,20 +142,21 @@ impl UiState {
             }
         }
         let top_offset = self.menu_bar(
-            ctx, scene, selection, camera, modal, physics, undo, measure, grid_spacing,
+            ctx, scene, selection, camera, modal, physics, undo, measure, settings,
             snap_to_grid,
         );
         let bottom_offset = self.status_bar(
-            ctx, scene, physics, measure, snap_to_grid, *grid_spacing, modal_status, fps, mcp,
+            ctx, scene, physics, measure, snap_to_grid, settings, modal_status, fps, mcp,
         );
         let right_offset = if self.show_sidebar {
-            self.sidebar(ctx, scene, selection)
+            self.sidebar(ctx, scene, selection, settings)
         } else {
             0.0
         };
         self.keymap_window(ctx);
         self.import_window(ctx, scene, undo);
-        self.save_as_window(ctx, scene);
+        self.save_as_window(ctx, scene, settings);
+        self.settings_window.ui(ctx, settings);
         UiLayout {
             top_offset,
             right_offset,
@@ -172,7 +176,7 @@ impl UiState {
         physics: &mut PhysicsMirror,
         undo: &mut UndoStack,
         measure: &mut MeasureTool,
-        grid_spacing: &mut f32,
+        settings: &mut Settings,
         snap_to_grid: &mut bool,
     ) -> f32 {
         let mut bar_height = 24.0;
@@ -219,12 +223,14 @@ impl UiState {
                     egui::Frame::menu(ui.style()).show(ui, |ui| {
                         ui.set_min_width(160.0);
                         close = match menu {
-                            Menu::File => self.file_menu(ui, scene, selection, undo),
-                            Menu::Edit => edit_menu(ui, scene, undo),
+                            Menu::File => self.file_menu(ui, scene, selection, undo, settings),
+                            Menu::Edit => {
+                                edit_menu(ui, scene, undo, &mut self.settings_window)
+                            }
                             Menu::Add => add_menu_items(ui, scene, measure),
                             Menu::Object => object_menu(ui, scene, selection, modal, physics),
                             Menu::View => {
-                                view_menu(ui, camera, scene, selection, grid_spacing, snap_to_grid)
+                                view_menu(ui, camera, scene, selection, settings, snap_to_grid)
                             }
                             Menu::Help => {
                                 let mut close = false;
@@ -256,6 +262,7 @@ impl UiState {
         scene: &mut Scene,
         selection: &mut Selection,
         undo: &mut UndoStack,
+        settings: &Settings,
     ) -> bool {
         let mut close = false;
         if ui.button("New scene  (Ctrl+N)").clicked() {
@@ -264,11 +271,11 @@ impl UiState {
         }
         ui.separator();
         if ui.button("Open…  (Ctrl+O)").clicked() {
-            self.action_open();
+            self.action_open(settings);
             close = true;
         }
         if ui.button("Save  (Ctrl+S)").clicked() {
-            self.action_save(scene);
+            self.action_save(scene, settings);
             close = true;
         }
         if ui.button("Save As…").clicked() {
@@ -278,7 +285,7 @@ impl UiState {
                 .map(io::display_name)
                 .unwrap_or_else(|| io::DEFAULT_NAME.to_string());
             #[cfg(not(target_arch = "wasm32"))]
-            io::request_save(scene.to_json(), default_name);
+            io::request_save(scene.to_json(), default_name, settings.save_dir());
             #[cfg(target_arch = "wasm32")]
             {
                 self.save_as_buffer = default_name;
@@ -346,21 +353,25 @@ impl UiState {
     /// File > Save, also reachable via Ctrl+S: writes to the current file
     /// directly, or opens a Save dialog (async — the result arrives via
     /// `io::poll_save` on a later frame) if there isn't one yet.
-    pub fn action_save(&mut self, scene: &Scene) {
+    pub fn action_save(&mut self, scene: &Scene, settings: &Settings) {
         if let Some(handle) = self.current_file.clone() {
             self.do_save(scene, handle);
         } else {
-            io::request_save(scene.to_json(), io::DEFAULT_NAME.to_string());
+            io::request_save(
+                scene.to_json(),
+                io::DEFAULT_NAME.to_string(),
+                settings.save_dir(),
+            );
         }
     }
 
     /// File > Open…, also reachable via Ctrl+O.
-    pub fn action_open(&mut self) {
-        io::request_open();
+    pub fn action_open(&mut self, settings: &Settings) {
+        io::request_open(settings.save_dir());
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn save_as_window(&mut self, ctx: &egui::Context, scene: &Scene) {
+    fn save_as_window(&mut self, ctx: &egui::Context, scene: &Scene, _settings: &Settings) {
         if !self.save_as_open {
             return;
         }
@@ -389,7 +400,7 @@ impl UiState {
                 name.push('.');
                 name.push_str(io::EXTENSION);
             }
-            io::request_save(scene.to_json(), name);
+            io::request_save(scene.to_json(), name, None);
             self.save_as_open = false;
         } else if !open {
             self.save_as_open = false;
@@ -397,7 +408,7 @@ impl UiState {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn save_as_window(&mut self, _ctx: &egui::Context, _scene: &Scene) {}
+    fn save_as_window(&mut self, _ctx: &egui::Context, _scene: &Scene, _settings: &Settings) {}
 
     fn import_window(&mut self, ctx: &egui::Context, scene: &mut Scene, undo: &mut UndoStack) {
         if !self.import_open {
@@ -446,7 +457,7 @@ impl UiState {
         physics: &mut PhysicsMirror,
         measure: &MeasureTool,
         snap_to_grid: &mut bool,
-        grid_spacing: f32,
+        settings: &Settings,
         modal_status: &Option<String>,
         fps: f32,
         mcp: Option<Option<McpStatus>>,
@@ -483,7 +494,12 @@ impl UiState {
                 ui.checkbox(snap_to_grid, "snap")
                     .on_hover_text("Snap moves to absolute grid positions (Ctrl inverts)");
                 ui.label(
-                    egui::RichText::new(format!("grid {grid_spacing} m")).size(12.0).weak(),
+                    egui::RichText::new(format!(
+                        "grid {}",
+                        settings.unit.format(settings.grid_spacing)
+                    ))
+                    .size(12.0)
+                    .weak(),
                 );
                 ui.separator();
 
@@ -514,6 +530,14 @@ impl UiState {
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // app version = modeler-app crate version; the patch digit
+                    // is bumped on every build+commit
+                    ui.label(
+                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .size(12.0)
+                            .weak(),
+                    );
+                    ui.separator();
                     ui.label(
                         egui::RichText::new(format!(
                             "{} objects · {fps:.0} fps",
@@ -581,7 +605,13 @@ impl UiState {
 
     // --- sidebar: outliner + properties -----------------------------------
 
-    fn sidebar(&mut self, ctx: &egui::Context, scene: &mut Scene, selection: &mut Selection) -> f32 {
+    fn sidebar(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        settings: &Settings,
+    ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
             .default_size(250.0)
@@ -597,7 +627,7 @@ impl UiState {
                             if ui.small_button("✖").on_hover_text("Delete measurement").clicked() {
                                 remove = Some(i);
                             }
-                            ui.label(format!("{:.3} m", m.length()));
+                            ui.label(settings.unit.format(m.length()));
                         });
                     }
                     if let Some(i) = remove {
@@ -605,7 +635,7 @@ impl UiState {
                     }
                     ui.separator();
                 }
-                properties(ui, scene, selection);
+                properties(ui, scene, selection, settings);
             });
         response.response.rect.width()
     }
@@ -804,7 +834,12 @@ impl UiState {
 
 // --- menu contents ---------------------------------------------------------
 
-fn edit_menu(ui: &mut egui::Ui, scene: &mut Scene, undo: &mut UndoStack) -> bool {
+fn edit_menu(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    undo: &mut UndoStack,
+    settings_window: &mut SettingsWindow,
+) -> bool {
     let mut close = false;
     if ui
         .add_enabled(undo.can_undo(), egui::Button::new("Undo  (Ctrl+Z)"))
@@ -821,6 +856,11 @@ fn edit_menu(ui: &mut egui::Ui, scene: &mut Scene, undo: &mut UndoStack) -> bool
         .clicked()
     {
         undo.redo(scene);
+        close = true;
+    }
+    ui.separator();
+    if ui.button("Preferences…").clicked() {
+        settings_window.open = true;
         close = true;
     }
     close
@@ -939,19 +979,21 @@ fn view_menu(
     camera: &mut BlenderCamera,
     scene: &Scene,
     selection: &Selection,
-    grid_spacing: &mut f32,
+    settings: &mut Settings,
     snap_to_grid: &mut bool,
 ) -> bool {
     let mut close = false;
     ui.label(egui::RichText::new("Grid spacing").weak().size(11.0));
     ui.horizontal(|ui| {
+        let unit = settings.unit;
         for spacing in [0.1f32, 0.25, 0.5, 1.0, 2.0] {
-            let selected = (*grid_spacing - spacing).abs() < 1e-6;
-            if ui.selectable_label(selected, format!("{spacing}")).clicked() {
-                *grid_spacing = spacing;
+            let selected = (settings.grid_spacing - spacing).abs() < 1e-6;
+            let label = format!("{}", unit.from_meters(spacing));
+            if ui.selectable_label(selected, label).clicked() {
+                settings.grid_spacing = spacing;
             }
         }
-        ui.label(egui::RichText::new("m").weak());
+        ui.label(egui::RichText::new(settings.unit.suffix()).weak());
     });
     ui.checkbox(snap_to_grid, "Snap to grid");
     ui.separator();
@@ -993,7 +1035,7 @@ fn view_menu(
 
 // --- properties (N panel) ----------------------------------------------------
 
-fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection) {
+fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, settings: &Settings) {
     let Some(active_id) = selection.active() else {
         ui.weak("No active object");
         return;
@@ -1064,7 +1106,12 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection) {
         .default_open(false)
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut adorn.0, "Show name label").changed();
-            changed |= ui.checkbox(&mut adorn.1, "Show dimensions (m)").changed();
+            changed |= ui
+                .checkbox(
+                    &mut adorn.1,
+                    format!("Show dimensions ({})", settings.unit.suffix()),
+                )
+                .changed();
         });
 
     egui::CollapsingHeader::new("Physics")

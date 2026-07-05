@@ -82,3 +82,21 @@ R x 45 <enter> (rotate 45 degrees on the x-axis)
 
 Push the code to github. I created a public repo: https://github.com/bartbeecoders/3dmodeler.git
 Include all files from /run/media/bart/Development/Projects/box3d 
+
+
+Add a settings page:
+
+- maintain the grid size
+- maintain the grid color
+- ability to define a unit, standard is 1 unit = 1 meter
+    - ability to switch between units (meter, centimeter, millimeter)
+    - only allow metric
+- ability to set the default save location
+
+Make the settings page large enough to fit all settings and all future settings
+Make it multi tabbed
+
+
+Improvement:
+moving, rotating, scaling objects should only be done on the selected object(s).
+Not on the linked (children or parent) objects.
