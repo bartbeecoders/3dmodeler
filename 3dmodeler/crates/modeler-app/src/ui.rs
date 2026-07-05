@@ -12,6 +12,7 @@ use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
 use crate::ref_image::{self, CalibrateTool};
+use crate::scene_render::ShadeMode;
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use modeler_core::ImagePlane;
@@ -118,6 +119,8 @@ impl UiState {
         settings: &mut Settings,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
+        shade_mode: &mut ShadeMode,
+        xray: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
         mcp: Option<Option<McpStatus>>,
@@ -157,12 +160,12 @@ impl UiState {
         }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
-            snap_to_grid,
+            snap_to_grid, shade_mode, xray,
         );
         let top_offset = menu_offset
             + self.toolbar(
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
-                snap_to_vertex,
+                snap_to_vertex, shade_mode, xray,
             );
         let bottom_offset = self.status_bar(
             ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
@@ -199,6 +202,8 @@ impl UiState {
         measure: &mut MeasureTool,
         settings: &mut Settings,
         snap_to_grid: &mut bool,
+        shade_mode: &mut ShadeMode,
+        xray: &mut bool,
     ) -> f32 {
         let mut bar_height = 24.0;
         let mut opened_this_frame = false;
@@ -250,9 +255,10 @@ impl UiState {
                             }
                             Menu::Add => add_menu_items(ui, scene, measure),
                             Menu::Object => object_menu(ui, scene, selection, modal, physics),
-                            Menu::View => {
-                                view_menu(ui, camera, scene, selection, settings, snap_to_grid)
-                            }
+                            Menu::View => view_menu(
+                                ui, camera, scene, selection, settings, snap_to_grid,
+                                shade_mode, xray,
+                            ),
                             Menu::Help => {
                                 let mut close = false;
                                 if ui.button("Keymap").clicked() {
@@ -290,6 +296,8 @@ impl UiState {
         settings: &Settings,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
+        shade_mode: &mut ShadeMode,
+        xray: &mut bool,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::top("toolbar").show(ctx, |ui| {
@@ -379,6 +387,28 @@ impl UiState {
                     snap_to_vertex,
                     "⌖",
                     "Snap to vertex: while moving, the selection snaps so its closest                      vertex lands on the vertex nearest the cursor",
+                );
+                ui.separator();
+
+                // viewport shading modes + X-ray
+                for (mode, label, tip) in [
+                    (ShadeMode::Wireframe, "Wire", "Wireframe: only object edges"),
+                    (ShadeMode::Solid, "Solid", "Solid: neutral studio shading, materials ignored"),
+                    (ShadeMode::Shaded, "Shaded", "Shaded: full materials and lights"),
+                ] {
+                    if ui
+                        .selectable_label(*shade_mode == mode, label)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        *shade_mode = mode;
+                    }
+                }
+                toggle(
+                    ui,
+                    xray,
+                    "X-ray",
+                    "X-ray: see through objects (solid and shaded modes)",
                 );
                 ui.separator();
 
@@ -1153,6 +1183,7 @@ fn set_selected_smooth(scene: &mut Scene, selection: &Selection, smooth: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn view_menu(
     ui: &mut egui::Ui,
     camera: &mut BlenderCamera,
@@ -1160,8 +1191,24 @@ fn view_menu(
     selection: &Selection,
     settings: &mut Settings,
     snap_to_grid: &mut bool,
+    shade_mode: &mut ShadeMode,
+    xray: &mut bool,
 ) -> bool {
     let mut close = false;
+    ui.label(egui::RichText::new("Viewport shading").weak().size(11.0));
+    ui.horizontal(|ui| {
+        for (mode, label) in [
+            (ShadeMode::Wireframe, "Wireframe"),
+            (ShadeMode::Solid, "Solid"),
+            (ShadeMode::Shaded, "Shaded"),
+        ] {
+            if ui.selectable_label(*shade_mode == mode, label).clicked() {
+                *shade_mode = mode;
+            }
+        }
+    });
+    ui.checkbox(xray, "X-ray");
+    ui.separator();
     ui.label(egui::RichText::new("Grid spacing").weak().size(11.0));
     ui.horizontal(|ui| {
         let unit = settings.unit;

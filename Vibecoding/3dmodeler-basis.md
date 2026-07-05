@@ -113,3 +113,5 @@ The user can then edit the selected face, edge or vertex.
 
 Add a snap to vertex mode. When turned on, when moving objects, they will snap to the nearest vertex.
 Add a top toolbar, with the main options. Use useful icons.
+
+Add views for wireframe, solid, and shaded modes. And add a X-ray mode.

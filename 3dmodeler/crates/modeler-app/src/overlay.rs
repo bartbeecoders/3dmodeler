@@ -194,6 +194,32 @@ pub fn draw_modal_guides(
     }
 }
 
+/// Wireframe shading mode: every visible object as its sharp edges.
+/// Selection tiers echo the outline colors (orange = selected/active).
+pub fn draw_wireframe(
+    ctx: &egui::Context,
+    camera: &BlenderCamera,
+    viewport: Viewport,
+    device_pixel_ratio: f32,
+    segments: &[crate::scene_render::WireSegment],
+) {
+    const TIERS: [egui::Color32; 3] = [
+        egui::Color32::from_rgb(150, 160, 175),
+        egui::Color32::from_rgb(230, 110, 20),
+        egui::Color32::from_rgb(255, 170, 64),
+    ];
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
+    for &(a, b, tier) in segments {
+        if let (Some(a), Some(b)) = (project(a), project(b)) {
+            painter.line_segment(
+                [a, b],
+                egui::Stroke::new(1.2, TIERS[usize::from(tier).min(2)]),
+            );
+        }
+    }
+}
+
 /// Edit-mode visuals: the object's wireframe (sharp edges), its vertices in
 /// vertex mode, and the selected element highlighted in orange.
 pub fn draw_edit_mode(

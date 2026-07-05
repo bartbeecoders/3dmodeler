@@ -99,6 +99,9 @@ pub fn main() {
     let mut saved_settings = settings.clone();
     let mut snap_to_grid = false;
     let mut snap_to_vertex = false;
+    let mut shade_mode = scene_render::ShadeMode::Shaded;
+    let mut xray = false;
+    let mut wire_cache = scene_render::WireframeCache::new();
     let mut grid_built =
         (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
     #[cfg(not(target_arch = "wasm32"))]
@@ -144,6 +147,8 @@ pub fn main() {
         let modal_status = edit_mode.status_line().or_else(|| modal.status_line());
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
+        let wire_segments = (shade_mode == scene_render::ShadeMode::Wireframe)
+            .then(|| wire_cache.segments(&scene, &sel));
         let fps = 1000.0 / frame_input.elapsed_time.max(0.001) as f32;
         #[cfg(not(target_arch = "wasm32"))]
         let mcp_status = Some(control.as_ref().map(|c| c.status()));
@@ -169,6 +174,8 @@ pub fn main() {
                     &mut settings,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
+                    &mut shade_mode,
+                    &mut xray,
                     &modal_status,
                     fps,
                     mcp_status,
@@ -191,6 +198,15 @@ pub fn main() {
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
                         guides,
+                    );
+                }
+                if let Some(segments) = &wire_segments {
+                    overlay::draw_wireframe(
+                        gui_context,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        segments,
                     );
                 }
                 if let Some(edit) = &edit_overlay {
@@ -523,7 +539,7 @@ pub fn main() {
             }
         }
 
-        scene_render.sync(&scene, &sel, &overlaps, &context);
+        scene_render.sync(&scene, &sel, &overlaps, &context, shade_mode, xray);
         ref_render.sync(&scene, &context);
 
         let cam = camera.camera(frame_input.viewport);
