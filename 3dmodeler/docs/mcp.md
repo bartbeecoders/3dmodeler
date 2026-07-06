@@ -127,6 +127,29 @@ in the project:
 }
 ```
 
+### LM Studio
+
+Open the **Program** tab (right sidebar) → **Install** → **Edit mcp.json**,
+or edit `~/.lmstudio/mcp.json` directly, and add the server under
+`mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "modeler": {
+      "command": "<REPO>/3dmodeler/target/release/modeler-mcp",
+      "env": {}
+    }
+  }
+}
+```
+
+Use the absolute path to `modeler-mcp` (no arguments needed). If the app
+runs on a non-default control port, add it to `env`:
+`"env": { "MODELER_CONTROL_PORT": "9000" }`. Toggle the server on in the
+Program tab and confirm the tools appear; the native modeler app must be
+running for calls to succeed.
+
 ### VS Code (native MCP / GitHub Copilot agent mode)
 
 `.vscode/mcp.json` in the workspace:
