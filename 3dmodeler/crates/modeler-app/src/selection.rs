@@ -7,6 +7,9 @@ use modeler_core::{ObjectId, Scene};
 pub struct Selection {
     selected: Vec<ObjectId>,
     active: Option<ObjectId>,
+    /// A selected reference image (viewport click) — mutually exclusive
+    /// with the object selection.
+    image: Option<u64>,
     stamp: u64,
 }
 
@@ -35,7 +38,27 @@ impl Selection {
 
     /// Blender click rules: plain click selects only the hit object (or
     /// clears on empty space); shift+click extends / toggles.
+    /// The selected reference image, if any.
+    pub fn image(&self) -> Option<u64> {
+        self.image
+    }
+
+    /// Select a reference image (clears the object selection).
+    pub fn select_image(&mut self, id: u64) {
+        self.selected.clear();
+        self.active = None;
+        self.image = Some(id);
+        self.stamp += 1;
+    }
+
+    pub fn clear_image(&mut self) {
+        if self.image.take().is_some() {
+            self.stamp += 1;
+        }
+    }
+
     pub fn click(&mut self, hit: Option<ObjectId>, shift: bool) {
+        self.image = None;
         self.stamp += 1;
         match (hit, shift) {
             (Some(id), false) => {
@@ -72,6 +95,7 @@ impl Selection {
             return;
         };
         let members = scene.subtree(root);
+        self.image = None;
         self.stamp += 1;
         if !shift {
             self.selected = members;
@@ -93,6 +117,7 @@ impl Selection {
     pub fn set(&mut self, ids: Vec<ObjectId>, active: Option<ObjectId>) {
         self.selected = ids;
         self.active = active;
+        self.image = None;
         self.stamp += 1;
     }
 
@@ -144,6 +169,28 @@ mod tests {
         sel.click(None, false);
         assert!(sel.is_empty());
         assert_eq!(sel.active(), None);
+    }
+
+    #[test]
+    fn image_and_object_selection_are_mutually_exclusive() {
+        let a = ObjectId(1);
+        let mut sel = Selection::default();
+
+        sel.click(Some(a), false);
+        sel.select_image(7);
+        assert_eq!(sel.image(), Some(7));
+        assert!(sel.is_empty(), "selecting an image clears objects");
+        assert_eq!(sel.active(), None);
+
+        sel.click(Some(a), false);
+        assert_eq!(sel.image(), None, "selecting an object clears the image");
+        sel.select_image(7);
+        sel.click(None, false);
+        assert_eq!(sel.image(), None, "clicking empty space clears the image");
+
+        sel.select_image(7);
+        sel.clear_image();
+        assert_eq!(sel.image(), None);
     }
 
     #[test]

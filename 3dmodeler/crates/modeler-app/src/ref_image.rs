@@ -322,6 +322,187 @@ impl CalibrateTool {
     }
 }
 
+// --- viewport move tool -----------------------------------------------------
+
+struct ImageGrab {
+    id: u64,
+    original: glam::Vec3,
+    start_mouse: (f32, f32), // physical px, bottom-left origin
+    cur_mouse: (f32, f32),
+    /// None = screen plane, Some(axis) = world axis constraint.
+    constraint: Option<usize>,
+    status: String,
+}
+
+/// G-move for the reference image selected in the viewport: same gestures as
+/// the object grab (mouse moves in the screen plane, X/Y/Z constrains,
+/// LMB/Enter confirms, RMB/Esc cancels and restores).
+pub struct ImageMoveTool {
+    state: Option<ImageGrab>,
+    last_mouse: (f32, f32),
+}
+
+impl ImageMoveTool {
+    pub fn new() -> Self {
+        Self { state: None, last_mouse: (0.0, 0.0) }
+    }
+
+    pub fn active(&self) -> bool {
+        self.state.is_some()
+    }
+
+    pub fn status_line(&self) -> Option<String> {
+        self.state.as_ref().map(|s| s.status.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_events(
+        &mut self,
+        events: &mut [Event],
+        camera: &crate::camera::BlenderCamera,
+        viewport: Viewport,
+        scene: &mut Scene,
+        selected_image: Option<u64>,
+        egui_owns_keyboard: bool,
+        unit: crate::settings::Unit,
+    ) {
+        let mut confirm = false;
+        let mut cancel = false;
+
+        for event in events.iter_mut() {
+            match event {
+                Event::MouseMotion { position, handled, .. } => {
+                    self.last_mouse = (position.x, position.y);
+                    if let Some(state) = &mut self.state {
+                        state.cur_mouse = self.last_mouse;
+                        *handled = true;
+                    }
+                }
+                Event::MousePress { button, position, handled, .. }
+                    if self.state.is_some() && !*handled =>
+                {
+                    self.last_mouse = (position.x, position.y);
+                    match button {
+                        MouseButton::Left => confirm = true,
+                        MouseButton::Right => cancel = true,
+                        MouseButton::Middle => {}
+                    }
+                    if *button != MouseButton::Middle {
+                        *handled = true;
+                    }
+                }
+                Event::KeyPress { kind, handled, .. } if self.state.is_some() && !*handled => {
+                    match kind {
+                        Key::Enter => confirm = true,
+                        Key::Escape => cancel = true,
+                        _ => {}
+                    }
+                    *handled = true; // the tool owns the keyboard while moving
+                }
+                Event::Text(text) if !egui_owns_keyboard && !text.is_empty() => {
+                    let consumed = match (self.state.as_mut(), text.as_str()) {
+                        (None, "g" | "G") => {
+                            if let Some(id) = selected_image {
+                                if let Some(image) =
+                                    scene.reference_images().iter().find(|r| r.id == id)
+                                {
+                                    self.state = Some(ImageGrab {
+                                        id,
+                                        original: image.location,
+                                        start_mouse: self.last_mouse,
+                                        cur_mouse: self.last_mouse,
+                                        constraint: None,
+                                        status: String::new(),
+                                    });
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        (Some(state), "x" | "X" | "y" | "Y" | "z" | "Z") => {
+                            let axis = match text.to_ascii_lowercase().as_str() {
+                                "x" => 0,
+                                "y" => 1,
+                                _ => 2,
+                            };
+                            state.constraint =
+                                if state.constraint == Some(axis) { None } else { Some(axis) };
+                            true
+                        }
+                        (Some(_), _) => true, // moving owns typed input
+                        _ => false,
+                    };
+                    if consumed {
+                        text.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if cancel {
+            if let Some(state) = self.state.take() {
+                if let Some(image) = scene.reference_image_mut(state.id) {
+                    image.location = state.original;
+                }
+            }
+            return;
+        }
+
+        self.apply(camera, viewport, scene, unit);
+
+        if confirm {
+            self.state = None; // location already applied
+        }
+    }
+
+    fn apply(
+        &mut self,
+        camera: &crate::camera::BlenderCamera,
+        viewport: Viewport,
+        scene: &mut Scene,
+        unit: crate::settings::Unit,
+    ) {
+        let Some(state) = &mut self.state else { return };
+        let (right, up, _) = camera.screen_basis();
+        let (right, up) = (
+            glam::Vec3::new(right.x, right.y, right.z),
+            glam::Vec3::new(up.x, up.y, up.z),
+        );
+        let wpp = camera.world_per_pixel_at(
+            viewport,
+            vec3(state.original.x, state.original.y, state.original.z),
+        );
+        let dx = state.cur_mouse.0 - state.start_mouse.0;
+        let dy = state.cur_mouse.1 - state.start_mouse.1;
+        let mut delta = right * (dx * wpp) + up * (dy * wpp);
+        if let Some(axis) = state.constraint {
+            let a = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z][axis];
+            delta = a * delta.dot(a);
+        }
+
+        let shown = delta * unit.per_meter();
+        state.status = format!(
+            "Move image: ({:.p$}, {:.p$}, {:.p$}) {}{}   |   LMB/Enter confirm · RMB/Esc cancel",
+            shown.x,
+            shown.y,
+            shown.z,
+            unit.suffix(),
+            match state.constraint {
+                Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
+                None => String::new(),
+            },
+            p = unit.decimals(),
+        );
+
+        let target = state.original + delta;
+        if let Some(image) = scene.reference_image_mut(state.id) {
+            image.location = target;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

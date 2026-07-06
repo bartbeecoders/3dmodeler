@@ -98,6 +98,7 @@ pub fn main() {
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
+    let mut image_move = ref_image::ImageMoveTool::new();
     let mut settings = settings::Settings::load();
     let mut saved_settings = settings.clone();
     let mut library = library::load();
@@ -149,7 +150,10 @@ pub fn main() {
                 }
             }
         }
-        let modal_status = edit_mode.status_line().or_else(|| modal.status_line());
+        let modal_status = edit_mode
+            .status_line()
+            .or_else(|| modal.status_line())
+            .or_else(|| image_move.status_line());
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
         // edit-mode element selection, for "set pivot/anchor to selection"
@@ -577,9 +581,22 @@ pub fn main() {
             }
         }
 
+        // G on a selected reference image: move it (same gestures as objects)
+        if physics.is_stopped() && !edit_mode.active() && !modal.active() {
+            image_move.handle_events(
+                &mut frame_input.events,
+                &camera,
+                frame_input.viewport,
+                &mut scene,
+                sel.image(),
+                egui_owns_keyboard,
+                settings.unit,
+            );
+        }
+
         // editing tools are disabled while the simulation owns the transforms
         // and while edit mode owns the object
-        if physics.is_stopped() && !edit_mode.active() {
+        if physics.is_stopped() && !edit_mode.active() && !image_move.active() {
             // modal transform operators get first claim on input after the UI
             modal.handle_events(
                 &mut frame_input.events,
@@ -625,6 +642,12 @@ pub fn main() {
         // physics mirror must be current before picking (no-op while playing)
         physics.sync(&scene);
         sel.retain_existing(|id| scene.object(id).is_some());
+        if sel
+            .image()
+            .is_some_and(|id| !scene.reference_images().iter().any(|r| r.id == id))
+        {
+            sel.clear_image();
+        }
 
         // batch this frame's edits into undo checkpoints once things go quiet
         undo.on_frame(&scene, modal.active() || edit_mode.grabbing() || !physics.is_stopped());
@@ -651,12 +674,31 @@ pub fn main() {
                 if !*handled && !pointer_over_ui {
                     let (origin, direction) =
                         camera.pick_ray(frame_input.viewport, position.x, position.y);
-                    let hit = physics.pick(
-                        glam::Vec3::new(origin.x, origin.y, origin.z),
-                        glam::Vec3::new(direction.x, direction.y, direction.z),
-                    );
-                    // grouped assemblies (placed library objects) select as one
-                    sel.click_expanded(&scene, hit, modifiers.shift);
+                    let ray_o = glam::Vec3::new(origin.x, origin.y, origin.z);
+                    let ray_d = glam::Vec3::new(direction.x, direction.y, direction.z);
+                    let hit = physics.pick(ray_o, ray_d);
+                    // reference images are not physics bodies: intersect
+                    // them analytically and let the nearest hit win
+                    let object_t = hit
+                        .and_then(|_| physics.pick_point(ray_o, ray_d))
+                        .map(|p| (p - ray_o).length());
+                    let image_hit = scene
+                        .reference_images()
+                        .iter()
+                        .filter(|r| r.visible)
+                        .filter_map(|r| r.intersect_ray(ray_o, ray_d).map(|t| (t, r.id)))
+                        .min_by(|a, b| a.0.total_cmp(&b.0));
+                    let image_in_front = match (object_t, image_hit) {
+                        (Some(ot), Some((it, _))) => it < ot,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if image_in_front && !modifiers.shift {
+                        sel.select_image(image_hit.unwrap().1);
+                    } else {
+                        // grouped assemblies (placed library objects) select as one
+                        sel.click_expanded(&scene, hit, modifiers.shift);
+                    }
                     *handled = true;
                 }
             }
@@ -687,7 +729,26 @@ pub fn main() {
                             && !edit_mode.active()
                             && !egui_owns_keyboard =>
                     {
-                        object_ops::place_on_ground(&mut scene, &sel);
+                        if let Some(image_id) = sel.image() {
+                            // ground the reference image: lowest corner to z=0
+                            let min_z = scene
+                                .reference_images()
+                                .iter()
+                                .find(|r| r.id == image_id)
+                                .map(|r| {
+                                    r.corners()
+                                        .iter()
+                                        .map(|c| c.z)
+                                        .fold(f32::INFINITY, f32::min)
+                                });
+                            if let Some(min_z) = min_z.filter(|z| z.is_finite()) {
+                                if let Some(image) = scene.reference_image_mut(image_id) {
+                                    image.location.z -= min_z;
+                                }
+                            }
+                        } else {
+                            object_ops::place_on_ground(&mut scene, &sel);
+                        }
                     }
                     _ => {}
                 }

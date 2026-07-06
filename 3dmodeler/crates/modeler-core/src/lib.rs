@@ -389,6 +389,36 @@ impl ReferenceImage {
         let (s, c) = self.rotation_deg.to_radians().sin_cos();
         (u * c + v * s, v * c - u * s, n)
     }
+
+    /// World-space corners of the image rectangle (counter-clockwise).
+    pub fn corners(&self) -> [Vec3; 4] {
+        let (u, v, _) = self.oriented_basis();
+        let half_w = u * (0.5 * self.width_m);
+        let half_h = v * (0.5 * self.height_m());
+        [
+            self.location - half_w - half_h,
+            self.location + half_w - half_h,
+            self.location + half_w + half_h,
+            self.location - half_w + half_h,
+        ]
+    }
+
+    /// Distance along a ray to the image rectangle, if it hits (viewport
+    /// picking — reference images are not physics bodies).
+    pub fn intersect_ray(&self, origin: Vec3, direction: Vec3) -> Option<f32> {
+        let (u, v, n) = self.oriented_basis();
+        let denom = direction.dot(n);
+        if denom.abs() < 1e-9 {
+            return None; // ray parallel to the image plane
+        }
+        let t = (self.location - origin).dot(n) / denom;
+        if t <= 1e-6 {
+            return None;
+        }
+        let p = origin + direction * t - self.location;
+        (p.dot(u).abs() <= 0.5 * self.width_m && p.dot(v).abs() <= 0.5 * self.height_m())
+            .then_some(t)
+    }
 }
 
 /// The scene document — the single source of truth that the renderer and the
@@ -1046,6 +1076,41 @@ mod tests {
         let (u, v, n) = scene.reference_images()[0].oriented_basis();
         assert!(u.dot(v).abs() < 1e-6);
         assert!(u.cross(v).dot(n) > 0.99);
+    }
+
+    #[test]
+    fn reference_image_ray_picking_and_corners() {
+        // 4 m wide, aspect 0.5 -> 2 m tall, on the front plane (Y), at z = 1
+        let image = ReferenceImage {
+            id: 1,
+            name: "front".into(),
+            plane: ImagePlane::Y,
+            location: Vec3::new(0.0, 0.0, 1.0),
+            rotation_deg: 0.0,
+            width_m: 4.0,
+            aspect: 0.5,
+            opacity: 0.5,
+            visible: true,
+            data_base64: String::new(),
+        };
+        // corners span x -2..2, z 0..2 at y = 0
+        let corners = image.corners();
+        let min_z = corners.iter().map(|c| c.z).fold(f32::INFINITY, f32::min);
+        let max_x = corners.iter().map(|c| c.x).fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_z - 0.0).abs() < 1e-5 && (max_x - 2.0).abs() < 1e-5);
+
+        // ray from the front hits the middle at t = 5
+        let t = image
+            .intersect_ray(Vec3::new(1.0, -5.0, 1.5), Vec3::new(0.0, 1.0, 0.0))
+            .expect("hit");
+        assert!((t - 5.0).abs() < 1e-5);
+        // misses beside the rectangle; parallel rays never hit
+        assert!(image
+            .intersect_ray(Vec3::new(3.0, -5.0, 1.0), Vec3::new(0.0, 1.0, 0.0))
+            .is_none());
+        assert!(image
+            .intersect_ray(Vec3::new(0.0, -5.0, 1.0), Vec3::new(1.0, 0.0, 0.0))
+            .is_none());
     }
 
     #[test]

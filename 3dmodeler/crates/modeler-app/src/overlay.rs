@@ -349,6 +349,34 @@ pub fn draw(
         }
     }
 
+    // --- selected reference image (viewport click) ---------------------------
+    if let Some(image_id) = selection.image() {
+        if let Some(image) = scene.reference_images().iter().find(|r| r.id == image_id) {
+            const IMAGE_SEL: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
+            let corners = image.corners();
+            let screen: Vec<_> = corners.iter().filter_map(|&c| project(c)).collect();
+            if screen.len() == 4 {
+                painter.add(egui::Shape::closed_line(
+                    screen.clone(),
+                    egui::Stroke::new(2.0, IMAGE_SEL),
+                ));
+                let top = screen
+                    .iter()
+                    .copied()
+                    .reduce(|a, b| if a.y <= b.y { a } else { b })
+                    .unwrap();
+                text_with_bg(
+                    &painter,
+                    top + egui::vec2(0.0, -8.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &format!("{}  ·  G move · End to ground", image.name),
+                    11.0,
+                    IMAGE_SEL,
+                );
+            }
+        }
+    }
+
     // --- pivot & anchor markers (active object, when set) -------------------
     const PIVOT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
     const ANCHOR_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 205, 225);
