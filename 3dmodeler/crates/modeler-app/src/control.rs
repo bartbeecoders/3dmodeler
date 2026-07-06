@@ -9,7 +9,7 @@
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::{EulerRot, Quat, Vec3};
-use modeler_core::{library, Library, LibraryAsset, ObjectId, Primitive, Scene, Transform};
+use modeler_core::{library, Library, LibraryAsset, ObjectId, Primitive, Scene, Transform, WallCutout};
 use serde_json::{json, Value};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -149,7 +149,7 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
     let (rx, ry, rz) = object.transform.rotation.to_euler(EulerRot::XYZ);
     let world = scene.world_transform(object.id);
     let dims = object.primitive.dimensions() * world.scale.abs();
-    json!({
+    let mut json = json!({
         "id": object.id.0,
         "name": object.name,
         "primitive": format!("{:?}", object.primitive),
@@ -169,7 +169,20 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "show_label": object.show_label,
         "show_dimensions": object.show_dimensions,
         "dimensions_m": [dims.x, dims.y, dims.z],
-    })
+    });
+    if matches!(object.primitive, modeler_core::Primitive::Wall { .. }) {
+        json["cutouts"] = object
+            .cutouts
+            .iter()
+            .map(|c| {
+                json!({
+                    "offset": c.offset, "width": c.width,
+                    "bottom": c.bottom, "height": c.height,
+                })
+            })
+            .collect();
+    }
+    json
 }
 
 fn primitive_from_name(name: &str) -> Option<Primitive> {
@@ -182,6 +195,7 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
         "cylinder" => Some(catalog[4]),
         "cone" => Some(catalog[5]),
         "torus" => Some(catalog[6]),
+        "wall" => Some(Primitive::Wall { length: 2.0, height: 2.5, thickness: 0.2 }),
         _ => None,
     }
 }
@@ -202,8 +216,45 @@ fn apply_object_params(
     let color = params.get("color").map(|v| vec3_from(v).ok_or("color must be [r, g, b] 0..1"));
     let pivot = params.get("pivot").map(|v| vec3_from(v).ok_or("pivot must be [x, y, z]"));
     let anchor = params.get("anchor").map(|v| vec3_from(v).ok_or("anchor must be [x, y, z]"));
+    // wall openings: full replacement of the cutout list
+    let cutouts: Option<Result<Vec<WallCutout>, String>> =
+        params.get("cutouts").filter(|v| !v.is_null()).map(|v| {
+            v.as_array()
+                .ok_or_else(|| "cutouts must be an array".to_string())?
+                .iter()
+                .map(|c| {
+                    let field = |k: &str| {
+                        c.get(k).and_then(Value::as_f64).map(|v| v as f32).ok_or_else(|| {
+                            format!("each cutout needs numeric '{k}' (offset/width/bottom/height, meters)")
+                        })
+                    };
+                    Ok(WallCutout {
+                        offset: field("offset")?,
+                        width: field("width")?,
+                        bottom: field("bottom")?,
+                        height: field("height")?,
+                    })
+                })
+                .collect()
+        });
 
     let object = scene.object_mut(id).ok_or("object vanished")?;
+    // wall dimensions (walls only; ignored elsewhere)
+    if let Primitive::Wall { length, height, thickness } = object.primitive {
+        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+        let (l, h, t) = (get("length"), get("height"), get("thickness"));
+        if l.is_some() || h.is_some() || t.is_some() {
+            object.primitive = Primitive::Wall {
+                length: l.unwrap_or(length).max(0.01),
+                height: h.unwrap_or(height).max(0.01),
+                thickness: t.unwrap_or(thickness).max(0.002),
+            };
+        }
+    }
+    if let Some(cutouts) = cutouts {
+        object.cutouts = cutouts?;
+        object.mesh_revision += 1; // render/physics caches key on it
+    }
     if let Some(location) = location {
         object.transform.location = location?;
     }
@@ -510,7 +561,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());
@@ -1009,6 +1060,79 @@ mod tests {
         // cycle rejected through the API too
         let response = execute(
             &json!({"cmd": "set_parent", "child": "Cube", "parent": "Ball"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn wall_commands_roundtrip() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        // add a wall with explicit dimensions and a door
+        let response = execute(
+            &json!({
+                "cmd": "add_object", "primitive": "wall", "new_name": "South",
+                "length": 4.0, "height": 2.7, "thickness": 0.15,
+                "cutouts": [{"offset": 1.0, "width": 0.9, "bottom": 0.0, "height": 2.1}]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let wall = scene.objects().iter().find(|o| o.name == "South").unwrap();
+        assert_eq!(
+            wall.primitive,
+            Primitive::Wall { length: 4.0, height: 2.7, thickness: 0.15 }
+        );
+        assert_eq!(wall.cutouts.len(), 1);
+
+        // get_scene reports the cutouts and the wall dimensions
+        let response = execute(
+            &json!({"cmd": "get_scene"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        let south = response["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == "South")
+            .unwrap();
+        assert_eq!(south["cutouts"].as_array().unwrap().len(), 1);
+        assert_eq!(south["dimensions_m"][0], 4.0);
+        assert_eq!(south["dimensions_m"][2].as_f64().unwrap() as f32, 2.7);
+
+        // update: change the height, replace the openings with a window
+        let response = execute(
+            &json!({
+                "cmd": "update_object", "object": "South", "height": 3.0,
+                "cutouts": [{"offset": 2.5, "width": 1.2, "bottom": 0.9, "height": 1.2}]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let wall = scene.objects().iter().find(|o| o.name == "South").unwrap();
+        assert_eq!(
+            wall.primitive,
+            Primitive::Wall { length: 4.0, height: 3.0, thickness: 0.15 }
+        );
+        assert!(!wall.cutouts[0].is_door());
+
+        // malformed cutouts are a friendly error
+        let response = execute(
+            &json!({"cmd": "update_object", "object": "South", "cutouts": [{"offset": 1.0}]}),
             &mut scene,
             &mut sel,
             &mut physics,

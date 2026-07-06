@@ -185,20 +185,16 @@ impl PhysicsMirror {
             // back to a convex hull below.
             Primitive::Torus { .. } if !object.dynamic || self.sim == SimState::Stopped => {
                 let mesh = object.primitive.generate(true); // shared-vertex topology
-                let mut vertices: Vec<ffi::b3Vec3> =
-                    mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
-                let mut indices: Vec<i32> = mesh.indices.iter().map(|&i| i as i32).collect();
-
-                let mut def: ffi::b3MeshDef = std::mem::zeroed();
-                def.vertices = vertices.as_mut_ptr();
-                def.indices = indices.as_mut_ptr();
-                def.vertexCount = vertices.len() as i32;
-                def.triangleCount = (indices.len() / 3) as i32;
-                let mesh_data = ffi::b3CreateMesh(&def, std::ptr::null_mut(), 0);
-                if !mesh_data.is_null() {
-                    ffi::b3CreateMeshShape(body, shape_def, mesh_data, bvec(Vec3::ONE));
-                    self.meshes.push(mesh_data); // shape references it; keep alive
-                }
+                self.create_mesh_shape(body, shape_def, &mesh, scale);
+            }
+            // walls with door/window cutouts: exact triangle mesh so rays and
+            // bodies pass through the openings (solid walls stay convex hulls)
+            Primitive::Wall { .. }
+                if !object.cutouts.is_empty()
+                    && (!object.dynamic || self.sim == SimState::Stopped) =>
+            {
+                let mesh = object.collision_mesh();
+                self.create_mesh_shape(body, shape_def, &mesh, scale);
             }
             // everything else is convex: simplified hull of the scaled mesh
             _ => {
@@ -211,6 +207,31 @@ impl PhysicsMirror {
                     ffi::b3DestroyHull(hull); // b3CreateHullShape copies
                 }
             }
+        }
+    }
+
+    /// Exact (non-convex) triangle-mesh shape; box3d keeps a reference to the
+    /// mesh data, so it is stored until the bodies are destroyed.
+    unsafe fn create_mesh_shape(
+        &mut self,
+        body: ffi::b3BodyId,
+        shape_def: &ffi::b3ShapeDef,
+        mesh: &modeler_core::MeshData,
+        scale: Vec3,
+    ) {
+        let mut vertices: Vec<ffi::b3Vec3> =
+            mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
+        let mut indices: Vec<i32> = mesh.indices.iter().map(|&i| i as i32).collect();
+
+        let mut def: ffi::b3MeshDef = std::mem::zeroed();
+        def.vertices = vertices.as_mut_ptr();
+        def.indices = indices.as_mut_ptr();
+        def.vertexCount = vertices.len() as i32;
+        def.triangleCount = (indices.len() / 3) as i32;
+        let mesh_data = ffi::b3CreateMesh(&def, std::ptr::null_mut(), 0);
+        if !mesh_data.is_null() {
+            ffi::b3CreateMeshShape(body, shape_def, mesh_data, bvec(Vec3::ONE));
+            self.meshes.push(mesh_data); // shape references it; keep alive
         }
     }
 

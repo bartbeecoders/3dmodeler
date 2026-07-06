@@ -124,6 +124,7 @@ impl UiState {
         settings: &mut Settings,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
+        wall_tool: &mut crate::wall_tool::WallTool,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -167,7 +168,7 @@ impl UiState {
         }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
-            snap_to_grid, shade_mode, xray,
+            wall_tool, snap_to_grid, shade_mode, xray,
         );
         let top_offset = menu_offset
             + self.toolbar(
@@ -191,9 +192,14 @@ impl UiState {
         if let Some(message) = self.library_panel.dialog_window(ctx, scene, selection, library) {
             self.status_message = Some(message);
         }
-        if let Some(message) =
-            self.context_menu.ui(ctx, scene, selection, modal, &mut self.library_panel)
-        {
+        if let Some(message) = self.context_menu.ui(
+            ctx,
+            scene,
+            selection,
+            modal,
+            &mut self.library_panel,
+            settings.unit,
+        ) {
             self.status_message = Some(message);
         }
         self.library_panel
@@ -218,6 +224,7 @@ impl UiState {
         undo: &mut UndoStack,
         measure: &mut MeasureTool,
         settings: &mut Settings,
+        wall_tool: &mut crate::wall_tool::WallTool,
         snap_to_grid: &mut bool,
         shade_mode: &mut ShadeMode,
         xray: &mut bool,
@@ -270,7 +277,7 @@ impl UiState {
                             Menu::Edit => {
                                 edit_menu(ui, scene, undo, &mut self.settings_window)
                             }
-                            Menu::Add => add_menu_items(ui, scene, measure),
+                            Menu::Add => add_menu_items(ui, scene, measure, wall_tool, settings),
                             Menu::Object => object_menu(
                                 ui, scene, selection, modal, physics,
                                 &mut self.library_panel,
@@ -1075,6 +1082,7 @@ impl UiState {
                         ("Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y", "Undo / redo"),
                         ("Ctrl+S / Ctrl+O / Ctrl+N", "Save / Open / New scene"),
                         ("Ctrl+P / Alt+P", "Parent to active / clear parent"),
+                        ("Add ▸ Wall", "Draw walls on the floor: click corners, Esc ends"),
                         ("Add ▸ Measure", "Ruler: click two points"),
                         ("Esc", "Stop physics (restore)"),
                     ] {
@@ -1122,9 +1130,27 @@ fn edit_menu(
     close
 }
 
-fn add_menu_items(ui: &mut egui::Ui, scene: &mut Scene, measure: &mut MeasureTool) -> bool {
+fn add_menu_items(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    measure: &mut MeasureTool,
+    wall_tool: &mut crate::wall_tool::WallTool,
+    settings: &Settings,
+) -> bool {
     if let Some(primitive) = crate::add_menu::mesh_menu_buttons(ui) {
         scene.add_object(primitive, Transform::default());
+        return true;
+    }
+    ui.separator();
+    if ui
+        .button("Wall")
+        .on_hover_text(
+            "Draw wall segments on the floor: click the start point, then each \
+             corner; Enter keeps the current segment, Esc/RMB ends the tool",
+        )
+        .clicked()
+    {
+        wall_tool.start(settings);
         return true;
     }
     ui.separator();
@@ -1639,6 +1665,7 @@ fn properties(
     let mut pivot = object.pivot;
     let mut anchor = object.anchor;
     let mut changed = false;
+    let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
 
     egui::CollapsingHeader::new("Transform")
         .default_open(true)
@@ -1747,6 +1774,19 @@ fn properties(
                 changed |= primitive_params(ui, &mut primitive);
                 changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
             });
+        // wall openings (doors & windows) — cutout edits regenerate the mesh
+        if let Primitive::Wall { length, height, .. } = primitive {
+            let mut cutouts = object.cutouts.clone();
+            let mut cut_changed = false;
+            egui::CollapsingHeader::new("Openings (doors & windows)")
+                .default_open(true)
+                .show(ui, |ui| {
+                    cut_changed = wall_cutout_rows(ui, &mut cutouts, length, height);
+                });
+            if cut_changed {
+                edited_cutouts = Some(cutouts);
+            }
+        }
     }
 
     egui::CollapsingHeader::new("Adornments")
@@ -1804,6 +1844,12 @@ fn properties(
             object.show_dimensions = adorn.1;
             object.pivot = pivot;
             object.anchor = anchor;
+        }
+    }
+    if let Some(cutouts) = edited_cutouts {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.cutouts = cutouts;
+            object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
     if revert_mesh {
@@ -1896,6 +1942,81 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
             changed |= float_row(ui, "Major radius", major_radius, 0.02);
             changed |= float_row(ui, "Minor radius", minor_radius, 0.02);
         }
+        Primitive::Wall { length, height, thickness } => {
+            changed |= float_row(ui, "Length", length, 0.02);
+            changed |= float_row(ui, "Height", height, 0.02);
+            changed |= float_row(ui, "Thickness", thickness, 0.005);
+        }
     }
+    changed
+}
+
+/// Door/window openings on a wall: per-cutout rows plus add buttons.
+/// Returns true when anything changed (the caller writes back and bumps
+/// `mesh_revision` so the render/physics caches rebuild).
+fn wall_cutout_rows(
+    ui: &mut egui::Ui,
+    cutouts: &mut Vec<modeler_core::WallCutout>,
+    length: f32,
+    height: f32,
+) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    for (i, cutout) in cutouts.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.small_button("✖").on_hover_text("Remove this opening").clicked() {
+                remove = Some(i);
+            }
+            ui.label(
+                egui::RichText::new(if cutout.is_door() {
+                    format!("Door {}", i + 1)
+                } else {
+                    format!("Window {}", i + 1)
+                })
+                .weak()
+                .size(11.0),
+            );
+        });
+        for (label, value, speed) in [
+            ("Offset", &mut cutout.offset, 0.02),
+            ("Width", &mut cutout.width, 0.02),
+            ("Bottom", &mut cutout.bottom, 0.02),
+            ("Height", &mut cutout.height, 0.02),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                changed |= ui
+                    .add(egui::DragValue::new(value).speed(speed).range(0.0..=1000.0))
+                    .changed();
+            });
+        }
+    }
+    if let Some(i) = remove {
+        cutouts.remove(i);
+        changed = true;
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("+ Door")
+            .on_hover_text("Add a 0.9 × 2.1 m door opening at the wall center")
+            .clicked()
+        {
+            cutouts.push(modeler_core::WallCutout::door(0.5 * length, length, height));
+            changed = true;
+        }
+        if ui
+            .button("+ Window")
+            .on_hover_text("Add a 1.2 × 1.2 m window opening at the wall center")
+            .clicked()
+        {
+            cutouts.push(modeler_core::WallCutout::window(
+                0.5 * length,
+                1.5,
+                length,
+                height,
+            ));
+            changed = true;
+        }
+    });
     changed
 }

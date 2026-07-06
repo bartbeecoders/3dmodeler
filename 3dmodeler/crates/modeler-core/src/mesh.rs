@@ -62,6 +62,141 @@ impl MeshData {
     }
 }
 
+/// A rectangular opening (door or window) cut through a wall, in the wall's
+/// local frame: `offset` is the distance from the wall's start along its
+/// length to the opening's left edge, `bottom` the sill height above the
+/// floor (0 for doors).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WallCutout {
+    pub offset: f32,
+    pub width: f32,
+    pub bottom: f32,
+    pub height: f32,
+}
+
+impl WallCutout {
+    /// Standard door opening (0.9 × 2.1 m), horizontally centered on
+    /// `center_x` and clamped inside the wall.
+    pub fn door(center_x: f32, wall_length: f32, wall_height: f32) -> Self {
+        let width = 0.9f32.min(wall_length);
+        Self {
+            offset: (center_x - 0.5 * width).clamp(0.0, (wall_length - width).max(0.0)),
+            width,
+            bottom: 0.0,
+            height: 2.1f32.min(wall_height),
+        }
+    }
+
+    /// Standard window opening (1.2 × 1.2 m) centered on `(center_x,
+    /// center_z)` and clamped inside the wall.
+    pub fn window(center_x: f32, center_z: f32, wall_length: f32, wall_height: f32) -> Self {
+        let width = 1.2f32.min(wall_length);
+        let height = 1.2f32.min(wall_height);
+        Self {
+            offset: (center_x - 0.5 * width).clamp(0.0, (wall_length - width).max(0.0)),
+            width,
+            bottom: (center_z - 0.5 * height).clamp(0.0, (wall_height - height).max(0.0)),
+            height,
+        }
+    }
+
+    pub fn is_door(&self) -> bool {
+        self.bottom <= 1e-4
+    }
+}
+
+/// One quad with per-face vertices; `corners` counter-clockwise seen from
+/// the normal side.
+fn face(m: &mut MeshData, corners: [Vec3; 4], n: Vec3) {
+    let base = m.positions.len() as u32;
+    m.positions.extend_from_slice(&corners);
+    m.normals.extend_from_slice(&[n; 4]);
+    m.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// Wall segment: runs along +X from the origin to `length`, straddling the
+/// X axis in Y (`thickness`), floor at z = 0, top at z = `height`. Cutouts
+/// are rectangular holes through the thickness (doors, windows); a wall
+/// whose cutouts cover it completely falls back to the solid shape so the
+/// mesh never comes out empty.
+pub fn wall(length: f32, height: f32, thickness: f32, cutouts: &[WallCutout]) -> MeshData {
+    let length = length.max(0.01);
+    let height = height.max(0.01);
+    let ht = 0.5 * thickness.max(0.002);
+
+    // clamp the openings into the wall rectangle; drop degenerate ones
+    let holes: Vec<(f32, f32, f32, f32)> = cutouts
+        .iter()
+        .map(|c| {
+            (
+                c.offset.clamp(0.0, length),
+                (c.offset + c.width).clamp(0.0, length),
+                c.bottom.clamp(0.0, height),
+                (c.bottom + c.height).clamp(0.0, height),
+            )
+        })
+        .filter(|(x0, x1, z0, z1)| x1 - x0 > 1e-4 && z1 - z0 > 1e-4)
+        .collect();
+
+    // grid decomposition: cell edges at the wall and cutout boundaries
+    let mut xs = vec![0.0, length];
+    let mut zs = vec![0.0, height];
+    for &(x0, x1, z0, z1) in &holes {
+        xs.extend_from_slice(&[x0, x1]);
+        zs.extend_from_slice(&[z0, z1]);
+    }
+    for edges in [&mut xs, &mut zs] {
+        edges.sort_by(f32::total_cmp);
+        edges.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+    }
+
+    let (nx, nz) = (xs.len() - 1, zs.len() - 1);
+    // outside the wall counts as open, so the rim faces come out of the
+    // same solid/open-boundary rule as the jambs inside the holes
+    let open = |i: isize, j: isize| -> bool {
+        if i < 0 || j < 0 || i >= nx as isize || j >= nz as isize {
+            return true;
+        }
+        let cx = 0.5 * (xs[i as usize] + xs[i as usize + 1]);
+        let cz = 0.5 * (zs[j as usize] + zs[j as usize + 1]);
+        holes
+            .iter()
+            .any(|&(x0, x1, z0, z1)| cx > x0 && cx < x1 && cz > z0 && cz < z1)
+    };
+
+    let mut m = MeshData::default();
+    let v = Vec3::new;
+    for i in 0..nx {
+        for j in 0..nz {
+            if open(i as isize, j as isize) {
+                continue;
+            }
+            let (x0, x1, z0, z1) = (xs[i], xs[i + 1], zs[j], zs[j + 1]);
+            // the two big wall faces of this solid cell
+            face(&mut m, [v(x0, ht, z0), v(x0, ht, z1), v(x1, ht, z1), v(x1, ht, z0)], Vec3::Y);
+            face(&mut m, [v(x0, -ht, z0), v(x1, -ht, z0), v(x1, -ht, z1), v(x0, -ht, z1)], Vec3::NEG_Y);
+            // faces through the thickness wherever the neighbor is open
+            if open(i as isize - 1, j as isize) {
+                face(&mut m, [v(x0, -ht, z0), v(x0, -ht, z1), v(x0, ht, z1), v(x0, ht, z0)], Vec3::NEG_X);
+            }
+            if open(i as isize + 1, j as isize) {
+                face(&mut m, [v(x1, -ht, z0), v(x1, ht, z0), v(x1, ht, z1), v(x1, -ht, z1)], Vec3::X);
+            }
+            if open(i as isize, j as isize - 1) {
+                face(&mut m, [v(x0, -ht, z0), v(x0, ht, z0), v(x1, ht, z0), v(x1, -ht, z0)], Vec3::NEG_Z);
+            }
+            if open(i as isize, j as isize + 1) {
+                face(&mut m, [v(x0, -ht, z1), v(x1, -ht, z1), v(x1, ht, z1), v(x0, ht, z1)], Vec3::Z);
+            }
+        }
+    }
+    if m.indices.is_empty() {
+        return wall(length, height, thickness, &[]);
+    }
+    m
+}
+
 pub fn plane(size: f32) -> MeshData {
     let h = 0.5 * size;
     let mut m = MeshData::default();
@@ -329,6 +464,71 @@ mod tests {
         validate(&torus(48, 12, 1.0, 0.25));
         validate(&cube(2.0).into_flat());
         validate(&uv_sphere(16, 8, 1.0).into_flat());
+        validate(&wall(4.0, 2.5, 0.2, &[]));
+        validate(&wall(
+            4.0,
+            2.5,
+            0.2,
+            &[WallCutout::door(1.0, 4.0, 2.5), WallCutout::window(3.0, 1.5, 4.0, 2.5)],
+        ));
+    }
+
+    #[test]
+    fn wall_cutouts_open_real_holes() {
+        // a point ray through the middle of the door opening must not cross
+        // any triangle; through solid wall it must cross front and back
+        let door = WallCutout::door(1.0, 4.0, 2.5);
+        let m = wall(4.0, 2.5, 0.2, &[door]);
+
+        let crossings = |x: f32, z: f32| -> usize {
+            // count triangles whose XZ projection contains (x, z) — the wall
+            // is a prism along Y, so the ±Y faces are the only ones with
+            // nonzero XZ... use a y-directed segment against all triangles
+            let (o, d) = (Vec3::new(x, -5.0, z), Vec3::new(0.0, 1.0, 0.0));
+            m.indices
+                .chunks_exact(3)
+                .filter(|tri| {
+                    let (a, b, c) = (
+                        m.positions[tri[0] as usize],
+                        m.positions[tri[1] as usize],
+                        m.positions[tri[2] as usize],
+                    );
+                    // Möller–Trumbore
+                    let (e1, e2) = (b - a, c - a);
+                    let p = d.cross(e2);
+                    let det = e1.dot(p);
+                    if det.abs() < 1e-9 {
+                        return false;
+                    }
+                    let t = o - a;
+                    let u = t.dot(p) / det;
+                    let q = t.cross(e1);
+                    let vv = d.dot(q) / det;
+                    u >= -1e-6 && vv >= -1e-6 && u + vv <= 1.0 + 1e-6 && e2.dot(q) / det > 0.0
+                })
+                .count()
+        };
+        assert_eq!(crossings(1.0, 1.0), 0, "ray through the door must be free");
+        assert!(crossings(3.5, 1.0) >= 2, "solid wall must block the ray");
+        assert!(crossings(1.0, 2.3) >= 2, "lintel above the door must block");
+
+        // cutouts covering the whole wall fall back to the solid shape
+        let all = WallCutout { offset: -1.0, width: 10.0, bottom: -1.0, height: 10.0 };
+        let solid = wall(4.0, 2.5, 0.2, &[all]);
+        assert_eq!(solid.indices.len(), wall(4.0, 2.5, 0.2, &[]).indices.len());
+    }
+
+    #[test]
+    fn wall_cutout_constructors_clamp_into_the_wall() {
+        let door = WallCutout::door(0.0, 4.0, 2.5); // centered past the start
+        assert_eq!(door.offset, 0.0);
+        assert!(door.is_door());
+        let door = WallCutout::door(1.0, 0.5, 2.0); // wall shorter than a door
+        assert!(door.width <= 0.5 && door.offset >= 0.0);
+        let win = WallCutout::window(3.9, 2.4, 4.0, 2.5); // near the top corner
+        assert!(win.offset + win.width <= 4.0 + 1e-6);
+        assert!(win.bottom + win.height <= 2.5 + 1e-6);
+        assert!(!win.is_door());
     }
 
     #[test]
@@ -351,6 +551,8 @@ mod tests {
             frustum(16, 1.0, 0.5, 2.0),
             frustum(16, 1.0, 0.0, 2.0),
             torus(24, 8, 1.0, 0.25),
+            wall(4.0, 2.5, 0.2, &[]),
+            wall(4.0, 2.5, 0.2, &[WallCutout::door(1.0, 4.0, 2.5), WallCutout::window(3.0, 1.5, 4.0, 2.5)]),
         ] {
             for tri in mesh.indices.chunks_exact(3) {
                 let a = mesh.positions[tri[0] as usize];

@@ -8,6 +8,9 @@
 //! tools/list, tools/call, ping — is small, and this keeps the binary free of
 //! async runtimes.
 
+// the tool_definitions() json! literal nests deeply (wall cutout schemas)
+#![recursion_limit = "256"]
+
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -55,11 +58,20 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "add_object",
-            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given.",
+            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall"]},
+                    "length": {"type": "number", "description": "Wall only: length in meters (default 2)"},
+                    "height": {"type": "number", "description": "Wall only: height in meters (default 2.5)"},
+                    "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
+                    "cutouts": {"type": "array", "items": {"type": "object", "properties": {
+                        "offset": {"type": "number", "description": "Distance from the wall start to the opening's left edge, meters"},
+                        "width": {"type": "number"},
+                        "bottom": {"type": "number", "description": "Sill height above the floor; 0 for doors"},
+                        "height": {"type": "number"}
+                    }, "required": ["offset", "width", "bottom", "height"]}, "description": "Wall only: door/window openings cut through the wall"},
                     "new_name": {"type": "string", "description": "Optional name (defaults to Blender-style Cube, Cube.001, ...)"},
                     "location": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] in meters"},
                     "rotation_euler_deg": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] Euler angles in degrees"},
@@ -85,6 +97,15 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "object": {"type": "string", "description": "Object name (or id as string)"},
                     "new_name": {"type": "string"},
+                    "length": {"type": "number", "description": "Wall only: length in meters"},
+                    "height": {"type": "number", "description": "Wall only: height in meters"},
+                    "thickness": {"type": "number", "description": "Wall only: thickness in meters"},
+                    "cutouts": {"type": "array", "items": {"type": "object", "properties": {
+                        "offset": {"type": "number"},
+                        "width": {"type": "number"},
+                        "bottom": {"type": "number", "description": "Sill height; 0 for doors"},
+                        "height": {"type": "number"}
+                    }, "required": ["offset", "width", "bottom", "height"]}, "description": "Wall only: REPLACES the full list of door/window openings"},
                     "location": {"type": "array", "items": {"type": "number"}},
                     "rotation_euler_deg": {"type": "array", "items": {"type": "number"}},
                     "scale": {"type": "array", "items": {"type": "number"}},

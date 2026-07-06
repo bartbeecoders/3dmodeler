@@ -13,8 +13,9 @@ use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
 use crate::selection::Selection;
+use crate::settings::Unit;
 use modeler_core::glam::Vec3;
-use modeler_core::{ObjectId, Scene};
+use modeler_core::{ObjectId, Primitive, Scene, WallCutout};
 use three_d::egui;
 
 #[derive(Clone, Copy)]
@@ -53,6 +54,7 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
+        unit: Unit,
     ) -> Option<String> {
         let Some((pos, target)) = self.state else { return None };
         let mut status = None;
@@ -66,7 +68,7 @@ impl ContextMenu {
                     ui.set_min_width(190.0);
                     close = match target {
                         Target::Object { id, hit_local } => object_menu(
-                            ui, scene, selection, modal, library_panel, id, hit_local,
+                            ui, scene, selection, modal, library_panel, id, hit_local, unit,
                             &mut status,
                         ),
                         Target::Element { id, point, label } => {
@@ -99,11 +101,16 @@ fn object_menu(
     library_panel: &mut LibraryPanel,
     id: ObjectId,
     hit_local: Vec3,
+    unit: Unit,
     status: &mut Option<String>,
 ) -> bool {
     let Some(object) = scene.object(id) else { return true };
     let name = object.name.clone();
     let is_group = object.group;
+    let wall = match object.primitive {
+        Primitive::Wall { .. } if object.edited_mesh.is_none() => Some(object.primitive),
+        _ => None,
+    };
     ui.label(
         egui::RichText::new(if is_group { format!("❐ {name} (group)") } else { name.clone() })
             .weak()
@@ -125,6 +132,87 @@ fn object_menu(
             }
             *status = Some(format!("ungrouped '{name}' — parts are now selectable"));
             close = true;
+        }
+        ui.separator();
+    }
+
+    // wall section: dimensions, material and openings at the clicked point
+    if let Some(Primitive::Wall { length, height, thickness }) = wall {
+        ui.label(egui::RichText::new("Wall").weak().size(11.0));
+
+        for (label, value, min, max, speed) in [
+            ("Height", height, 0.1f32, 20.0f32, 0.02f64),
+            ("Thickness", thickness, 0.01, 2.0, 0.005),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                let mut shown = unit.from_meters(value);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut shown)
+                            .speed(speed * unit.per_meter() as f64)
+                            .range(unit.from_meters(min)..=unit.from_meters(max))
+                            .suffix(format!(" {}", unit.suffix())),
+                    )
+                    .changed()
+                {
+                    let value = unit.to_meters(shown).clamp(min, max);
+                    if let Some(object) = scene.object_mut(id) {
+                        object.primitive = match label {
+                            "Height" => Primitive::Wall { length, height: value, thickness },
+                            _ => Primitive::Wall { length, height, thickness: value },
+                        };
+                    }
+                }
+            });
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Material");
+            let mut color = scene.object(id).map(|o| o.material.base_color).unwrap_or_default();
+            if ui.color_edit_button_rgb(&mut color).changed() {
+                if let Some(object) = scene.object_mut(id) {
+                    object.material.base_color = color;
+                }
+            }
+        });
+
+        if ui
+            .button("Add door here")
+            .on_hover_text("Cut a 0.9 × 2.1 m door opening centered on the clicked point")
+            .clicked()
+        {
+            if let Some(object) = scene.object_mut(id) {
+                object.cutouts.push(WallCutout::door(hit_local.x, length, height));
+                object.mesh_revision += 1;
+            }
+            *status = Some(format!("door added to '{name}'"));
+            close = true;
+        }
+        if ui
+            .button("Add window here")
+            .on_hover_text("Cut a 1.2 × 1.2 m window opening centered on the clicked point")
+            .clicked()
+        {
+            if let Some(object) = scene.object_mut(id) {
+                object
+                    .cutouts
+                    .push(WallCutout::window(hit_local.x, hit_local.z, length, height));
+                object.mesh_revision += 1;
+            }
+            *status = Some(format!("window added to '{name}'"));
+            close = true;
+        }
+        let cutout_count = scene.object(id).map(|o| o.cutouts.len()).unwrap_or(0);
+        if cutout_count > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{cutout_count} opening{} — edit in the sidebar (N)",
+                    if cutout_count == 1 { "" } else { "s" }
+                ))
+                .weak()
+                .size(11.0),
+            );
         }
         ui.separator();
     }

@@ -25,6 +25,7 @@ mod selection;
 mod settings;
 mod ui;
 mod undo;
+mod wall_tool;
 
 use camera::BlenderCamera;
 use modeler_core::glam;
@@ -95,6 +96,7 @@ pub fn main() {
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
+    let mut wall_tool = wall_tool::WallTool::new();
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
@@ -153,7 +155,8 @@ pub fn main() {
         let modal_status = edit_mode
             .status_line()
             .or_else(|| modal.status_line())
-            .or_else(|| image_move.status_line());
+            .or_else(|| image_move.status_line())
+            .or_else(|| wall_tool.status_line(settings.unit));
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
         // edit-mode element selection, for "set pivot/anchor to selection"
@@ -185,6 +188,7 @@ pub fn main() {
                     &mut settings,
                     &mut library,
                     edit_point,
+                    &mut wall_tool,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
@@ -232,7 +236,7 @@ pub fn main() {
                         edit,
                     );
                 }
-                add_menu.ui(gui_context, &mut scene);
+                add_menu.ui(gui_context, &mut scene, &mut wall_tool, &settings);
                 delete_tool.ui(gui_context, &mut scene, &mut sel);
                 axis_widget::axis_widget(
                     gui_context,
@@ -479,10 +483,29 @@ pub fn main() {
             }
         }
 
+        // wall tool: click wall segments onto the floor. It owns the mouse
+        // and typed input while active, so it runs before the other tools.
+        if !physics.is_stopped() && wall_tool.active() {
+            wall_tool.abort(&mut scene); // simulation took over mid-draw
+        }
+        if wall_tool.active() && !edit_mode.active() && !modal.active() {
+            wall_tool.handle_events(
+                &mut frame_input.events,
+                &camera,
+                frame_input.viewport,
+                &mut scene,
+                &mut sel,
+                egui_owns_keyboard,
+                pointer_over_ui,
+                snap_to_grid,
+                settings.grid_spacing,
+            );
+        }
+
         // right-click: context menu on the object (object mode) or the
         // vertex/edge/face (edit mode) under the cursor — set pivot/anchor
         // and common actions. Cancel-RMB during modal/grab stays theirs.
-        if physics.is_stopped() && !modal.active() && !edit_mode.grabbing() {
+        if physics.is_stopped() && !modal.active() && !edit_mode.grabbing() && !wall_tool.active() {
             for event in frame_input.events.iter_mut() {
                 if let Event::MousePress {
                     button: MouseButton::Right,
@@ -558,7 +581,7 @@ pub fn main() {
         );
 
         // Space = play/pause, Esc = stop (when not editing)
-        if !modal.active() && !edit_mode.active() {
+        if !modal.active() && !edit_mode.active() && !wall_tool.active() {
             for event in frame_input.events.iter_mut() {
                 if let Event::KeyPress { kind, handled, .. } = event {
                     match kind {
@@ -582,7 +605,7 @@ pub fn main() {
         }
 
         // G on a selected reference image: move it (same gestures as objects)
-        if physics.is_stopped() && !edit_mode.active() && !modal.active() {
+        if physics.is_stopped() && !edit_mode.active() && !modal.active() && !wall_tool.active() {
             image_move.handle_events(
                 &mut frame_input.events,
                 &camera,
@@ -596,7 +619,7 @@ pub fn main() {
 
         // editing tools are disabled while the simulation owns the transforms
         // and while edit mode owns the object
-        if physics.is_stopped() && !edit_mode.active() && !image_move.active() {
+        if physics.is_stopped() && !edit_mode.active() && !image_move.active() && !wall_tool.active() {
             // modal transform operators get first claim on input after the UI
             modal.handle_events(
                 &mut frame_input.events,
@@ -614,7 +637,7 @@ pub fn main() {
 
         ui_state.handle_events(&mut frame_input.events, egui_owns_keyboard, pointer_over_ui);
 
-        if !modal.active() && physics.is_stopped() && !edit_mode.active() {
+        if !modal.active() && physics.is_stopped() && !edit_mode.active() && !wall_tool.active() {
             delete_tool.handle_events(
                 &mut frame_input.events,
                 frame_input.viewport,
@@ -650,7 +673,10 @@ pub fn main() {
         }
 
         // batch this frame's edits into undo checkpoints once things go quiet
-        undo.on_frame(&scene, modal.active() || edit_mode.grabbing() || !physics.is_stopped());
+        undo.on_frame(
+            &scene,
+            modal.active() || edit_mode.grabbing() || wall_tool.drawing() || !physics.is_stopped(),
+        );
 
         // overlap warning while placing (grab/rotate/scale active)
         let overlaps = if modal.active() {

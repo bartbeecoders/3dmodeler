@@ -85,6 +85,9 @@ pub struct Settings {
     pub unit: Unit,
     /// Starting directory for Save/Open dialogs (native only).
     pub default_save_dir: Option<String>,
+    /// Defaults for walls drawn with the wall tool, meters.
+    pub default_wall_height: f32,
+    pub default_wall_thickness: f32,
 }
 
 impl Default for Settings {
@@ -95,6 +98,8 @@ impl Default for Settings {
             grid_major_color: [76, 80, 87],
             unit: Unit::Meters,
             default_save_dir: None,
+            default_wall_height: 2.5,
+            default_wall_thickness: 0.2,
         }
     }
 }
@@ -195,16 +200,18 @@ fn poll_pick_dir() -> Option<String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Viewport,
+    Tools,
     Units,
     Files,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Viewport, Tab::Units, Tab::Files];
+    const ALL: [Tab; 4] = [Tab::Viewport, Tab::Tools, Tab::Units, Tab::Files];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Viewport => "Viewport",
+            Tab::Tools => "Tools",
             Tab::Units => "Units",
             Tab::Files => "Files",
         }
@@ -262,6 +269,7 @@ impl SettingsWindow {
                         ui.set_min_height(400.0);
                         egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                             Tab::Viewport => viewport_tab(ui, settings),
+                            Tab::Tools => tools_tab(ui, settings),
                             Tab::Units => units_tab(ui, settings),
                             Tab::Files => files_tab(ui, settings),
                         });
@@ -314,6 +322,49 @@ fn viewport_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     }
     ui.add_space(4.0);
     ui.weak("Every 10th line uses the major color; the X and Y axes keep their red/green.");
+}
+
+fn tools_tab(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.heading("Wall tool");
+    ui.add_space(6.0);
+    let unit = settings.unit;
+    egui::Grid::new("wall-settings")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Default height");
+            let mut value = unit.from_meters(settings.default_wall_height);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut value)
+                        .speed(0.02 * unit.per_meter() as f64)
+                        .range(unit.from_meters(0.1)..=unit.from_meters(20.0))
+                        .suffix(format!(" {}", unit.suffix())),
+                )
+                .changed()
+            {
+                settings.default_wall_height = unit.to_meters(value).clamp(0.1, 20.0);
+            }
+            ui.end_row();
+
+            ui.label("Default thickness");
+            let mut value = unit.from_meters(settings.default_wall_thickness);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut value)
+                        .speed(0.005 * unit.per_meter() as f64)
+                        .range(unit.from_meters(0.01)..=unit.from_meters(2.0))
+                        .suffix(format!(" {}", unit.suffix())),
+                )
+                .changed()
+            {
+                settings.default_wall_thickness = unit.to_meters(value).clamp(0.01, 2.0);
+            }
+            ui.end_row();
+        });
+    ui.add_space(4.0);
+    ui.weak("New walls drawn with Add ▸ Wall use these; each wall's height, thickness \
+             and openings stay editable afterwards (sidebar or right-click).");
 }
 
 fn units_tab(ui: &mut egui::Ui, settings: &mut Settings) {

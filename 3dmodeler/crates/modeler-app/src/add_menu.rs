@@ -79,7 +79,13 @@ impl AddMenu {
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, scene: &mut Scene) {
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        wall_tool: &mut crate::wall_tool::WallTool,
+        settings: &crate::settings::Settings,
+    ) {
         if !self.open {
             return;
         }
@@ -93,6 +99,18 @@ impl AddMenu {
                     ui.separator();
                     if let Some(primitive) = mesh_menu_buttons(ui) {
                         scene.add_object(primitive, Transform::default());
+                        self.open = false;
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Wall")
+                        .on_hover_text(
+                            "Draw wall segments on the floor: click start and corners, \
+                             Esc/RMB ends",
+                        )
+                        .clicked()
+                    {
+                        wall_tool.start(settings);
                         self.open = false;
                     }
                 });

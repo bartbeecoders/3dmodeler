@@ -10,7 +10,7 @@ pub mod mesh;
 use glam::{Quat, Vec3};
 pub use glam;
 pub use library::{Library, LibraryAsset};
-pub use mesh::MeshData;
+pub use mesh::{MeshData, WallCutout};
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for an object in the scene.
@@ -98,6 +98,10 @@ pub enum Primitive {
     Cylinder { vertices: u32, radius: f32, depth: f32 },
     Cone { vertices: u32, radius_bottom: f32, radius_top: f32, depth: f32 },
     Torus { major_segments: u32, minor_segments: u32, major_radius: f32, minor_radius: f32 },
+    /// Building wall segment: origin at its start, running along local +X,
+    /// standing on z = 0, thickness centered on the X axis. Door/window
+    /// openings live on the OBJECT (`Object::cutouts`), not here.
+    Wall { length: f32, height: f32, thickness: f32 },
 }
 
 impl Primitive {
@@ -124,6 +128,7 @@ impl Primitive {
             Primitive::Cylinder { .. } => "Cylinder",
             Primitive::Cone { .. } => "Cone",
             Primitive::Torus { .. } => "Torus",
+            Primitive::Wall { .. } => "Wall",
         }
     }
 
@@ -139,6 +144,11 @@ impl Primitive {
                 (r * r + 0.25 * depth * depth).sqrt()
             }
             Primitive::Torus { major_radius, minor_radius, .. } => major_radius + minor_radius,
+            // origin at the start-bottom corner: the far top corner is the
+            // most distant point
+            Primitive::Wall { length, height, thickness } => {
+                (length * length + 0.25 * thickness * thickness + height * height).sqrt()
+            }
         }
     }
 
@@ -161,6 +171,9 @@ impl Primitive {
                 let d = 2.0 * (major_radius + minor_radius);
                 Vec3::new(d, d, 2.0 * minor_radius)
             }
+            Primitive::Wall { length, height, thickness } => {
+                Vec3::new(length, thickness, height)
+            }
         }
     }
 
@@ -172,6 +185,7 @@ impl Primitive {
             Primitive::UvSphere { radius, .. } | Primitive::IcoSphere { radius, .. } => radius,
             Primitive::Cylinder { depth, .. } | Primitive::Cone { depth, .. } => 0.5 * depth,
             Primitive::Torus { minor_radius, .. } => minor_radius,
+            Primitive::Wall { .. } => 0.0, // stands on its own floor line
         }
     }
 
@@ -188,6 +202,10 @@ impl Primitive {
             }
             Primitive::Torus { major_segments, minor_segments, major_radius, minor_radius } => {
                 mesh::torus(major_segments, minor_segments, major_radius, minor_radius)
+            }
+            // solid wall; cutouts need the object and go through render_mesh
+            Primitive::Wall { length, height, thickness } => {
+                mesh::wall(length, height, thickness, &[])
             }
         };
         if smooth {
@@ -251,6 +269,11 @@ pub struct Object {
     /// library assets are grouped by default; Ungroup clears the flag.
     #[serde(default)]
     pub group: bool,
+    /// Door/window openings, for `Primitive::Wall` objects only (ignored
+    /// elsewhere). Editors must bump `mesh_revision` when they change these
+    /// so the render/physics caches resync.
+    #[serde(default)]
+    pub cutouts: Vec<WallCutout>,
     /// Result of mesh editing (Tab edit mode): when present it replaces the
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
@@ -262,19 +285,27 @@ pub struct Object {
 }
 
 impl Object {
-    /// The mesh to draw: the edited mesh if any, else the primitive.
+    /// The mesh to draw: the edited mesh if any, else the primitive (walls
+    /// include their door/window cutouts).
     pub fn render_mesh(&self) -> MeshData {
-        match &self.edited_mesh {
-            Some(mesh) => mesh.clone(),
-            None => self.primitive.generate(self.smooth),
+        match (&self.edited_mesh, self.primitive) {
+            (Some(mesh), _) => mesh.clone(),
+            (None, Primitive::Wall { length, height, thickness }) => {
+                mesh::wall(length, height, thickness, &self.cutouts)
+            }
+            (None, primitive) => primitive.generate(self.smooth),
         }
     }
 
-    /// The mesh for collision building (shared-vertex topology preferred).
+    /// The mesh for collision building (shared-vertex topology preferred;
+    /// walls keep their cutouts so rays pass through doors and windows).
     pub fn collision_mesh(&self) -> MeshData {
-        match &self.edited_mesh {
-            Some(mesh) => mesh.clone(),
-            None => self.primitive.generate(true),
+        match (&self.edited_mesh, self.primitive) {
+            (Some(mesh), _) => mesh.clone(),
+            (None, Primitive::Wall { length, height, thickness }) => {
+                mesh::wall(length, height, thickness, &self.cutouts)
+            }
+            (None, primitive) => primitive.generate(true),
         }
     }
 
@@ -496,6 +527,7 @@ impl Scene {
             pivot: Vec3::ZERO,
             anchor: Vec3::ZERO,
             group: false,
+            cutouts: Vec::new(),
             edited_mesh: None,
             mesh_revision: 0,
         });
@@ -1026,6 +1058,35 @@ mod tests {
         // cycles and self-attach rejected
         assert!(!scene.attach(table, cup, None));
         assert!(!scene.attach(table, table, None));
+    }
+
+    #[test]
+    fn wall_cutouts_survive_json_and_reach_the_meshes() {
+        let mut scene = Scene::new();
+        let wall = Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 };
+        let id = scene.add_object(wall, Transform::default());
+        assert_eq!(scene.object(id).unwrap().name, "Wall");
+
+        let solid_tris = scene.object(id).unwrap().render_mesh().indices.len();
+        scene.object_mut(id).unwrap().cutouts.push(WallCutout::door(1.0, 4.0, 2.5));
+        let object = scene.object(id).unwrap();
+        assert_ne!(object.render_mesh().indices.len(), solid_tris);
+        assert_eq!(
+            object.render_mesh().indices.len(),
+            object.collision_mesh().indices.len(),
+            "render and collision meshes must both carry the cutouts"
+        );
+
+        // dimensions / bottom line: stands on z = 0
+        assert_eq!(wall.dimensions(), Vec3::new(4.0, 0.2, 2.5));
+        assert_eq!(wall.bottom_offset(), 0.0);
+        assert_eq!(scene.lowest_point_z(id), 0.0);
+
+        // save/load keeps the openings; old files (no field) still load
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.objects[0].cutouts.len(), 1);
+        let old: SceneData = serde_json::from_str(r#"{"objects": [], "next_id": 1}"#).unwrap();
+        assert!(old.objects.is_empty());
     }
 
     #[test]
