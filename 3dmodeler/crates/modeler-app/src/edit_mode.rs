@@ -158,14 +158,23 @@ pub fn build_topology(mesh: &MeshData) -> Topology {
     Topology { verts, weld_of, tris, faces, edges }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TransformKind {
+    Move,
+    Rotate,
+    Scale,
+}
+
 struct Grab {
+    kind: TransformKind,
     /// Affected welded ids with their original local positions.
     originals: Vec<(usize, Vec3)>,
     start_mouse: (f32, f32),
     cur_mouse: (f32, f32),
-    /// None = screen plane, Some(axis) = world axis constraint.
+    /// None = screen plane / view axis / uniform, Some(axis) = world axis.
     constraint: Option<usize>,
-    /// World-space pivot at grab start (for world-per-pixel scaling).
+    /// World-space pivot at grab start: element centroid (move uses it for
+    /// world-per-pixel scaling; rotate/scale transform around it).
     pivot_world: Vec3,
     status: String,
 }
@@ -176,6 +185,10 @@ pub struct EditMode {
     selected: Option<Element>,
     topo: Option<Topology>,
     topo_revision: u64,
+    /// Scene instance we entered on: a replaced document (File ▸ New,
+    /// control new_scene) restarts object ids, so the active id could
+    /// silently rebind to an unrelated object.
+    scene_instance: u64,
     grab: Option<Grab>,
     last_mouse: (f32, f32),
 }
@@ -188,6 +201,50 @@ fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
     t.location + t.rotation * (p * t.scale)
 }
 
+fn world_to_local(t: &Transform, w: Vec3) -> Vec3 {
+    let safe_scale = Vec3::new(
+        if t.scale.x.abs() < 1e-9 { 1.0 } else { t.scale.x },
+        if t.scale.y.abs() < 1e-9 { 1.0 } else { t.scale.y },
+        if t.scale.z.abs() < 1e-9 { 1.0 } else { t.scale.z },
+    );
+    (t.rotation.inverse() * (w - t.location)) / safe_scale
+}
+
+/// Rotate local mesh positions around a world-space pivot: local -> world,
+/// rotate, back to local. Exact for any object transform, since edited
+/// meshes store arbitrary per-vertex positions.
+fn rotate_positions(
+    world: &Transform,
+    originals: &[(usize, Vec3)],
+    pivot_world: Vec3,
+    rotation: modeler_core::glam::Quat,
+) -> Vec<(usize, Vec3)> {
+    originals
+        .iter()
+        .map(|&(weld, local)| {
+            let w = local_to_world(world, local);
+            (weld, world_to_local(world, pivot_world + rotation * (w - pivot_world)))
+        })
+        .collect()
+}
+
+/// Scale local mesh positions around a world-space pivot (per-world-axis
+/// factors, like the object-mode S operator).
+fn scale_positions(
+    world: &Transform,
+    originals: &[(usize, Vec3)],
+    pivot_world: Vec3,
+    factors: Vec3,
+) -> Vec<(usize, Vec3)> {
+    originals
+        .iter()
+        .map(|&(weld, local)| {
+            let w = local_to_world(world, local);
+            (weld, world_to_local(world, pivot_world + (w - pivot_world) * factors))
+        })
+        .collect()
+}
+
 impl EditMode {
     pub fn new() -> Self {
         Self {
@@ -196,6 +253,7 @@ impl EditMode {
             selected: None,
             topo: None,
             topo_revision: 0,
+            scene_instance: 0,
             grab: None,
             last_mouse: (0.0, 0.0),
         }
@@ -248,7 +306,7 @@ impl EditMode {
         Some(match &self.grab {
             Some(grab) => grab.status.clone(),
             None => format!(
-                "EDIT MODE ({}) · click select · G move · P/A set pivot/anchor · \
+                "EDIT MODE ({}) · click select · G/R/S transform · P/A set pivot/anchor · \
                  1/2/3 vertex/edge/face · Tab exit",
                 self.mode.label()
             ),
@@ -269,6 +327,7 @@ impl EditMode {
         self.active = Some(id);
         self.selected = None;
         self.grab = None;
+        self.scene_instance = scene.instance();
         self.rebuild_topology(scene);
     }
 
@@ -285,6 +344,10 @@ impl EditMode {
     /// by undo, …). Call once per frame before handling events.
     pub fn sync(&mut self, scene: &mut Scene) {
         let Some(id) = self.active else { return };
+        if scene.instance() != self.scene_instance {
+            self.exit(scene); // whole document replaced under us
+            return;
+        }
         match scene.object(id) {
             None => self.exit(scene),
             Some(object) => {
@@ -425,7 +488,19 @@ impl EditMode {
                 true
             }
             "g" | "G" => {
-                self.start_grab(scene);
+                self.start_transform(TransformKind::Move, scene);
+                true
+            }
+            "r" | "R" => {
+                if self.grab.is_none() {
+                    self.start_transform(TransformKind::Rotate, scene);
+                }
+                true
+            }
+            "s" | "S" => {
+                if self.grab.is_none() {
+                    self.start_transform(TransformKind::Scale, scene);
+                }
                 true
             }
             // P / A: the selected element becomes the pivot / anchor point
@@ -441,8 +516,9 @@ impl EditMode {
                 }
                 true
             }
-            // swallow the object-mode tools so they can't fire mid-edit
-            "r" | "R" | "s" | "S" | "x" | "X" | "y" | "Y" | "z" | "Z" | "D" => {
+            // axis constraints while transforming; swallow the object-mode
+            // tools so they can't fire mid-edit
+            "x" | "X" | "y" | "Y" | "z" | "Z" | "D" => {
                 if self.grab.is_some() {
                     self.grab_constraint(text);
                 }
@@ -554,12 +630,16 @@ impl EditMode {
         }
     }
 
-    fn start_grab(&mut self, scene: &mut Scene) {
+    fn start_transform(&mut self, kind: TransformKind, scene: &mut Scene) {
         if self.grab.is_some() {
             return;
         }
         let affected = self.affected_verts();
         if affected.is_empty() {
+            return;
+        }
+        // rotating/scaling a single vertex is a no-op — needs an edge/face
+        if kind != TransformKind::Move && affected.len() < 2 {
             return;
         }
         let Some(id) = self.active else { return };
@@ -576,6 +656,7 @@ impl EditMode {
         let centroid = affected.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
             / affected.len() as f32;
         self.grab = Some(Grab {
+            kind,
             originals: affected.iter().map(|&v| (v, topo.verts[v])).collect(),
             start_mouse: self.last_mouse,
             cur_mouse: self.last_mouse,
@@ -596,68 +677,112 @@ impl EditMode {
         let Some(grab) = &mut self.grab else { return };
 
         let world = scene.world_transform(id);
-        let (right, up, _) = camera.screen_basis();
-        let (right, up) = (gv(right), gv(up));
-        let wpp = camera.world_per_pixel_at(
-            viewport,
-            three_d::vec3(grab.pivot_world.x, grab.pivot_world.y, grab.pivot_world.z),
-        );
-        let dx = grab.cur_mouse.0 - grab.start_mouse.0;
-        let dy = grab.cur_mouse.1 - grab.start_mouse.1;
-        let mut delta = right * (dx * wpp) + up * (dy * wpp);
-        if let Some(axis) = grab.constraint {
-            let a = [Vec3::X, Vec3::Y, Vec3::Z][axis];
-            delta = a * delta.dot(a);
-        }
+        let element = match self.selected {
+            Some(Element::Vertex(_)) => "vertex",
+            Some(Element::Edge(..)) => "edge",
+            Some(Element::Face(_)) => "face",
+            None => "?",
+        };
+        let constraint_tag = match grab.constraint {
+            Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
+            None => String::new(),
+        };
+        let pivot_cg = three_d::vec3(grab.pivot_world.x, grab.pivot_world.y, grab.pivot_world.z);
 
-        let shown = delta * unit.per_meter();
-        grab.status = format!(
-            "Move {}: ({:.p$}, {:.p$}, {:.p$}) {}{}   |   LMB/Enter confirm · RMB/Esc cancel",
-            match self.selected {
-                Some(Element::Vertex(_)) => "vertex",
-                Some(Element::Edge(..)) => "edge",
-                Some(Element::Face(_)) => "face",
-                None => "?",
-            },
-            shown.x,
-            shown.y,
-            shown.z,
-            unit.suffix(),
-            match grab.constraint {
-                Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
-                None => String::new(),
-            },
-            p = unit.decimals(),
-        );
+        let targets: Vec<(usize, Vec3)> = match grab.kind {
+            TransformKind::Move => {
+                let (right, up, _) = camera.screen_basis();
+                let (right, up) = (gv(right), gv(up));
+                let wpp = camera.world_per_pixel_at(viewport, pivot_cg);
+                let dx = grab.cur_mouse.0 - grab.start_mouse.0;
+                let dy = grab.cur_mouse.1 - grab.start_mouse.1;
+                let mut delta = right * (dx * wpp) + up * (dy * wpp);
+                if let Some(axis) = grab.constraint {
+                    let a = [Vec3::X, Vec3::Y, Vec3::Z][axis];
+                    delta = a * delta.dot(a);
+                }
 
-        // world delta -> local delta (mesh positions are local)
-        let inv_rot = world.rotation.inverse();
-        let safe_scale = Vec3::new(
-            if world.scale.x.abs() < 1e-9 { 1.0 } else { world.scale.x },
-            if world.scale.y.abs() < 1e-9 { 1.0 } else { world.scale.y },
-            if world.scale.z.abs() < 1e-9 { 1.0 } else { world.scale.z },
-        );
-        let local_delta = (inv_rot * delta) / safe_scale;
+                let shown = delta * unit.per_meter();
+                grab.status = format!(
+                    "Move {element}: ({:.p$}, {:.p$}, {:.p$}) {}{constraint_tag}   |   \
+                     LMB/Enter confirm · RMB/Esc cancel",
+                    shown.x,
+                    shown.y,
+                    shown.z,
+                    unit.suffix(),
+                    p = unit.decimals(),
+                );
 
-        let originals = grab.originals.clone();
-        self.write_positions(scene, &originals, local_delta);
+                // world delta -> local delta (mesh positions are local)
+                let local_delta = world_to_local(&world, world.location + delta)
+                    - world_to_local(&world, world.location);
+                grab.originals.iter().map(|&(w, p)| (w, p + local_delta)).collect()
+            }
+            TransformKind::Rotate => {
+                let pivot_screen = camera.world_to_screen(viewport, pivot_cg);
+                let a0 = (grab.start_mouse.1 - pivot_screen.1)
+                    .atan2(grab.start_mouse.0 - pivot_screen.0);
+                let a1 = (grab.cur_mouse.1 - pivot_screen.1)
+                    .atan2(grab.cur_mouse.0 - pivot_screen.0);
+                // rotation axis: view axis (toward the viewer) or a world axis
+                let (_, _, forward) = camera.screen_basis();
+                let view_axis = -gv(forward);
+                let (axis, sign) = match grab.constraint {
+                    None => (view_axis, 1.0),
+                    Some(i) => {
+                        let axis = [Vec3::X, Vec3::Y, Vec3::Z][i];
+                        (axis, if axis.dot(view_axis) >= 0.0 { 1.0 } else { -1.0 })
+                    }
+                };
+                let angle = sign * (a1 - a0);
+                grab.status = format!(
+                    "Rotate {element}: {:.1}°{constraint_tag}   |   \
+                     LMB/Enter confirm · RMB/Esc cancel",
+                    angle.to_degrees(),
+                );
+                let rotation =
+                    modeler_core::glam::Quat::from_axis_angle(axis.normalize_or_zero(), angle);
+                rotate_positions(&world, &grab.originals, grab.pivot_world, rotation)
+            }
+            TransformKind::Scale => {
+                let pivot_screen = camera.world_to_screen(viewport, pivot_cg);
+                let d0 = ((grab.start_mouse.0 - pivot_screen.0).powi(2)
+                    + (grab.start_mouse.1 - pivot_screen.1).powi(2))
+                .sqrt()
+                .max(1.0);
+                let d1 = ((grab.cur_mouse.0 - pivot_screen.0).powi(2)
+                    + (grab.cur_mouse.1 - pivot_screen.1).powi(2))
+                .sqrt();
+                let factor = d1 / d0;
+                let factors = match grab.constraint {
+                    None => Vec3::splat(factor),
+                    Some(i) => {
+                        let mut f = Vec3::ONE;
+                        f[i] = factor;
+                        f
+                    }
+                };
+                grab.status = format!(
+                    "Scale {element}: {factor:.3}{constraint_tag}   |   \
+                     LMB/Enter confirm · RMB/Esc cancel",
+                );
+                scale_positions(&world, &grab.originals, grab.pivot_world, factors)
+            }
+        };
+
+        self.write_positions(scene, &targets);
     }
 
-    /// Move welded vertices to original + delta, update the topology copy
-    /// and the object's mesh (all duplicated mesh vertices follow).
-    fn write_positions(
-        &mut self,
-        scene: &mut Scene,
-        originals: &[(usize, Vec3)],
-        local_delta: Vec3,
-    ) {
+    /// Write absolute local positions for welded vertices, updating the
+    /// topology copy and the object's mesh (all duplicated mesh vertices
+    /// follow).
+    fn write_positions(&mut self, scene: &mut Scene, positions: &[(usize, Vec3)]) {
         let Some(id) = self.active else { return };
         let Some(topo) = &mut self.topo else { return };
         let Some(object) = scene.object_mut(id) else { return };
         let Some(mesh) = &mut object.edited_mesh else { return };
 
-        for &(weld, original) in originals {
-            let new_pos = original + local_delta;
+        for &(weld, new_pos) in positions {
             topo.verts[weld] = new_pos;
             for (i, &w) in topo.weld_of.iter().enumerate() {
                 if w == weld {
@@ -671,7 +796,7 @@ impl EditMode {
     }
 
     fn cancel_grab_inner(&mut self, scene: &mut Scene, grab: Grab) {
-        self.write_positions(scene, &grab.originals, Vec3::ZERO);
+        self.write_positions(scene, &grab.originals);
     }
 
     // --- overlay data --------------------------------------------------------
@@ -799,8 +924,8 @@ mod tests {
             .iter()
             .position(|v| (*v - Vec3::ONE).length() < 1e-4)
             .expect("corner");
-        let originals = vec![(corner, Vec3::ONE)];
-        edit.write_positions(&mut scene, &originals, Vec3::new(0.0, 0.0, 0.5));
+        let targets = vec![(corner, Vec3::ONE + Vec3::new(0.0, 0.0, 0.5))];
+        edit.write_positions(&mut scene, &targets);
 
         let mesh = scene.object(id).unwrap().edited_mesh.as_ref().unwrap();
         let moved: Vec<&Vec3> = mesh
@@ -817,6 +942,111 @@ mod tests {
         assert!(mesh.normals.iter().all(|n| (n.length() - 1.0).abs() < 1e-3));
         // revision bumped so caches resync
         assert_eq!(scene.object(id).unwrap().mesh_revision, 1);
+    }
+
+    #[test]
+    fn edit_mode_exits_when_the_scene_is_replaced() {
+        let mut scene = Scene::default_scene();
+        let id = scene.objects()[0].id;
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        assert!(edit.active());
+
+        // File ▸ New / control new_scene: fresh document, ids restart — the
+        // new cube reuses the SAME id, but edit mode must not rebind to it
+        scene = Scene::default_scene();
+        assert_eq!(scene.objects()[0].id, id);
+        edit.sync(&mut scene);
+        assert!(!edit.active());
+    }
+
+    #[test]
+    fn face_scales_toward_its_centroid() {
+        // top face of a unit-ish cube: corners (±1, ±1, 1), centroid (0,0,1)
+        let world = Transform::default();
+        let originals: Vec<(usize, Vec3)> = [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        .collect();
+        let pivot = Vec3::new(0.0, 0.0, 1.0);
+
+        // uniform 0.5: corners move halfway to the centroid, z stays
+        let scaled = scale_positions(&world, &originals, pivot, Vec3::splat(0.5));
+        assert!((scaled[0].1 - Vec3::new(0.5, 0.5, 1.0)).length() < 1e-5);
+        assert!((scaled[2].1 - Vec3::new(-0.5, -0.5, 1.0)).length() < 1e-5);
+
+        // X-constrained: only x shrinks
+        let scaled = scale_positions(&world, &originals, pivot, Vec3::new(0.5, 1.0, 1.0));
+        assert!((scaled[0].1 - Vec3::new(0.5, 1.0, 1.0)).length() < 1e-5);
+
+        // a moved & scaled OBJECT still scales exactly around the world pivot
+        let mut moved = Transform::default();
+        moved.location = Vec3::new(10.0, 0.0, 0.0);
+        moved.scale = Vec3::new(2.0, 1.0, 1.0);
+        let pivot_world = local_to_world(&moved, pivot);
+        let scaled = scale_positions(&moved, &originals, pivot_world, Vec3::splat(0.5));
+        // world corner (12,1,1) -> (11,0.5,1) -> local (0.5, 0.5, 1)
+        assert!((scaled[0].1 - Vec3::new(0.5, 0.5, 1.0)).length() < 1e-5, "{:?}", scaled[0].1);
+    }
+
+    #[test]
+    fn face_rotates_around_its_centroid() {
+        let world = Transform::default();
+        let originals: Vec<(usize, Vec3)> = [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        .collect();
+        let pivot = Vec3::new(0.0, 0.0, 1.0);
+
+        // 90° about Z through the centroid: (1,1,1) -> (-1,1,1)
+        let rotation = modeler_core::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let rotated = rotate_positions(&world, &originals, pivot, rotation);
+        assert!((rotated[0].1 - Vec3::new(-1.0, 1.0, 1.0)).length() < 1e-5, "{:?}", rotated[0].1);
+        assert!((rotated[1].1 - Vec3::new(-1.0, -1.0, 1.0)).length() < 1e-5);
+
+        // the centroid itself is a fixed point
+        let fixed = rotate_positions(&world, &[(0, pivot)], pivot, rotation);
+        assert!((fixed[0].1 - pivot).length() < 1e-6);
+    }
+
+    #[test]
+    fn rotate_and_scale_require_more_than_one_vertex() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut edit = EditMode::new();
+        edit.active = Some(id);
+        edit.rebuild_topology(&scene);
+
+        // single vertex: R and S refuse to start, G works
+        edit.selected = Some(Element::Vertex(0));
+        assert!(edit.text_input("r", &mut scene));
+        assert!(edit.grab.is_none());
+        assert!(edit.text_input("s", &mut scene));
+        assert!(edit.grab.is_none());
+
+        // an edge starts a rotate (and bakes the primitive into a mesh)
+        let (a, b) = edit.topo.as_ref().unwrap().edges[0];
+        edit.selected = Some(Element::Edge(a, b));
+        assert!(edit.text_input("r", &mut scene));
+        assert!(edit.grab.is_some());
+        assert_eq!(edit.grab.as_ref().unwrap().kind, TransformKind::Rotate);
+        assert!(scene.object(id).unwrap().edited_mesh.is_some());
+        edit.grab = None;
+
+        // a face starts a scale
+        edit.selected = Some(Element::Face(0));
+        assert!(edit.text_input("s", &mut scene));
+        assert_eq!(edit.grab.as_ref().unwrap().kind, TransformKind::Scale);
     }
 
     #[test]

@@ -357,18 +357,42 @@ impl ReferenceImage {
 
 /// The scene document — the single source of truth that the renderer and the
 /// physics mirror derive their state from.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Scene {
     objects: Vec<Object>,
     measurements: Vec<Measurement>,
     reference_images: Vec<ReferenceImage>,
     next_id: u64,
     version: u64,
+    /// Process-unique id of this Scene value. Editors use it to notice the
+    /// document being REPLACED (File ▸ New, control new_scene) — object ids
+    /// restart there, so an id alone can silently match a different object.
+    instance: u64,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        Self {
+            objects: Vec::new(),
+            measurements: Vec::new(),
+            reference_images: Vec::new(),
+            next_id: 0,
+            version: 0,
+            instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 impl Scene {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// See the `instance` field: changes when the whole document is swapped.
+    pub fn instance(&self) -> u64 {
+        self.instance
     }
 
     /// Blender-like startup scene: a default cube.

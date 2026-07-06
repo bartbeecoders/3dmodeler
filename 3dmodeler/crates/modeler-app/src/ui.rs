@@ -1032,7 +1032,7 @@ impl UiState {
                         ("X / Delete", "Delete (confirm / immediate)"),
                         ("Tab", "Object edit mode (active object)"),
                         ("1 / 2 / 3 (edit)", "Vertex / Edge / Face select"),
-                        ("G (edit)", "Move selected element (X/Y/Z axis)"),
+                        ("G / R / S (edit)", "Move / rotate / scale element (X/Y/Z axis)"),
                         ("P / A (edit)", "Selected element becomes pivot / anchor"),
                         ("N", "Toggle sidebar"),
                         ("Space", "Play / pause physics"),
