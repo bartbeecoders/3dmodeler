@@ -45,7 +45,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "get_scene",
-            "description": "Read the full scene: all objects (id, name, primitive, local & world transforms, parent, color, physics flags, dimensions in meters), measurements and the simulation state. Call this first to see what exists.",
+            "description": "Read the full scene: all objects (id, name, primitive, local & world transforms, parent, pivot & anchor points, group flag, color, physics flags, dimensions in meters), measurements and the simulation state. Call this first to see what exists.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -71,7 +71,8 @@ fn tool_definitions() -> Value {
                     "show_label": {"type": "boolean", "description": "Show the name as a viewport label"},
                     "show_dimensions": {"type": "boolean", "description": "Show W×D×H dimensions in the viewport"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space pivot point: interactive rotations (R) spin the object around it"},
-                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space anchor point: where the object attaches to another object (attach_object)"}
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space anchor point: where the object attaches to another object (attach_object)"},
+                    "group": {"type": "boolean", "description": "Group root flag: this object + its (later-parented) descendants select as ONE unit in the viewport"}
                 },
                 "required": ["primitive"]
             }
@@ -120,6 +121,27 @@ fn tool_definitions() -> Value {
                     "parent": {"type": ["string", "null"]}
                 },
                 "required": ["child"]
+            }
+        },
+        {
+            "name": "group_objects",
+            "description": "Group scene objects into ONE unit: every object is parented to the root (world placement preserved) and the root gets the group flag — viewport clicks then select the whole assembly, and it moves/rotates/scales as one. Placed library assets come pre-grouped. Returns the group root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "objects": {"type": "array", "items": {"type": "string"}, "description": "Names/ids of the objects to group (at least 2)"},
+                    "root": {"type": "string", "description": "Which of 'objects' becomes the group root (default: the first)"}
+                },
+                "required": ["objects"]
+            }
+        },
+        {
+            "name": "ungroup_object",
+            "description": "Break a group apart: pass any member (or the root) and the group flag is cleared, so parts are selectable individually again. The parent hierarchy is KEPT — use set_parent with parent=null on the children to fully detach them. Returns the former root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"object": {"type": "string", "description": "Any object of the group (name or id)"}},
+                "required": ["object"]
             }
         },
         {
@@ -291,9 +313,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
         "add_object" | "update_object" | "delete_object" | "set_parent" | "attach_object"
-        | "add_measurement" | "simulate" | "add_reference_image" | "update_reference_image"
-        | "delete_reference_image" | "calibrate_reference_image" | "create_library_object"
-        | "update_library_object" | "delete_library_object" | "place_library_object" => {
+        | "group_objects" | "ungroup_object" | "add_measurement" | "simulate"
+        | "add_reference_image" | "update_reference_image" | "delete_reference_image"
+        | "calibrate_reference_image" | "create_library_object" | "update_library_object"
+        | "delete_library_object" | "place_library_object" => {
             let mut command = arguments.clone();
             if !command.is_object() {
                 command = json!({});

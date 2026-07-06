@@ -542,6 +542,49 @@ fn execute_inner(
                 Err("parenting rejected (cycle or missing object)".to_string())
             }
         }
+        "group_objects" => {
+            let refs = command["objects"]
+                .as_array()
+                .filter(|a| a.len() >= 2)
+                .ok_or("'objects' must be an array of at least 2 names/ids")?;
+            let ids: Vec<ObjectId> = refs
+                .iter()
+                .map(|r| resolve(scene, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let root = match command.get("root").filter(|v| !v.is_null()) {
+                Some(r) => {
+                    let root = resolve(scene, r)?;
+                    if !ids.contains(&root) {
+                        return Err("'root' must be one of 'objects'".to_string());
+                    }
+                    root
+                }
+                None => ids[0],
+            };
+            for &id in &ids {
+                if id != root && !scene.set_parent(id, Some(root)) {
+                    return Err(format!(
+                        "cannot parent object {} under the group root (cycle)",
+                        id.0
+                    ));
+                }
+            }
+            if let Some(object) = scene.object_mut(root) {
+                object.group = true;
+            }
+            selection.set(ids, Some(root));
+            Ok(json!({"root": object_json(scene, scene.object(root).unwrap())}))
+        }
+        "ungroup_object" => {
+            let id = resolve(scene, &command["object"])?;
+            let root = scene
+                .group_root(id)
+                .ok_or("object is not part of a group")?;
+            if let Some(object) = scene.object_mut(root) {
+                object.group = false;
+            }
+            Ok(json!({"root": object_json(scene, scene.object(root).unwrap())}))
+        }
         "attach_object" => {
             let child = resolve(scene, &command["object"])?;
             let parent = resolve(scene, &command["to"])?;
@@ -758,11 +801,11 @@ fn execute_inner(
         }
         other => Err(format!(
             "unknown cmd '{other}' (get_scene, new_scene, add_object, update_object, \
-             delete_object, set_parent, attach_object, add_measurement, simulate, \
-             screenshot, add_reference_image, update_reference_image, \
-             delete_reference_image, calibrate_reference_image, get_library, \
-             create_library_object, update_library_object, delete_library_object, \
-             place_library_object)"
+             delete_object, set_parent, attach_object, group_objects, ungroup_object, \
+             add_measurement, simulate, screenshot, add_reference_image, \
+             update_reference_image, delete_reference_image, calibrate_reference_image, \
+             get_library, create_library_object, update_library_object, \
+             delete_library_object, place_library_object)"
         )),
     }
 }
@@ -1084,6 +1127,80 @@ mod tests {
         // the placed root's world location is (0,0,1) - (1,0,0) + root offset
         let w = scene.world_transform(placed);
         assert!((w.location.x - (-1.0)).abs() < 1e-3, "{:?}", w.location);
+    }
+
+    #[test]
+    fn group_and_ungroup_commands() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        for name in ["Seat", "Leg"] {
+            let response = execute(
+                &json!({"cmd": "add_object", "primitive": "cube", "new_name": name}),
+                &mut scene,
+                &mut sel,
+                &mut physics,
+                &mut lib,
+            );
+            assert_eq!(response["ok"], true, "{response}");
+        }
+
+        // group with an explicit root: members are parented, flag set,
+        // selection = the group
+        let response = execute(
+            &json!({"cmd": "group_objects", "objects": ["Cube", "Seat", "Leg"], "root": "Seat"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["root"]["name"], "Seat");
+        assert_eq!(response["root"]["group"], true);
+        let seat = scene.objects().iter().find(|o| o.name == "Seat").unwrap().id;
+        let leg = scene.objects().iter().find(|o| o.name == "Leg").unwrap().id;
+        assert_eq!(scene.object(leg).unwrap().parent, Some(seat));
+        assert_eq!(scene.group_root(leg), Some(seat));
+        assert_eq!(sel.active(), Some(seat));
+
+        // ungroup by a MEMBER: root flag cleared, hierarchy kept
+        let response = execute(
+            &json!({"cmd": "ungroup_object", "object": "Leg"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["root"]["name"], "Seat");
+        assert_eq!(response["root"]["group"], false);
+        assert_eq!(scene.object(leg).unwrap().parent, Some(seat));
+
+        // errors: ungroup on a non-group, group with < 2 objects, bad root
+        let response = execute(
+            &json!({"cmd": "ungroup_object", "object": "Leg"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+        let response = execute(
+            &json!({"cmd": "group_objects", "objects": ["Seat"]}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+        let response = execute(
+            &json!({"cmd": "group_objects", "objects": ["Seat", "Leg"], "root": "Cube"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
     }
 
     #[test]
