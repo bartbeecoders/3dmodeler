@@ -1,7 +1,7 @@
 //! Selection state with Blender's click rules. This is editor state, not
 //! document state — it lives outside the scene and has its own change stamp.
 
-use modeler_core::ObjectId;
+use modeler_core::{ObjectId, Scene};
 
 #[derive(Default)]
 pub struct Selection {
@@ -63,6 +63,32 @@ impl Selection {
         }
     }
 
+    /// Viewport click with GROUP expansion: hitting any part of a grouped
+    /// assembly (placed library objects) selects the whole group, root
+    /// active. Ungrouped objects fall through to the plain click rules.
+    pub fn click_expanded(&mut self, scene: &Scene, hit: Option<ObjectId>, shift: bool) {
+        let Some(root) = hit.and_then(|id| scene.group_root(id)) else {
+            self.click(hit, shift);
+            return;
+        };
+        let members = scene.subtree(root);
+        self.stamp += 1;
+        if !shift {
+            self.selected = members;
+            self.active = Some(root);
+        } else if self.is_selected(root) {
+            // shift-click on a selected group removes the whole group
+            self.selected.retain(|id| !members.contains(id));
+            if self.active.is_some_and(|a| members.contains(&a)) {
+                self.active = self.selected.last().copied();
+            }
+        } else {
+            self.selected.retain(|id| !members.contains(id));
+            self.selected.extend(members);
+            self.active = Some(root);
+        }
+    }
+
     /// Replace the whole selection (used by duplicate).
     pub fn set(&mut self, ids: Vec<ObjectId>, active: Option<ObjectId>) {
         self.selected = ids;
@@ -118,5 +144,35 @@ mod tests {
         sel.click(None, false);
         assert!(sel.is_empty());
         assert_eq!(sel.active(), None);
+    }
+
+    #[test]
+    fn clicking_a_group_part_selects_the_whole_group() {
+        use modeler_core::{Primitive, Transform};
+        let mut scene = Scene::new();
+        let root = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let part = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let loose = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        scene.set_parent(part, Some(root));
+        scene.object_mut(root).unwrap().group = true;
+
+        let mut sel = Selection::default();
+        // hitting the PART selects root + part, root active
+        sel.click_expanded(&scene, Some(part), false);
+        assert!(sel.is_selected(root) && sel.is_selected(part));
+        assert_eq!(sel.active(), Some(root));
+
+        // shift-click on a loose object extends; shift-click the group again
+        // removes the whole group
+        sel.click_expanded(&scene, Some(loose), true);
+        assert_eq!(sel.selected().len(), 3);
+        sel.click_expanded(&scene, Some(part), true);
+        assert_eq!(sel.selected(), &[loose]);
+
+        // ungrouped: plain per-object click rules apply again
+        scene.object_mut(root).unwrap().group = false;
+        sel.click_expanded(&scene, Some(part), false);
+        assert_eq!(sel.selected(), &[part]);
+        assert_eq!(sel.active(), Some(part));
     }
 }

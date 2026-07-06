@@ -246,6 +246,11 @@ pub struct Object {
     /// object (Object ▸ Attach to Active, MCP attach_object, library drops).
     #[serde(default)]
     pub anchor: Vec3,
+    /// Group root: this object and its descendants act as ONE unit —
+    /// clicking any part in the viewport selects the whole subtree. Placed
+    /// library assets are grouped by default; Ungroup clears the flag.
+    #[serde(default)]
+    pub group: bool,
     /// Result of mesh editing (Tab edit mode): when present it replaces the
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
@@ -440,6 +445,7 @@ impl Scene {
             show_dimensions: false,
             pivot: Vec3::ZERO,
             anchor: Vec3::ZERO,
+            group: false,
             edited_mesh: None,
             mesh_revision: 0,
         });
@@ -606,6 +612,34 @@ impl Scene {
         world.location += target - self.world_anchor(child);
         self.set_world_transform(child, world);
         self.set_parent(child, Some(parent))
+    }
+
+    /// The OUTERMOST group root above `id` (or `id` itself), if any part of
+    /// its parent chain is flagged as a group.
+    pub fn group_root(&self, id: ObjectId) -> Option<ObjectId> {
+        let mut result = None;
+        let mut current = Some(id);
+        let mut hops = 0;
+        while let Some(cur) = current {
+            if self.object(cur).is_some_and(|o| o.group) {
+                result = Some(cur);
+            }
+            current = self.object(cur).and_then(|o| o.parent);
+            hops += 1;
+            if hops > 1000 {
+                break;
+            }
+        }
+        result
+    }
+
+    /// `root` plus all its descendants (any depth).
+    pub fn subtree(&self, root: ObjectId) -> Vec<ObjectId> {
+        self.objects
+            .iter()
+            .filter(|o| self.is_ancestor(root, o.id))
+            .map(|o| o.id)
+            .collect()
     }
 
     /// Nesting depth (roots are 0) — used for hierarchy-ordered updates.

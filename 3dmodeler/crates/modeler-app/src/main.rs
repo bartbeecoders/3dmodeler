@@ -508,10 +508,12 @@ pub fn main() {
                         let ray_o = glam::Vec3::new(origin.x, origin.y, origin.z);
                         let ray_d = glam::Vec3::new(direction.x, direction.y, direction.z);
                         physics.pick(ray_o, ray_d).map(|id| {
+                            // a grouped assembly is addressed via its root
+                            let id = scene.group_root(id).unwrap_or(id);
                             // clicking inside the current selection keeps it
                             // (menu actions apply to the whole selection)
                             if !sel.is_selected(id) {
-                                sel.click(Some(id), false);
+                                sel.click_expanded(&scene, Some(id), false);
                             }
                             let hit = physics.pick_point(ray_o, ray_d).unwrap_or_default();
                             let hit_local =
@@ -643,7 +645,8 @@ pub fn main() {
                         glam::Vec3::new(origin.x, origin.y, origin.z),
                         glam::Vec3::new(direction.x, direction.y, direction.z),
                     );
-                    sel.click(hit, modifiers.shift);
+                    // grouped assemblies (placed library objects) select as one
+                    sel.click_expanded(&scene, hit, modifiers.shift);
                     *handled = true;
                 }
             }

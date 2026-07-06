@@ -95,7 +95,8 @@ fn tool_definitions() -> Value {
                     "show_label": {"type": "boolean"},
                     "show_dimensions": {"type": "boolean"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space rotation pivot"},
-                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space attachment point"}
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space attachment point"},
+                    "group": {"type": "boolean", "description": "Group root flag: this object + descendants select as ONE unit in the viewport (placed library assets set it on their root; false = ungroup)"}
                 },
                 "required": ["object"]
             }
@@ -254,7 +255,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "place_library_object",
-            "description": "Instantiate a library asset into the scene. Default: the asset's PIVOT point lands on 'location' ([0,0,0] if omitted). With 'attach_to': the asset's ANCHOR point lands on the attachment point (location, or the target object's anchor point) and the asset is parented to that object. Objects get fresh ids and unique names, hierarchy preserved; the new objects become the selection. Returns their ids and names.",
+            "description": "Instantiate a library asset into the scene. Default: the asset's PIVOT point lands on 'location' ([0,0,0] if omitted). With 'attach_to': the asset's ANCHOR point lands on the attachment point (location, or the target object's anchor point) and the asset is parented to that object. Objects get fresh ids and unique names, hierarchy preserved, and the instance is GROUPED under one root (clicks select it as one unit; update_object group=false ungroups); the new objects become the selection. Returns their ids and names.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

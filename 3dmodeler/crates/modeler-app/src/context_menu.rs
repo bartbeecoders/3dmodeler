@@ -103,8 +103,31 @@ fn object_menu(
 ) -> bool {
     let Some(object) = scene.object(id) else { return true };
     let name = object.name.clone();
-    ui.label(egui::RichText::new(&name).weak().size(11.0));
+    let is_group = object.group;
+    ui.label(
+        egui::RichText::new(if is_group { format!("❐ {name} (group)") } else { name.clone() })
+            .weak()
+            .size(11.0),
+    );
     let mut close = false;
+
+    if is_group {
+        if ui
+            .button("Ungroup")
+            .on_hover_text(
+                "Break the group into its parts: clicks select parts \
+                 individually again (the parent hierarchy is kept)",
+            )
+            .clicked()
+        {
+            if let Some(object) = scene.object_mut(id) {
+                object.group = false;
+            }
+            *status = Some(format!("ungrouped '{name}' — parts are now selectable"));
+            close = true;
+        }
+        ui.separator();
+    }
 
     if ui
         .button("Set pivot to this point")
@@ -167,6 +190,21 @@ fn object_menu(
             }
         }
         close = true;
+    }
+    if !is_group {
+        let can_group = selection.selected().len() >= 2 && selection.active().is_some();
+        if ui
+            .add_enabled(can_group, egui::Button::new("Group Selection"))
+            .on_hover_text(
+                "Parent the selected objects to the active one and make it a \
+                 group: clicks then select the assembly as one unit",
+            )
+            .clicked()
+        {
+            crate::ui::group_selection(scene, selection);
+            *status = Some("grouped the selection".to_string());
+            close = true;
+        }
     }
     if ui.button("Save Selection to Library…").clicked() {
         library_panel.open_create_dialog(scene, selection);

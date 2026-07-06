@@ -335,13 +335,19 @@ impl ModalTransform {
                 .map(entry)
                 .collect()
         };
-        // rotate/scale happen around the objects' pivot points (median when
-        // several are selected); objects default to pivot = origin
-        let pivot = originals
+        // rotate/scale happen around the pivot points of the SELECTION ROOTS
+        // (selected objects whose parent is not selected) — so a grouped
+        // assembly turns around its root's pivot, and a plain multi-select
+        // uses the median of the objects' pivots as before
+        let roots: Vec<&OriginalEntry> = originals
+            .iter()
+            .filter(|e| e.parent.map_or(true, |p| !selected.contains(&p)))
+            .collect();
+        let pivot = roots
             .iter()
             .map(|e| scene.world_pivot(e.id))
             .sum::<Vec3>()
-            / originals.len() as f32;
+            / roots.len().max(1) as f32;
 
         // vertex snap: moving geometry (selection + followers) vs the rest
         let moving: Vec<ObjectId> = scene
@@ -702,6 +708,7 @@ pub fn duplicate_selection(scene: &mut Scene, selection: &mut Selection) -> bool
             object.show_dimensions = source.show_dimensions;
             object.pivot = source.pivot;
             object.anchor = source.anchor;
+            object.group = source.group;
             object.edited_mesh = source.edited_mesh.clone();
         }
         id_map.insert(source.id, id);

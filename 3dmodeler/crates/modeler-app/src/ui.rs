@@ -923,10 +923,16 @@ impl UiState {
                 }
 
                 let is_selected = selection.is_selected(object.id);
-                let label = if selection.active() == Some(object.id) {
-                    egui::RichText::new(&object.name).strong()
+                // group roots select as one unit in the viewport — mark them
+                let display_name = if object.group {
+                    format!("❐ {}", object.name)
                 } else {
-                    egui::RichText::new(&object.name)
+                    object.name.clone()
+                };
+                let label = if selection.active() == Some(object.id) {
+                    egui::RichText::new(&display_name).strong()
+                } else {
+                    egui::RichText::new(&display_name)
                 };
 
                 // drag a row onto another row to parent it there
@@ -1167,6 +1173,33 @@ fn object_menu(
     ui.separator();
     let can_parent = selection.selected().len() >= 2 && selection.active().is_some();
     if ui
+        .add_enabled(can_parent, egui::Button::new("Group Selection"))
+        .on_hover_text(
+            "Parent the selection to the active object and select it as one \
+             unit from then on (placed library objects come pre-grouped)",
+        )
+        .clicked()
+    {
+        group_selection(scene, selection);
+        close = true;
+    }
+    let has_group = selection
+        .selected()
+        .iter()
+        .any(|&id| scene.object(id).is_some_and(|o| o.group));
+    if ui
+        .add_enabled(has_group, egui::Button::new("Ungroup"))
+        .on_hover_text(
+            "Break the selected group(s) into parts: clicks select parts \
+             individually again (the hierarchy is kept)",
+        )
+        .clicked()
+    {
+        ungroup_selection(scene, selection);
+        close = true;
+    }
+    ui.separator();
+    if ui
         .add_enabled(can_parent, egui::Button::new("Parent to Active  (Ctrl+P)"))
         .clicked()
     {
@@ -1229,6 +1262,29 @@ pub fn parent_selected_to_active(scene: &mut Scene, selection: &Selection) {
     for id in selection.selected().to_vec() {
         if id != active {
             scene.set_parent(id, Some(active));
+        }
+    }
+}
+
+/// Make the selection ONE group: parent everything to the active object
+/// (world transforms preserved) and flag it as the group root — viewport
+/// clicks then select the whole assembly.
+pub fn group_selection(scene: &mut Scene, selection: &Selection) {
+    let Some(active) = selection.active() else { return };
+    parent_selected_to_active(scene, selection);
+    if let Some(object) = scene.object_mut(active) {
+        object.group = true;
+    }
+}
+
+/// Clear the group flag on every selected group root: parts become
+/// individually selectable again (the parent hierarchy is kept).
+pub fn ungroup_selection(scene: &mut Scene, selection: &Selection) {
+    for id in selection.selected().to_vec() {
+        if scene.object(id).is_some_and(|o| o.group) {
+            if let Some(object) = scene.object_mut(id) {
+                object.group = false;
+            }
         }
     }
 }

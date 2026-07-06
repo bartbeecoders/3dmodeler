@@ -129,3 +129,8 @@ Add the ability to set an anchor point on an object and on a library object
 Add the possibility to set a selected vertex as the pivot or the anchor point
 
 Add a context menu (right click) on an object, vertex, edge, face to set options like the pivot or anchor point
+
+Library Objects
+
+By default, keep library objects as 1 group. So when the user drags a library object on the scene, it is kept as 1 group.
+When the user wants to edit a library object, it should be possible to break it down into its parts.

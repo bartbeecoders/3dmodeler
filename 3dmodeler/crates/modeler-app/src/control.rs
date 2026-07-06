@@ -160,6 +160,7 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "parent": object.parent.map(|p| p.0),
         "pivot": [object.pivot.x, object.pivot.y, object.pivot.z],
         "anchor": [object.anchor.x, object.anchor.y, object.anchor.z],
+        "group": object.group,
         "visible": object.visible,
         "smooth": object.smooth,
         "dynamic": object.dynamic,
@@ -245,6 +246,9 @@ fn apply_object_params(
     }
     if let Some(v) = params.get("show_dimensions").and_then(Value::as_bool) {
         object.show_dimensions = v;
+    }
+    if let Some(v) = params.get("group").and_then(Value::as_bool) {
+        object.group = v;
     }
     if let Some(v) = params.get("new_name").and_then(Value::as_str) {
         if !v.trim().is_empty() {
@@ -1145,6 +1149,19 @@ mod tests {
         assert_eq!(response["ok"], true, "{response}");
         assert_eq!(response["placed"].as_array().unwrap().len(), 2);
         assert_eq!(sel.selected().len(), 2);
+        // the placed instance is one GROUP rooted at the placed root; an
+        // update_object group=false ungroups it
+        let placed_root = ObjectId(response["placed"][0]["id"].as_u64().unwrap());
+        assert!(scene.object(placed_root).unwrap().group);
+        let response = execute(
+            &json!({"cmd": "update_object", "object": placed_root.0, "group": false}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["object"]["group"], false);
         let response = execute(
             &json!({"cmd": "place_library_object", "asset": "Table"}),
             &mut scene,

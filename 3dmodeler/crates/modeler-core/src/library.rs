@@ -204,8 +204,11 @@ pub fn capture_objects(scene: &Scene, ids: &[ObjectId]) -> Vec<Object> {
 }
 
 /// Place an asset's objects into the scene at `at` (world space). Objects get
-/// fresh ids and unique names; the internal hierarchy is preserved. Returns
-/// the new ids (same order as the asset's object list).
+/// fresh ids and unique names; the internal hierarchy is preserved. The
+/// placed instance becomes ONE group: a multi-root asset is unified under
+/// its first root, and that root gets the `group` flag so viewport clicks
+/// select the whole assembly (Ungroup breaks it apart). Returns the new ids
+/// (same order as the asset's object list).
 pub fn instantiate(scene: &mut Scene, asset: &LibraryAsset, at: Vec3) -> Vec<ObjectId> {
     let stored: Vec<ObjectId> = asset.objects.iter().map(|o| o.id).collect();
     let mut id_map: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -230,6 +233,22 @@ pub fn instantiate(scene: &mut Scene, asset: &LibraryAsset, at: Vec3) -> Vec<Obj
         let Some(&new_parent) = id_map.get(&old_parent) else { continue };
         if let Some(object) = scene.object_mut(id_map[&source.id]) {
             object.parent = Some(new_parent);
+        }
+    }
+
+    // one group per placement: extra roots slide under the first root
+    // (world-preserving), which becomes the group root
+    let roots: Vec<ObjectId> = new_ids
+        .iter()
+        .copied()
+        .filter(|&id| scene.object(id).is_some_and(|o| o.parent.is_none()))
+        .collect();
+    if let Some((&group_root, rest)) = roots.split_first() {
+        for &other in rest {
+            scene.set_parent(other, Some(group_root));
+        }
+        if let Some(object) = scene.object_mut(group_root) {
+            object.group = true;
         }
     }
     new_ids
@@ -296,9 +315,14 @@ mod tests {
         let new_ids = instantiate(&mut target, library.asset(id).unwrap(), at);
         assert_eq!(new_ids.len(), 2);
 
-        // parent sits on the drop point (cube bottom at z=0)
+        // the placed instance is ONE group, rooted at the (single) root
         let new_parent = new_ids[0];
         let new_child = new_ids[1];
+        assert!(target.object(new_parent).unwrap().group, "placed root must be a group");
+        assert!(!target.object(new_child).unwrap().group);
+        assert_eq!(target.group_root(new_child), Some(new_parent));
+
+        // parent sits on the drop point (cube bottom at z=0)
         let pw = target.world_transform(new_parent);
         assert!((pw.location - Vec3::new(10.0, 20.0, 1.0)).length() < 1e-5);
         // child kept its +3 y offset relative to the parent
@@ -307,6 +331,34 @@ mod tests {
         assert_eq!(target.object(new_child).unwrap().parent, Some(new_parent));
         // fresh unique names next to the existing "Cube"
         assert_eq!(target.object(new_parent).unwrap().name, "Cube.001");
+    }
+
+    #[test]
+    fn multi_root_assets_unify_into_one_group() {
+        let mut scene = Scene::new();
+        // two UNPARENTED cubes captured together
+        let a = cube_at(&mut scene, Vec3::new(0.0, 0.0, 1.0));
+        let b = cube_at(&mut scene, Vec3::new(3.0, 0.0, 1.0));
+        let mut library = Library::default();
+        let id = library.add_asset("Pair", "", capture_objects(&scene, &[a, b]), None);
+
+        let mut target = Scene::new();
+        let new_ids = instantiate(&mut target, library.asset(id).unwrap(), Vec3::ZERO);
+        // one root carries the group flag; the other became its child,
+        // keeping its world placement
+        let roots: Vec<_> = new_ids
+            .iter()
+            .filter(|&&i| target.object(i).unwrap().parent.is_none())
+            .collect();
+        assert_eq!(roots.len(), 1);
+        let root = *roots[0];
+        assert!(target.object(root).unwrap().group);
+        let other = *new_ids.iter().find(|&&i| i != root).unwrap();
+        assert_eq!(target.group_root(other), Some(root));
+        let spread = (target.world_transform(new_ids[0]).location
+            - target.world_transform(new_ids[1]).location)
+            .length();
+        assert!((spread - 3.0).abs() < 1e-4, "world layout preserved, got {spread}");
     }
 
     #[test]

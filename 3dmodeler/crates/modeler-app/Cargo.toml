@@ -1,6 +1,6 @@
 [package]
 name = "modeler-app"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "3D modeler application: viewport, tools, UI (native + browser)"
 

@@ -163,7 +163,7 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | `create_library_object` | Save scene objects (or the current selection) as a named library asset with a description and an auto-rendered preview image |
 | `update_library_object` | Rename an asset, edit its description, replace its contents, or set a custom preview |
 | `delete_library_object` | Remove an asset from the library (scene objects untouched) |
-| `place_library_object` | Instantiate a library asset: its **pivot** lands on the location, or with `attach_to` its **anchor** lands on the target's anchor point and the asset parents there |
+| `place_library_object` | Instantiate a library asset as ONE group (its **pivot** lands on the location, or with `attach_to` its **anchor** lands on the target's anchor point and the asset parents there); `update_object group=false` ungroups |
 
 Conventions the agent should know (also sent in the server's MCP
 `instructions`): units are **meters**, the world is **Z-up** (ground = XY
