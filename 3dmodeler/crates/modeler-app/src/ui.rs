@@ -1162,6 +1162,23 @@ fn object_menu(
         close = true;
     }
     if ui
+        .add_enabled(can_parent, egui::Button::new("Attach to Active"))
+        .on_hover_text(
+            "Parent to the active object AND move each selected object so its \
+             anchor point lands on the active object's anchor point",
+        )
+        .clicked()
+    {
+        if let Some(active) = selection.active() {
+            for id in selection.selected().to_vec() {
+                if id != active {
+                    scene.attach(id, active, None);
+                }
+            }
+        }
+        close = true;
+    }
+    if ui
         .add_enabled(has_selection, egui::Button::new("Clear Parent  (Alt+P)"))
         .clicked()
     {
@@ -1485,7 +1502,18 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
         return;
     };
 
-    ui.strong(object.name.clone());
+    // editable object name (also renamable by double-click in the outliner)
+    let mut name = object.name.clone();
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.text_edit_singleline(&mut name);
+    });
+    if name != object.name && !name.trim().is_empty() {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.name = name;
+        }
+    }
+    let Some(object) = scene.object(active_id) else { return };
     if let Some(parent) = object.parent {
         if let Some(parent_object) = scene.object(parent) {
             ui.label(
@@ -1504,6 +1532,8 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
     let mut smooth = object.smooth;
     let mut phys = (object.dynamic, object.density);
     let mut adorn = (object.show_label, object.show_dimensions);
+    let mut pivot = object.pivot;
+    let mut anchor = object.anchor;
     let mut changed = false;
 
     egui::CollapsingHeader::new("Transform")
@@ -1534,6 +1564,18 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
             }
 
             changed |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+        });
+
+    egui::CollapsingHeader::new("Pivot & Anchor")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Local-space points; markers show in the viewport.")
+                    .weak()
+                    .size(11.0),
+            );
+            changed |= vec3_row(ui, "Pivot (rotation center, R)", &mut pivot, 0.05);
+            changed |= vec3_row(ui, "Anchor (attachment point)", &mut anchor, 0.05);
         });
 
     let mut revert_mesh = false;
@@ -1614,6 +1656,8 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
             object.density = phys.1;
             object.show_label = adorn.0;
             object.show_dimensions = adorn.1;
+            object.pivot = pivot;
+            object.anchor = anchor;
         }
     }
     if revert_mesh {

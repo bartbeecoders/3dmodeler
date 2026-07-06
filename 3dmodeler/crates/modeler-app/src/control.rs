@@ -158,6 +158,8 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "scale": [object.transform.scale.x, object.transform.scale.y, object.transform.scale.z],
         "world_location": [world.location.x, world.location.y, world.location.z],
         "parent": object.parent.map(|p| p.0),
+        "pivot": [object.pivot.x, object.pivot.y, object.pivot.z],
+        "anchor": [object.anchor.x, object.anchor.y, object.anchor.z],
         "visible": object.visible,
         "smooth": object.smooth,
         "dynamic": object.dynamic,
@@ -197,6 +199,8 @@ fn apply_object_params(
     });
     let scale = params.get("scale").map(|v| vec3_from(v).ok_or("scale must be [x, y, z]"));
     let color = params.get("color").map(|v| vec3_from(v).ok_or("color must be [r, g, b] 0..1"));
+    let pivot = params.get("pivot").map(|v| vec3_from(v).ok_or("pivot must be [x, y, z]"));
+    let anchor = params.get("anchor").map(|v| vec3_from(v).ok_or("anchor must be [x, y, z]"));
 
     let object = scene.object_mut(id).ok_or("object vanished")?;
     if let Some(location) = location {
@@ -213,6 +217,12 @@ fn apply_object_params(
     }
     if let Some(scale) = scale {
         object.transform.scale = scale?;
+    }
+    if let Some(pivot) = pivot {
+        object.pivot = pivot?;
+    }
+    if let Some(anchor) = anchor {
+        object.anchor = anchor?;
     }
     if let Some(color) = color {
         let c = color?;
@@ -361,7 +371,30 @@ fn asset_json(asset: &LibraryAsset) -> Value {
         "object_count": asset.objects.len(),
         "objects": asset.objects.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
         "has_preview": asset.preview_png_base64.is_some(),
+        "pivot": [asset.pivot.x, asset.pivot.y, asset.pivot.z],
+        "anchor": [asset.anchor.x, asset.anchor.y, asset.anchor.z],
     })
+}
+
+/// Apply optional pivot/anchor fields onto a library asset.
+fn apply_asset_points(
+    library_doc: &mut Library,
+    id: u64,
+    params: &Value,
+) -> Result<(), String> {
+    let pivot = params.get("pivot").map(|v| vec3_from(v).ok_or("pivot must be [x, y, z]"));
+    let anchor = params.get("anchor").map(|v| vec3_from(v).ok_or("anchor must be [x, y, z]"));
+    if pivot.is_none() && anchor.is_none() {
+        return Ok(());
+    }
+    let asset = library_doc.asset_mut(id).ok_or("library item vanished")?;
+    if let Some(pivot) = pivot {
+        asset.pivot = pivot?;
+    }
+    if let Some(anchor) = anchor {
+        asset.anchor = anchor?;
+    }
+    Ok(())
 }
 
 /// The objects a library create/update captures: explicit references from
@@ -505,6 +538,19 @@ fn execute_inner(
                 Err("parenting rejected (cycle or missing object)".to_string())
             }
         }
+        "attach_object" => {
+            let child = resolve(scene, &command["object"])?;
+            let parent = resolve(scene, &command["to"])?;
+            let at = match command.get("location").filter(|v| !v.is_null()) {
+                Some(v) => Some(vec3_from(v).ok_or("location must be [x, y, z]")?),
+                None => None,
+            };
+            if scene.attach(child, parent, at) {
+                Ok(json!({"object": object_json(scene, scene.object(child).unwrap())}))
+            } else {
+                Err("attach rejected (cycle or missing object)".to_string())
+            }
+        }
         "add_measurement" => {
             let a = vec3_from(&command["a"]).ok_or("'a' must be [x, y, z]")?;
             let b = vec3_from(&command["b"]).ok_or("'b' must be [x, y, z]")?;
@@ -620,6 +666,7 @@ fn execute_inner(
             let objects = capture_for_library(scene, selection, command)?;
             let preview = preview_for_library(command, &objects)?;
             let id = library_doc.add_asset(name.trim(), description.trim(), objects, preview);
+            apply_asset_points(library_doc, id, command)?;
             Ok(json!({"asset": asset_json(library_doc.asset(id).unwrap())}))
         }
         "update_library_object" => {
@@ -654,6 +701,7 @@ fn execute_inner(
                     }
                 }
             }
+            apply_asset_points(library_doc, id, command)?;
             Ok(json!({"asset": asset_json(library_doc.asset(id).unwrap())}))
         }
         "delete_library_object" => {
@@ -663,12 +711,38 @@ fn execute_inner(
         }
         "place_library_object" => {
             let id = resolve_asset(library_doc, &command["asset"])?;
-            let at = match command.get("location").filter(|v| !v.is_null()) {
-                Some(v) => vec3_from(v).ok_or("location must be [x, y, z]")?,
-                None => Vec3::ZERO,
+            let location = match command.get("location").filter(|v| !v.is_null()) {
+                Some(v) => Some(vec3_from(v).ok_or("location must be [x, y, z]")?),
+                None => None,
             };
             let asset = library_doc.asset(id).unwrap().clone();
-            let new_ids = library::instantiate(scene, &asset, at);
+            // attach_to: the asset's ANCHOR lands on the attachment point
+            // (location, or the target's anchor point) and the asset parents
+            // there; otherwise the PIVOT lands on the location
+            let target = match command.get("attach_to").filter(|v| !v.is_null()) {
+                Some(reference) => Some(resolve(scene, reference)?),
+                None => None,
+            };
+            let new_ids = match target {
+                Some(target) => {
+                    let point = location.unwrap_or_else(|| scene.world_anchor(target));
+                    let ids = library::instantiate(scene, &asset, point - asset.anchor);
+                    let roots: Vec<ObjectId> = ids
+                        .iter()
+                        .copied()
+                        .filter(|&i| scene.object(i).is_some_and(|o| o.parent.is_none()))
+                        .collect();
+                    for root in roots {
+                        scene.set_parent(root, Some(target));
+                    }
+                    ids
+                }
+                None => library::instantiate(
+                    scene,
+                    &asset,
+                    location.unwrap_or(Vec3::ZERO) - asset.pivot,
+                ),
+            };
             let active = new_ids.first().copied();
             selection.set(new_ids.clone(), active);
             let placed: Vec<Value> = new_ids
@@ -680,10 +754,11 @@ fn execute_inner(
         }
         other => Err(format!(
             "unknown cmd '{other}' (get_scene, new_scene, add_object, update_object, \
-             delete_object, set_parent, add_measurement, simulate, screenshot, \
-             add_reference_image, update_reference_image, delete_reference_image, \
-             calibrate_reference_image, get_library, create_library_object, \
-             update_library_object, delete_library_object, place_library_object)"
+             delete_object, set_parent, attach_object, add_measurement, simulate, \
+             screenshot, add_reference_image, update_reference_image, \
+             delete_reference_image, calibrate_reference_image, get_library, \
+             create_library_object, update_library_object, delete_library_object, \
+             place_library_object)"
         )),
     }
 }
@@ -893,6 +968,118 @@ mod tests {
             &mut lib,
         );
         assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn pivot_anchor_and_attach_commands() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        // the default cube becomes a "table" with an anchor on its top face
+        let response = execute(
+            &json!({
+                "cmd": "update_object", "object": "Cube",
+                "pivot": [0.0, 0.0, -1.0], "anchor": [0.0, 0.0, 1.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["object"]["pivot"][2], -1.0);
+        assert_eq!(response["object"]["anchor"][2], 1.0);
+
+        // a "cup" anchored at the bottom of its base, off to the side
+        let response = execute(
+            &json!({
+                "cmd": "add_object", "primitive": "cylinder", "new_name": "Cup",
+                "location": [5.0, 0.0, 0.5], "scale": [0.25, 0.25, 0.25],
+                "anchor": [0.0, 0.0, -1.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+
+        // attach: cup's anchor lands on the cube's anchor (top face center)
+        let response = execute(
+            &json!({"cmd": "attach_object", "object": "Cup", "to": "Cube"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let cup = scene.objects().iter().find(|o| o.name == "Cup").unwrap().id;
+        let anchor_world = scene.world_anchor(cup);
+        assert!(
+            (anchor_world - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-4,
+            "{anchor_world:?}"
+        );
+        assert!(scene.object(cup).unwrap().parent.is_some());
+
+        // attach at an explicit point
+        let response = execute(
+            &json!({"cmd": "attach_object", "object": "Cup", "to": "Cube",
+                    "location": [0.5, 0.5, 1.0]}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert!((scene.world_anchor(cup) - Vec3::new(0.5, 0.5, 1.0)).length() < 1e-4);
+
+        // library asset with explicit pivot/anchor; placement honors them
+        let response = execute(
+            &json!({
+                "cmd": "create_library_object", "name": "CupKit", "objects": ["Cup"],
+                "pivot": [0.0, 0.0, 0.25], "anchor": [1.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["asset"]["pivot"][2], 0.25);
+        assert_eq!(response["asset"]["anchor"][0], 1.0);
+
+        // ground placement: the PIVOT lands on the location
+        let response = execute(
+            &json!({"cmd": "place_library_object", "asset": "CupKit",
+                    "location": [10.0, 0.0, 1.0]}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let placed = response["placed"][0]["id"].as_u64().unwrap();
+        let w = scene.world_transform(ObjectId(placed));
+        // the asset pivot (0,0,0.25) lands on (10,0,1): the normalized root
+        // (at 0,0,0.25 in asset space) ends up exactly there
+        assert!((w.location - Vec3::new(10.0, 0.0, 1.0)).length() < 1e-4, "{:?}", w.location);
+
+        // attach placement: the ANCHOR lands on the target's anchor point
+        let response = execute(
+            &json!({"cmd": "place_library_object", "asset": "CupKit", "attach_to": "Cube"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let placed = ObjectId(response["placed"][0]["id"].as_u64().unwrap());
+        let object = scene.object(placed).unwrap();
+        assert!(object.parent.is_some(), "attached asset must be parented");
+        // asset anchor (1,0,0) landed on the cube's world anchor (0,0,1):
+        // the placed root's world location is (0,0,1) - (1,0,0) + root offset
+        let w = scene.world_transform(placed);
+        assert!((w.location.x - (-1.0)).abs() < 1e-3, "{:?}", w.location);
     }
 
     #[test]

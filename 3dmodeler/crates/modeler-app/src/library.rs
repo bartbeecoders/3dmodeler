@@ -9,6 +9,7 @@
 
 use crate::preview;
 use crate::selection::Selection;
+use modeler_core::glam::Vec3;
 use modeler_core::{library, Library, Scene};
 use std::collections::HashMap;
 use three_d::egui;
@@ -84,8 +85,17 @@ pub struct DropRequest {
 /// The "Save Selection to Library…" / edit-asset dialog.
 enum Dialog {
     Closed,
-    Create { name: String, description: String },
-    Edit { asset_id: u64, name: String, description: String },
+    Create {
+        name: String,
+        description: String,
+    },
+    Edit {
+        asset_id: u64,
+        name: String,
+        description: String,
+        pivot: Vec3,
+        anchor: Vec3,
+    },
 }
 
 pub struct LibraryPanel {
@@ -174,11 +184,18 @@ impl LibraryPanel {
                     if ui.small_button("✖").on_hover_text("Delete from library").clicked() {
                         delete = Some(id);
                     }
-                    if ui.small_button("✏").on_hover_text("Edit name / description").clicked() {
+                    if ui
+                        .small_button("✏")
+                        .on_hover_text("Edit name / description / pivot / anchor")
+                        .clicked()
+                    {
+                        let asset = library.asset(id);
                         self.dialog = Dialog::Edit {
                             asset_id: id,
                             name: name.clone(),
                             description: description.clone(),
+                            pivot: asset.map(|a| a.pivot).unwrap_or(Vec3::ZERO),
+                            anchor: asset.map(|a| a.anchor).unwrap_or(Vec3::ZERO),
                         };
                     }
                 });
@@ -231,14 +248,22 @@ impl LibraryPanel {
         library: &mut Library,
     ) -> Option<String> {
         let mut status = None;
-        let (title, mut name, mut description, editing) = match &self.dialog {
+        let (title, mut name, mut description, mut points, editing) = match &self.dialog {
             Dialog::Closed => return None,
-            Dialog::Create { name, description } => {
-                ("Save Selection to Library", name.clone(), description.clone(), None)
-            }
-            Dialog::Edit { asset_id, name, description } => {
-                ("Edit Library Item", name.clone(), description.clone(), Some(*asset_id))
-            }
+            Dialog::Create { name, description } => (
+                "Save Selection to Library",
+                name.clone(),
+                description.clone(),
+                (Vec3::ZERO, Vec3::ZERO),
+                None,
+            ),
+            Dialog::Edit { asset_id, name, description, pivot, anchor } => (
+                "Edit Library Item",
+                name.clone(),
+                description.clone(),
+                (*pivot, *anchor),
+                Some(*asset_id),
+            ),
         };
 
         let mut open = true;
@@ -268,6 +293,31 @@ impl LibraryPanel {
                         .desired_rows(3)
                         .desired_width(280.0),
                 );
+                if editing.is_some() {
+                    ui.add_space(4.0);
+                    for (label, value, hint) in [
+                        (
+                            "Pivot:",
+                            &mut points.0,
+                            "Placement/rotation reference — lands on the drop point \
+                             when placed on empty ground. (0,0,0) = footprint center \
+                             at the lowest point.",
+                        ),
+                        (
+                            "Anchor:",
+                            &mut points.1,
+                            "Attachment point — lands on the hit point when the asset \
+                             is dropped onto another object (and parents to it).",
+                        ),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(label).on_hover_text(hint);
+                            for axis in [&mut value.x, &mut value.y, &mut value.z] {
+                                ui.add(egui::DragValue::new(axis).speed(0.05));
+                            }
+                        });
+                    }
+                }
                 ui.add_space(6.0);
                 let valid = !name.trim().is_empty()
                     && (editing.is_some() || !selection.is_empty());
@@ -298,6 +348,8 @@ impl LibraryPanel {
                     library.rename_asset(asset_id, name.trim());
                     if let Some(asset) = library.asset_mut(asset_id) {
                         asset.description = description.trim().to_string();
+                        asset.pivot = points.0;
+                        asset.anchor = points.1;
                     }
                     status = Some("library item updated".to_string());
                 }
@@ -309,7 +361,13 @@ impl LibraryPanel {
             // write edits back into the dialog state
             self.dialog = match editing {
                 None => Dialog::Create { name, description },
-                Some(asset_id) => Dialog::Edit { asset_id, name, description },
+                Some(asset_id) => Dialog::Edit {
+                    asset_id,
+                    name,
+                    description,
+                    pivot: points.0,
+                    anchor: points.1,
+                },
             };
         }
         status

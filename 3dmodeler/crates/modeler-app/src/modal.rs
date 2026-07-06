@@ -335,7 +335,12 @@ impl ModalTransform {
                 .map(entry)
                 .collect()
         };
-        let pivot = originals.iter().map(|e| e.world.location).sum::<Vec3>()
+        // rotate/scale happen around the objects' pivot points (median when
+        // several are selected); objects default to pivot = origin
+        let pivot = originals
+            .iter()
+            .map(|e| scene.world_pivot(e.id))
+            .sum::<Vec3>()
             / originals.len() as f32;
 
         // vertex snap: moving geometry (selection + followers) vs the rest
@@ -695,6 +700,8 @@ pub fn duplicate_selection(scene: &mut Scene, selection: &mut Selection) -> bool
             object.parent = source.parent; // remapped below if inside the set
             object.show_label = source.show_label;
             object.show_dimensions = source.show_dimensions;
+            object.pivot = source.pivot;
+            object.anchor = source.anchor;
             object.edited_mesh = source.edited_mesh.clone();
         }
         id_map.insert(source.id, id);

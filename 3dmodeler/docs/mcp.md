@@ -155,6 +155,7 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | `update_object` | Change any of the above on an existing object (by name or id); `new_name` renames |
 | `delete_object` | Remove an object (children stay in place, unparented) |
 | `set_parent` | Link objects into a hierarchy (world placement preserved; cycles rejected); `parent: null` unparents |
+| `attach_object` | Move an object so its **anchor point** lands on the target's anchor point (or an explicit location), then parent it there |
 | `add_measurement` | Persistent ruler between two points, returns the distance in meters |
 | `simulate` | `play` / `pause` / `stop` the physics simulation (stop restores the scene) |
 | `new_scene` | Reset to the default scene |
@@ -162,7 +163,7 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | `create_library_object` | Save scene objects (or the current selection) as a named library asset with a description and an auto-rendered preview image |
 | `update_library_object` | Rename an asset, edit its description, replace its contents, or set a custom preview |
 | `delete_library_object` | Remove an asset from the library (scene objects untouched) |
-| `place_library_object` | Instantiate a library asset into the scene at a location (fresh ids/names, hierarchy preserved, lowest point lands on the location) |
+| `place_library_object` | Instantiate a library asset: its **pivot** lands on the location, or with `attach_to` its **anchor** lands on the target's anchor point and the asset parents there |
 
 Conventions the agent should know (also sent in the server's MCP
 `instructions`): units are **meters**, the world is **Z-up** (ground = XY

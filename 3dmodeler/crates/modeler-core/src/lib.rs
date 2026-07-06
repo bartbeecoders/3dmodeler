@@ -36,6 +36,19 @@ impl Default for Transform {
 }
 
 impl Transform {
+    /// Map a local-space point to this transform's space.
+    pub fn transform_point(&self, p: Vec3) -> Vec3 {
+        self.location + self.rotation * (p * self.scale)
+    }
+
+    /// Change the rotation while keeping the given LOCAL point fixed —
+    /// the object rotates around that point instead of its origin.
+    pub fn set_rotation_about(&mut self, rotation: Quat, local_point: Vec3) {
+        let fixed = self.transform_point(local_point);
+        self.rotation = rotation.normalize();
+        self.location = fixed - self.rotation * (local_point * self.scale);
+    }
+
     /// Compose parent ∘ child (child expressed in parent space).
     /// Exact for uniform scales; the usual SRT approximation otherwise.
     pub fn compose(parent: &Transform, child: &Transform) -> Transform {
@@ -214,6 +227,14 @@ pub struct Object {
     pub show_label: bool,
     #[serde(default)]
     pub show_dimensions: bool,
+    /// Pivot point (local space): interactive rotations (R) spin the object
+    /// around this point instead of its origin.
+    #[serde(default)]
+    pub pivot: Vec3,
+    /// Anchor point (local space): where this object attaches to another
+    /// object (Object ▸ Attach to Active, MCP attach_object, library drops).
+    #[serde(default)]
+    pub anchor: Vec3,
     /// Result of mesh editing (Tab edit mode): when present it replaces the
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
@@ -382,6 +403,8 @@ impl Scene {
             parent: None,
             show_label: false,
             show_dimensions: false,
+            pivot: Vec3::ZERO,
+            anchor: Vec3::ZERO,
             edited_mesh: None,
             mesh_revision: 0,
         });
@@ -518,6 +541,36 @@ impl Scene {
         } else {
             false
         }
+    }
+
+    /// World-space position of an object's pivot point.
+    pub fn world_pivot(&self, id: ObjectId) -> Vec3 {
+        let pivot = self.object(id).map(|o| o.pivot).unwrap_or(Vec3::ZERO);
+        self.world_transform(id).transform_point(pivot)
+    }
+
+    /// World-space position of an object's anchor point.
+    pub fn world_anchor(&self, id: ObjectId) -> Vec3 {
+        let anchor = self.object(id).map(|o| o.anchor).unwrap_or(Vec3::ZERO);
+        self.world_transform(id).transform_point(anchor)
+    }
+
+    /// Attach `child` to `parent`: move the child so its anchor point lands
+    /// on `at` (world space; defaults to the parent's anchor point), then
+    /// parent it there. Rejects cycles like `set_parent`.
+    pub fn attach(&mut self, child: ObjectId, parent: ObjectId, at: Option<Vec3>) -> bool {
+        if child == parent
+            || self.object(child).is_none()
+            || self.object(parent).is_none()
+            || self.is_ancestor(child, parent)
+        {
+            return false;
+        }
+        let target = at.unwrap_or_else(|| self.world_anchor(parent));
+        let mut world = self.world_transform(child);
+        world.location += target - self.world_anchor(child);
+        self.set_world_transform(child, world);
+        self.set_parent(child, Some(parent))
     }
 
     /// Nesting depth (roots are 0) — used for hierarchy-ordered updates.
@@ -791,6 +844,49 @@ mod tests {
         let object = scene.object(child).unwrap();
         assert_eq!(object.parent, None);
         assert!((object.transform.location - world_before.location).length() < 1e-4);
+    }
+
+    #[test]
+    fn rotation_about_pivot_keeps_the_pivot_fixed() {
+        let mut t = Transform::default();
+        t.location = Vec3::new(2.0, 0.0, 0.0);
+        t.scale = Vec3::splat(2.0);
+        let local_pivot = Vec3::new(1.0, 0.0, 0.0); // world (4, 0, 0)
+        let before = t.transform_point(local_pivot);
+
+        t.set_rotation_about(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), local_pivot);
+        let after = t.transform_point(local_pivot);
+        assert!((before - after).length() < 1e-5, "{after:?}");
+        // the origin swung around the pivot: (2,0,0) -> (4,-2,0)
+        assert!((t.location - Vec3::new(4.0, -2.0, 0.0)).length() < 1e-5, "{:?}", t.location);
+    }
+
+    #[test]
+    fn attach_lands_anchor_on_anchor_and_parents() {
+        let mut scene = Scene::new();
+        let table = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut t = Transform::default();
+        t.location = Vec3::new(10.0, 0.0, 0.0);
+        let cup = scene.add_object(Primitive::Cylinder { vertices: 8, radius: 0.5, depth: 1.0 }, t);
+
+        // table's attachment site is the tabletop center; the cup attaches
+        // by the bottom of its base
+        scene.object_mut(table).unwrap().anchor = Vec3::new(0.0, 0.0, 1.0);
+        scene.object_mut(cup).unwrap().anchor = Vec3::new(0.0, 0.0, -0.5);
+
+        assert!(scene.attach(cup, table, None));
+        assert_eq!(scene.object(cup).unwrap().parent, Some(table));
+        // cup bottom sits on the tabletop: cup center at z = 1.5
+        let w = scene.world_transform(cup);
+        assert!((w.location - Vec3::new(0.0, 0.0, 1.5)).length() < 1e-5, "{:?}", w.location);
+
+        // explicit attachment point wins
+        assert!(scene.attach(cup, table, Some(Vec3::new(0.5, 0.5, 1.0))));
+        assert!((scene.world_anchor(cup) - Vec3::new(0.5, 0.5, 1.0)).length() < 1e-5);
+
+        // cycles and self-attach rejected
+        assert!(!scene.attach(table, cup, None));
+        assert!(!scene.attach(table, table, None));
     }
 
     #[test]

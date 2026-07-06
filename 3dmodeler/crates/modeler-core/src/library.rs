@@ -27,6 +27,15 @@ pub struct LibraryAsset {
     /// Small preview image (PNG, base64) rendered from the objects.
     #[serde(default)]
     pub preview_png_base64: Option<String>,
+    /// Pivot point (asset space): placed on the drop point when the asset
+    /// lands on empty ground, and the reference for rotating the placed
+    /// group. (0,0,0) = the normalized footprint-center / lowest point.
+    #[serde(default)]
+    pub pivot: Vec3,
+    /// Anchor point (asset space): when the asset is dropped ONTO another
+    /// object it attaches there — the anchor lands on the hit point.
+    #[serde(default)]
+    pub anchor: Vec3,
 }
 
 /// The whole library document (serialized as JSON).
@@ -76,6 +85,8 @@ impl Library {
             description: description.to_string(),
             objects,
             preview_png_base64,
+            pivot: Vec3::ZERO,
+            anchor: Vec3::ZERO,
         });
         id
     }

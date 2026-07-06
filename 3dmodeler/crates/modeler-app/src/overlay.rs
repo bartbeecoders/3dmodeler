@@ -5,6 +5,7 @@
 use crate::camera::BlenderCamera;
 use crate::modal::{GuideKind, Guides};
 use crate::ref_image::CalibrateTool;
+use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::Scene;
@@ -293,6 +294,7 @@ pub fn draw(
     viewport: Viewport,
     device_pixel_ratio: f32,
     scene: &Scene,
+    selection: &Selection,
     measure: &MeasureTool,
     calibrate: &CalibrateTool,
     unit: Unit,
@@ -344,6 +346,59 @@ pub fn draw(
     if let Some(first) = measure.first {
         if let Some(a) = project(first) {
             painter.circle_stroke(a, 5.0, egui::Stroke::new(1.5, MEASURE_COLOR));
+        }
+    }
+
+    // --- pivot & anchor markers (active object, when set) -------------------
+    const PIVOT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
+    const ANCHOR_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 205, 225);
+    if let Some(active) = selection.active() {
+        if let Some(object) = scene.object(active) {
+            if object.pivot != Vec3::ZERO {
+                if let Some(pos) = project(scene.world_pivot(active)) {
+                    // crosshair circle, Blender-3D-cursor-style
+                    painter.circle_stroke(pos, 6.0, egui::Stroke::new(1.5, PIVOT_COLOR));
+                    for d in [egui::vec2(9.0, 0.0), egui::vec2(0.0, 9.0)] {
+                        painter.line_segment(
+                            [pos - d, pos + d],
+                            egui::Stroke::new(1.0, PIVOT_COLOR),
+                        );
+                    }
+                    text_with_bg(
+                        &painter,
+                        pos + egui::vec2(10.0, -4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        "pivot",
+                        10.0,
+                        PIVOT_COLOR,
+                    );
+                }
+            }
+            if object.anchor != Vec3::ZERO {
+                if let Some(pos) = project(scene.world_anchor(active)) {
+                    // diamond
+                    let r = 6.0;
+                    let points = vec![
+                        pos + egui::vec2(0.0, -r),
+                        pos + egui::vec2(r, 0.0),
+                        pos + egui::vec2(0.0, r),
+                        pos + egui::vec2(-r, 0.0),
+                    ];
+                    painter.add(egui::Shape::closed_line(
+                        points,
+                        egui::Stroke::new(1.5, ANCHOR_COLOR),
+                    ));
+                    painter.circle_filled(pos, 1.5, ANCHOR_COLOR);
+                    text_with_bg(
+                        &painter,
+                        pos + egui::vec2(10.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        "anchor",
+                        10.0,
+                        ANCHOR_COLOR,
+                    );
+                }
+            }
         }
     }
 

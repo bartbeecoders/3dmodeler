@@ -192,6 +192,7 @@ pub fn main() {
                     frame_input.viewport,
                     frame_input.device_pixel_ratio,
                     &scene,
+                    &sel,
                     &measure,
                     &calibrate,
                     settings.unit,
@@ -290,16 +291,43 @@ pub fn main() {
                 physics.sync(&scene); // ray needs a current mirror
                 let (origin, direction) =
                     camera.pick_ray(frame_input.viewport, x_px, y_px);
-                let at = physics
-                    .pick_point(
-                        glam::Vec3::new(origin.x, origin.y, origin.z),
-                        glam::Vec3::new(direction.x, direction.y, direction.z),
-                    )
+                let ray_origin = glam::Vec3::new(origin.x, origin.y, origin.z);
+                let ray_dir = glam::Vec3::new(direction.x, direction.y, direction.z);
+                let point = physics
+                    .pick_point(ray_origin, ray_dir)
                     .unwrap_or(glam::Vec3::ZERO);
-                let new_ids = modeler_core::library::instantiate(&mut scene, &asset, at);
+                // dropped ONTO an object: the asset's anchor lands on the hit
+                // point and the asset attaches (parents) there; dropped on
+                // empty ground: the pivot lands on the drop point
+                let hit_object = physics.pick(ray_origin, ray_dir);
+                let reference = if hit_object.is_some() { asset.anchor } else { asset.pivot };
+                let new_ids = modeler_core::library::instantiate(
+                    &mut scene,
+                    &asset,
+                    point - reference,
+                );
+                if let Some(target) = hit_object {
+                    let roots: Vec<_> = new_ids
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            scene.object(id).is_some_and(|o| o.parent.is_none())
+                        })
+                        .collect();
+                    for root in roots {
+                        scene.set_parent(root, Some(target));
+                    }
+                }
                 let active = new_ids.first().copied();
                 sel.set(new_ids, active);
-                ui_state.status_message = Some(format!("placed '{}'", asset.name));
+                ui_state.status_message = Some(match hit_object {
+                    Some(target) => format!(
+                        "placed '{}' on '{}'",
+                        asset.name,
+                        scene.object(target).map(|o| o.name.as_str()).unwrap_or("?")
+                    ),
+                    None => format!("placed '{}'", asset.name),
+                });
             }
         }
 

@@ -69,7 +69,9 @@ fn tool_definitions() -> Value {
                     "dynamic": {"type": "boolean", "description": "Falls & collides when the physics simulation plays"},
                     "density": {"type": "number"},
                     "show_label": {"type": "boolean", "description": "Show the name as a viewport label"},
-                    "show_dimensions": {"type": "boolean", "description": "Show W×D×H dimensions in the viewport"}
+                    "show_dimensions": {"type": "boolean", "description": "Show W×D×H dimensions in the viewport"},
+                    "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space pivot point: interactive rotations (R) spin the object around it"},
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space anchor point: where the object attaches to another object (attach_object)"}
                 },
                 "required": ["primitive"]
             }
@@ -91,7 +93,9 @@ fn tool_definitions() -> Value {
                     "dynamic": {"type": "boolean"},
                     "density": {"type": "number"},
                     "show_label": {"type": "boolean"},
-                    "show_dimensions": {"type": "boolean"}
+                    "show_dimensions": {"type": "boolean"},
+                    "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space rotation pivot"},
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space attachment point"}
                 },
                 "required": ["object"]
             }
@@ -115,6 +119,19 @@ fn tool_definitions() -> Value {
                     "parent": {"type": ["string", "null"]}
                 },
                 "required": ["child"]
+            }
+        },
+        {
+            "name": "attach_object",
+            "description": "Attach one object to another: the object is MOVED so its anchor point lands on the attachment point (the target's anchor point, or an explicit world location), then parented there. Set anchor points via add/update_object. Cycles are rejected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object to attach (name or id)"},
+                    "to": {"type": "string", "description": "Target object it attaches to"},
+                    "location": {"type": "array", "items": {"type": "number"}, "description": "Optional [x, y, z] world attachment point (default: the target's anchor point)"}
+                },
+                "required": ["object", "to"]
             }
         },
         {
@@ -202,7 +219,9 @@ fn tool_definitions() -> Value {
                     "name": {"type": "string", "description": "Asset name (unique-suffixed like Table, Table.001, ...)"},
                     "description": {"type": "string"},
                     "objects": {"type": "array", "items": {"type": "string"}, "description": "Scene object names/ids to capture (children included). Defaults to the current selection."},
-                    "preview_png_base64": {"type": "string", "description": "Optional custom preview image (PNG, base64)"}
+                    "preview_png_base64": {"type": "string", "description": "Optional custom preview image (PNG, base64)"},
+                    "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] asset-space pivot: lands on the location when placed on the ground (default [0,0,0] = footprint center at the lowest point)"},
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] asset-space anchor: lands on the attachment point when placed with attach_to"}
                 },
                 "required": ["name"]
             }
@@ -217,7 +236,9 @@ fn tool_definitions() -> Value {
                     "new_name": {"type": "string"},
                     "description": {"type": "string"},
                     "objects": {"type": "array", "items": {"type": "string"}, "description": "Replace the asset's contents with these scene objects (children included)"},
-                    "preview_png_base64": {"type": "string"}
+                    "preview_png_base64": {"type": "string"},
+                    "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] asset-space placement/rotation reference"},
+                    "anchor": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] asset-space attachment point"}
                 },
                 "required": ["asset"]
             }
@@ -233,12 +254,13 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "place_library_object",
-            "description": "Instantiate a library asset into the scene at a world location (default [0,0,0]). The asset's lowest point lands on that location. Objects get fresh ids and unique names, hierarchy preserved; the new objects become the selection. Returns their ids and names.",
+            "description": "Instantiate a library asset into the scene. Default: the asset's PIVOT point lands on 'location' ([0,0,0] if omitted). With 'attach_to': the asset's ANCHOR point lands on the attachment point (location, or the target object's anchor point) and the asset is parented to that object. Objects get fresh ids and unique names, hierarchy preserved; the new objects become the selection. Returns their ids and names.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "asset": {"type": "string", "description": "Library asset name (or id as string)"},
-                    "location": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] in meters"}
+                    "location": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] in meters"},
+                    "attach_to": {"type": "string", "description": "Optional scene object (name or id) to attach the placed asset to"}
                 },
                 "required": ["asset"]
             }
@@ -267,8 +289,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
-        "add_object" | "update_object" | "delete_object" | "set_parent" | "add_measurement"
-        | "simulate" | "add_reference_image" | "update_reference_image"
+        "add_object" | "update_object" | "delete_object" | "set_parent" | "attach_object"
+        | "add_measurement" | "simulate" | "add_reference_image" | "update_reference_image"
         | "delete_reference_image" | "calibrate_reference_image" | "create_library_object"
         | "update_library_object" | "delete_library_object" | "place_library_object" => {
             let mut command = arguments.clone();
