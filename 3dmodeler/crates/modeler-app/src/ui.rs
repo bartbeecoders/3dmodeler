@@ -5,6 +5,7 @@
 //! popups misbehave inside the deprecated panel API (see plan.md, Phase 3).
 
 use crate::camera::BlenderCamera;
+use crate::context_menu::ContextMenu;
 use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
@@ -44,6 +45,7 @@ pub struct UiState {
     current_file: Option<io::FileHandle>,
     settings_window: SettingsWindow,
     pub library_panel: LibraryPanel,
+    pub context_menu: ContextMenu,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
     #[cfg(target_arch = "wasm32")]
@@ -81,6 +83,7 @@ impl UiState {
             current_file: None,
             settings_window: SettingsWindow::new(),
             library_panel: LibraryPanel::new(),
+            context_menu: ContextMenu::new(),
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
             #[cfg(target_arch = "wasm32")]
@@ -187,6 +190,11 @@ impl UiState {
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
         if let Some(message) = self.library_panel.dialog_window(ctx, scene, selection, library) {
+            self.status_message = Some(message);
+        }
+        if let Some(message) =
+            self.context_menu.ui(ctx, scene, selection, modal, &mut self.library_panel)
+        {
             self.status_message = Some(message);
         }
         self.library_panel
@@ -1016,6 +1024,7 @@ impl UiState {
                 egui::Grid::new("keymap-grid").striped(true).show(ui, |ui| {
                     for (keys, action) in [
                         ("LMB / Shift+LMB", "Select / extend selection"),
+                        ("RMB (viewport)", "Context menu: pivot/anchor & object actions"),
                         ("MMB drag", "Orbit"),
                         ("Shift+MMB", "Pan"),
                         ("Wheel / Ctrl+MMB", "Zoom"),

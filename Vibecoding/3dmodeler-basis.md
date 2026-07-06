@@ -126,4 +126,6 @@ Add the ability to set a pivot point on an object and on a library object
 Add the ability to set an anchor point on an object and on a library object
     - anchor point is the point where the object is attached to another object
 
-Add the possibility to set a selected vertex as the pivot or the  anchor points
+Add the possibility to set a selected vertex as the pivot or the anchor point
+
+Add a context menu (right click) on an object, vertex, edge, face to set options like the pivot or anchor point

@@ -9,6 +9,7 @@ mod axis_widget;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
 mod camera;
+mod context_menu;
 mod edit_mode;
 mod grid;
 mod library;
@@ -460,6 +461,69 @@ pub fn main() {
                         *handled = true;
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // right-click: context menu on the object (object mode) or the
+        // vertex/edge/face (edit mode) under the cursor — set pivot/anchor
+        // and common actions. Cancel-RMB during modal/grab stays theirs.
+        if physics.is_stopped() && !modal.active() && !edit_mode.grabbing() {
+            for event in frame_input.events.iter_mut() {
+                if let Event::MousePress {
+                    button: MouseButton::Right,
+                    position,
+                    handled,
+                    ..
+                } = event
+                {
+                    if *handled || pointer_over_ui {
+                        continue;
+                    }
+                    // event coords are physical bottom-left; egui wants
+                    // logical top-left
+                    let menu_pos = egui::pos2(
+                        position.x / frame_input.device_pixel_ratio,
+                        (frame_input.viewport.height as f32 - position.y)
+                            / frame_input.device_pixel_ratio,
+                    );
+                    let target = if edit_mode.active() {
+                        edit_mode
+                            .context_pick(
+                                &scene,
+                                &camera,
+                                frame_input.viewport,
+                                position.x,
+                                position.y,
+                            )
+                            .map(|(id, point, label)| context_menu::Target::Element {
+                                id,
+                                point,
+                                label,
+                            })
+                    } else {
+                        physics.sync(&scene); // ray needs a current mirror
+                        let (origin, direction) =
+                            camera.pick_ray(frame_input.viewport, position.x, position.y);
+                        let ray_o = glam::Vec3::new(origin.x, origin.y, origin.z);
+                        let ray_d = glam::Vec3::new(direction.x, direction.y, direction.z);
+                        physics.pick(ray_o, ray_d).map(|id| {
+                            // clicking inside the current selection keeps it
+                            // (menu actions apply to the whole selection)
+                            if !sel.is_selected(id) {
+                                sel.click(Some(id), false);
+                            }
+                            let hit = physics.pick_point(ray_o, ray_d).unwrap_or_default();
+                            let hit_local =
+                                scene.world_transform(id).inverse_transform_point(hit);
+                            context_menu::Target::Object { id, hit_local }
+                        })
+                    };
+                    match target {
+                        Some(target) => ui_state.context_menu.open(menu_pos, target),
+                        None => ui_state.context_menu.close(),
+                    }
+                    *handled = true;
                 }
             }
         }

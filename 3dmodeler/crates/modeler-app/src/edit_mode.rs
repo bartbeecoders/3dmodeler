@@ -202,12 +202,7 @@ fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
 }
 
 fn world_to_local(t: &Transform, w: Vec3) -> Vec3 {
-    let safe_scale = Vec3::new(
-        if t.scale.x.abs() < 1e-9 { 1.0 } else { t.scale.x },
-        if t.scale.y.abs() < 1e-9 { 1.0 } else { t.scale.y },
-        if t.scale.z.abs() < 1e-9 { 1.0 } else { t.scale.z },
-    );
-    (t.rotation.inverse() * (w - t.location)) / safe_scale
+    t.inverse_transform_point(w)
 }
 
 /// Rotate local mesh positions around a world-space pivot: local -> world,
@@ -286,6 +281,27 @@ impl EditMode {
                     / group.verts.len().max(1) as f32
             }
         })
+    }
+
+    /// Right-click pick for the context menu: select the element under the
+    /// cursor and return (object, local point, element kind label).
+    pub fn context_pick(
+        &mut self,
+        scene: &Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        x: f32,
+        y: f32,
+    ) -> Option<(ObjectId, Vec3, &'static str)> {
+        let id = self.active?;
+        self.pick(scene, camera, viewport, x, y);
+        let point = self.selected_point()?;
+        let label = match self.selected? {
+            Element::Vertex(_) => "Vertex",
+            Element::Edge(..) => "Edge",
+            Element::Face(_) => "Face",
+        };
+        Some((id, point, label))
     }
 
     /// Set the edited object's pivot or anchor to the selected element.

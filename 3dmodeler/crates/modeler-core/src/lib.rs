@@ -41,6 +41,17 @@ impl Transform {
         self.location + self.rotation * (p * self.scale)
     }
 
+    /// Map a point from this transform's space back to local space (the
+    /// inverse of `transform_point`, with zero-scale guarded).
+    pub fn inverse_transform_point(&self, p: Vec3) -> Vec3 {
+        let safe_scale = Vec3::new(
+            if self.scale.x.abs() < 1e-9 { 1.0 } else { self.scale.x },
+            if self.scale.y.abs() < 1e-9 { 1.0 } else { self.scale.y },
+            if self.scale.z.abs() < 1e-9 { 1.0 } else { self.scale.z },
+        );
+        (self.rotation.inverse() * (p - self.location)) / safe_scale
+    }
+
     /// Change the rotation while keeping the given LOCAL point fixed —
     /// the object rotates around that point instead of its origin.
     pub fn set_rotation_about(&mut self, rotation: Quat, local_point: Vec3) {
@@ -868,6 +879,18 @@ mod tests {
         let object = scene.object(child).unwrap();
         assert_eq!(object.parent, None);
         assert!((object.transform.location - world_before.location).length() < 1e-4);
+    }
+
+    #[test]
+    fn transform_point_roundtrips_through_inverse() {
+        let t = Transform {
+            location: Vec3::new(1.0, -2.0, 3.0),
+            rotation: Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.2, 1.1),
+            scale: Vec3::new(2.0, 0.5, 3.0),
+        };
+        let p = Vec3::new(0.3, -1.7, 2.2);
+        let there = t.transform_point(p);
+        assert!((t.inverse_transform_point(there) - p).length() < 1e-5);
     }
 
     #[test]
