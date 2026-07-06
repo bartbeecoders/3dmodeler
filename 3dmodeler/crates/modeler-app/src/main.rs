@@ -151,6 +151,8 @@ pub fn main() {
         let modal_status = edit_mode.status_line().or_else(|| modal.status_line());
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
+        // edit-mode element selection, for "set pivot/anchor to selection"
+        let edit_point = edit_mode.active_object().zip(edit_mode.selected_point());
         let wire_segments = (shade_mode == scene_render::ShadeMode::Wireframe)
             .then(|| wire_cache.segments(&scene, &sel));
         let fps = 1000.0 / frame_input.elapsed_time.max(0.001) as f32;
@@ -177,6 +179,7 @@ pub fn main() {
                     &mut calibrate,
                     &mut settings,
                     &mut library,
+                    edit_point,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,

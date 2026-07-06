@@ -125,3 +125,5 @@ Add the ability to set a pivot point on an object and on a library object
     - pivot point is the point around which the object rotates
 Add the ability to set an anchor point on an object and on a library object
     - anchor point is the point where the object is attached to another object
+
+Add the possibility to set a selected vertex as the pivot or the  anchor points

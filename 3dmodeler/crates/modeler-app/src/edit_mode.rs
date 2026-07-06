@@ -209,13 +209,47 @@ impl EditMode {
         self.grab.is_some()
     }
 
+    /// The object being edited, if edit mode is on.
+    pub fn active_object(&self) -> Option<ObjectId> {
+        self.active
+    }
+
+    /// Local-space point of the current element selection: the vertex
+    /// position, the edge midpoint, or the face centroid. Local mesh space
+    /// is exactly the space pivot/anchor points live in.
+    pub fn selected_point(&self) -> Option<Vec3> {
+        let topo = self.topo.as_ref()?;
+        Some(match self.selected? {
+            Element::Vertex(v) => *topo.verts.get(v)?,
+            Element::Edge(a, b) => 0.5 * (*topo.verts.get(a)? + *topo.verts.get(b)?),
+            Element::Face(f) => {
+                let group = topo.faces.get(f)?;
+                group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+                    / group.verts.len().max(1) as f32
+            }
+        })
+    }
+
+    /// Set the edited object's pivot or anchor to the selected element.
+    fn set_point_from_selection(&self, scene: &mut Scene, anchor: bool) {
+        let (Some(id), Some(point)) = (self.active, self.selected_point()) else { return };
+        if let Some(object) = scene.object_mut(id) {
+            if anchor {
+                object.anchor = point;
+            } else {
+                object.pivot = point;
+            }
+        }
+    }
+
     /// Status-bar line while edit mode is on.
     pub fn status_line(&self) -> Option<String> {
         let _ = self.active?;
         Some(match &self.grab {
             Some(grab) => grab.status.clone(),
             None => format!(
-                "EDIT MODE ({}) · click select · G move · 1/2/3 vertex/edge/face · Tab exit",
+                "EDIT MODE ({}) · click select · G move · P/A set pivot/anchor · \
+                 1/2/3 vertex/edge/face · Tab exit",
                 self.mode.label()
             ),
         })
@@ -392,6 +426,19 @@ impl EditMode {
             }
             "g" | "G" => {
                 self.start_grab(scene);
+                true
+            }
+            // P / A: the selected element becomes the pivot / anchor point
+            "p" | "P" => {
+                if self.grab.is_none() {
+                    self.set_point_from_selection(scene, false);
+                }
+                true
+            }
+            "a" | "A" => {
+                if self.grab.is_none() {
+                    self.set_point_from_selection(scene, true);
+                }
                 true
             }
             // swallow the object-mode tools so they can't fire mid-edit
@@ -770,6 +817,60 @@ mod tests {
         assert!(mesh.normals.iter().all(|n| (n.length() - 1.0).abs() < 1e-3));
         // revision bumped so caches resync
         assert_eq!(scene.object(id).unwrap().mesh_revision, 1);
+    }
+
+    #[test]
+    fn selected_element_becomes_pivot_or_anchor() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut edit = EditMode::new();
+        edit.active = Some(id);
+        edit.rebuild_topology(&scene);
+
+        // vertex: the corner itself
+        let corner = edit
+            .topo
+            .as_ref()
+            .unwrap()
+            .verts
+            .iter()
+            .position(|v| (*v - Vec3::ONE).length() < 1e-4)
+            .expect("corner");
+        edit.selected = Some(Element::Vertex(corner));
+        assert_eq!(edit.selected_point(), Some(Vec3::ONE));
+
+        // P / A set the object's pivot / anchor (typed-character path)
+        assert!(edit.text_input("p", &mut scene));
+        assert_eq!(scene.object(id).unwrap().pivot, Vec3::ONE);
+        assert!(edit.text_input("A", &mut scene));
+        assert_eq!(scene.object(id).unwrap().anchor, Vec3::ONE);
+
+        // edge: midpoint; face: centroid
+        let (a, b) = edit.topo.as_ref().unwrap().edges[0];
+        let expect = {
+            let topo = edit.topo.as_ref().unwrap();
+            0.5 * (topo.verts[a] + topo.verts[b])
+        };
+        edit.selected = Some(Element::Edge(a, b));
+        assert_eq!(edit.selected_point(), Some(expect));
+
+        let expect = {
+            let topo = edit.topo.as_ref().unwrap();
+            let group = &topo.faces[0];
+            group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+                / group.verts.len() as f32
+        };
+        edit.selected = Some(Element::Face(0));
+        assert_eq!(edit.selected_point(), Some(expect));
+        assert!(edit.text_input("P", &mut scene));
+        assert!((scene.object(id).unwrap().pivot - expect).length() < 1e-6);
+
+        // no selection -> no point, P is still consumed but changes nothing
+        edit.selected = None;
+        assert_eq!(edit.selected_point(), None);
+        let before = scene.object(id).unwrap().pivot;
+        assert!(edit.text_input("p", &mut scene));
+        assert_eq!(scene.object(id).unwrap().pivot, before);
     }
 
     #[test]

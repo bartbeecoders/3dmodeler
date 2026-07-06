@@ -17,7 +17,7 @@ use crate::scene_render::ShadeMode;
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use modeler_core::ImagePlane;
-use modeler_core::glam::{EulerRot, Quat};
+use modeler_core::glam::{EulerRot, Quat, Vec3};
 use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
 use three_d::Event;
@@ -121,6 +121,7 @@ impl UiState {
         calibrate: &mut CalibrateTool,
         settings: &mut Settings,
         library: &mut Library,
+        edit_point: Option<(ObjectId, Vec3)>,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -176,7 +177,7 @@ impl UiState {
             mcp,
         );
         let right_offset = if self.show_sidebar {
-            self.sidebar(ctx, scene, selection, settings, calibrate, library)
+            self.sidebar(ctx, scene, selection, settings, calibrate, library, edit_point)
         } else {
             0.0
         };
@@ -816,6 +817,7 @@ impl UiState {
         settings: &Settings,
         calibrate: &mut CalibrateTool,
         library: &mut Library,
+        edit_point: Option<(ObjectId, Vec3)>,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
@@ -849,7 +851,7 @@ impl UiState {
                     }
                     ui.separator();
                 }
-                properties(ui, scene, selection, settings);
+                properties(ui, scene, selection, settings, edit_point);
             });
         response.response.rect.width()
     }
@@ -1031,6 +1033,7 @@ impl UiState {
                         ("Tab", "Object edit mode (active object)"),
                         ("1 / 2 / 3 (edit)", "Vertex / Edge / Face select"),
                         ("G (edit)", "Move selected element (X/Y/Z axis)"),
+                        ("P / A (edit)", "Selected element becomes pivot / anchor"),
                         ("N", "Toggle sidebar"),
                         ("Space", "Play / pause physics"),
                         ("Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y", "Undo / redo"),
@@ -1493,7 +1496,13 @@ fn calibrate_window(
 
 // --- properties (N panel) ----------------------------------------------------
 
-fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, settings: &Settings) {
+fn properties(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    selection: &Selection,
+    settings: &Settings,
+    edit_point: Option<(ObjectId, Vec3)>,
+) {
     let Some(active_id) = selection.active() else {
         ui.weak("No active object");
         return;
@@ -1576,6 +1585,48 @@ fn properties(ui: &mut egui::Ui, scene: &mut Scene, selection: &Selection, setti
             );
             changed |= vec3_row(ui, "Pivot (rotation center, R)", &mut pivot, 0.05);
             changed |= vec3_row(ui, "Anchor (attachment point)", &mut anchor, 0.05);
+
+            // edit mode (Tab) with an element selected on THIS object: one
+            // click makes that vertex/edge/face the pivot or anchor
+            match edit_point {
+                Some((edit_id, point)) if edit_id == active_id => {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Pivot = selection")
+                            .on_hover_text(
+                                "Set the pivot to the selected vertex (edge midpoint / \
+                                 face center) — also: press P in edit mode",
+                            )
+                            .clicked()
+                        {
+                            pivot = point;
+                            changed = true;
+                        }
+                        if ui
+                            .button("Anchor = selection")
+                            .on_hover_text(
+                                "Set the anchor to the selected vertex (edge midpoint / \
+                                 face center) — also: press A in edit mode",
+                            )
+                            .clicked()
+                        {
+                            anchor = point;
+                            changed = true;
+                        }
+                    });
+                }
+                _ => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Tab into edit mode and select a vertex to set these \
+                             from the geometry (P = pivot, A = anchor).",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                }
+            }
         });
 
     let mut revert_mesh = false;
