@@ -665,7 +665,8 @@ pub fn main() {
         let logical_height = frame_input.viewport.height as f32 / frame_input.device_pixel_ratio;
         camera.handle_events(&mut frame_input.events, logical_height);
 
-        // '.' frames the selection (and re-pivots the orbit on it); Home frames all
+        // '.' frames the selection (and re-pivots the orbit on it); Home
+        // frames all; End places the selection on the ground (z = 0)
         for event in frame_input.events.iter() {
             if let Event::KeyPress { kind, handled: false, .. } = event {
                 match kind {
@@ -680,6 +681,13 @@ pub fn main() {
                         if let Some((center, radius)) = scene.bounds() {
                             camera.frame(cg(center), radius);
                         }
+                    }
+                    Key::End
+                        if physics.is_stopped()
+                            && !edit_mode.active()
+                            && !egui_owns_keyboard =>
+                    {
+                        object_ops::place_on_ground(&mut scene, &sel);
                     }
                     _ => {}
                 }

@@ -1057,6 +1057,7 @@ impl UiState {
                         ("4 / 6 / 8 / 2", "Step-rotate view"),
                         ("5", "Orthographic / perspective"),
                         (". / Home", "Frame selection / scene"),
+                        ("End", "Place selection on the ground (z = 0)"),
                         ("Shift+A", "Add mesh"),
                         ("G / R / S", "Move / Rotate / Scale"),
                         ("X / Y / Z (modal)", "Axis constraint (Shift: plane)"),
@@ -1168,10 +1169,19 @@ fn object_menu(
     }
     if ui
         .add_enabled(has_selection, egui::Button::new("Drop to Floor"))
+        .on_hover_text("Drop onto whatever is below (other objects or the ground)")
         .clicked()
     {
         physics.sync(scene); // mirror must match before ray casting
         physics.drop_to_floor(scene, selection);
+        close = true;
+    }
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Place on Ground  (End)"))
+        .on_hover_text("Move the selection vertically so its lowest point sits at z = 0")
+        .clicked()
+    {
+        object_ops::place_on_ground(scene, selection);
         close = true;
     }
     ui.separator();

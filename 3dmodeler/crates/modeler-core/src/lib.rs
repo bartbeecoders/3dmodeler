@@ -289,6 +289,26 @@ impl Object {
             None => self.primitive.bounding_radius(),
         }
     }
+
+    /// Distance from the local origin to the lowest point (unscaled),
+    /// following the edited mesh when there is one.
+    pub fn bottom_offset(&self) -> f32 {
+        match &self.edited_mesh {
+            Some(mesh) => {
+                let min_z = mesh
+                    .positions
+                    .iter()
+                    .map(|p| p.z)
+                    .fold(f32::INFINITY, f32::min);
+                if min_z.is_finite() {
+                    -min_z
+                } else {
+                    self.primitive.bottom_offset()
+                }
+            }
+            None => self.primitive.bottom_offset(),
+        }
+    }
 }
 
 /// A ruler measurement between two world-space points.
@@ -582,6 +602,14 @@ impl Scene {
         } else {
             false
         }
+    }
+
+    /// Lowest world-space z of an object, estimated from its bottom extent
+    /// along z (rotation is ignored — a placement approximation).
+    pub fn lowest_point_z(&self, id: ObjectId) -> f32 {
+        let world = self.world_transform(id);
+        let bottom = self.object(id).map(|o| o.bottom_offset()).unwrap_or(0.0);
+        world.location.z - bottom * world.scale.z.abs()
     }
 
     /// World-space position of an object's pivot point.

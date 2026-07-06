@@ -134,3 +134,6 @@ Library Objects
 
 By default, keep library objects as 1 group. So when the user drags a library object on the scene, it is kept as 1 group.
 When the user wants to edit a library object, it should be possible to break it down into its parts.
+
+
+Pressing the end key should place the selected object(s) on the ground (z = 0).

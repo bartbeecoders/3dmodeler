@@ -133,27 +133,6 @@ impl Library {
     }
 }
 
-/// Lowest world-space z of an object, estimated from its bottom extent along
-/// z (rotation is ignored — good enough for the placement pivot).
-fn lowest_z(scene: &Scene, object: &Object) -> f32 {
-    let world = scene.world_transform(object.id);
-    let bottom = match &object.edited_mesh {
-        Some(mesh) => {
-            let min_z = mesh
-                .positions
-                .iter()
-                .map(|p| p.z)
-                .fold(f32::INFINITY, f32::min);
-            if min_z.is_finite() {
-                -min_z
-            } else {
-                object.primitive.bottom_offset()
-            }
-        }
-        None => object.primitive.bottom_offset(),
-    };
-    world.location.z - bottom * world.scale.z.abs()
-}
 
 /// Capture the given objects (plus all their descendants) as a
 /// pivot-normalized object list ready to store in a [`LibraryAsset`].
@@ -183,7 +162,7 @@ pub fn capture_objects(scene: &Scene, ids: &[ObjectId]) -> Vec<Object> {
         / roots.len().max(1) as f32;
     let bottom = included
         .iter()
-        .map(|o| lowest_z(scene, o))
+        .map(|o| scene.lowest_point_z(o.id))
         .fold(f32::INFINITY, f32::min);
     let pivot = Vec3::new(center.x, center.y, if bottom.is_finite() { bottom } else { 0.0 });
 

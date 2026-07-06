@@ -125,3 +125,70 @@ pub fn delete_selected(scene: &mut Scene, selection: &mut Selection) {
     }
     selection.retain_existing(|id| scene.object(id).is_some());
 }
+
+/// Place the selection on the ground (End key): each selection root (a
+/// selected object whose parent is not selected) is moved vertically so the
+/// lowest point of its whole subtree sits at z = 0 — a grouped assembly
+/// lands as one piece, keeping its internal offsets.
+pub fn place_on_ground(scene: &mut Scene, selection: &Selection) {
+    let selected = selection.selected().to_vec();
+    let roots: Vec<_> = selected
+        .iter()
+        .copied()
+        .filter(|&id| {
+            scene
+                .object(id)
+                .is_some_and(|o| o.parent.map_or(true, |p| !selected.contains(&p)))
+        })
+        .collect();
+    for root in roots {
+        let lowest = scene
+            .subtree(root)
+            .iter()
+            .map(|&member| scene.lowest_point_z(member))
+            .fold(f32::INFINITY, f32::min);
+        if !lowest.is_finite() {
+            continue;
+        }
+        let mut world = scene.world_transform(root);
+        world.location.z -= lowest;
+        scene.set_world_transform(root, world);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modeler_core::glam::Vec3;
+    use modeler_core::{Primitive, Transform};
+
+    #[test]
+    fn end_places_selection_roots_on_the_ground() {
+        let mut scene = Scene::new();
+        let mut at = |location: Vec3| {
+            let mut t = Transform::default();
+            t.location = location;
+            scene.add_object(Primitive::Cube { size: 2.0 }, t)
+        };
+        // a floating "door"-like pair: root high up, child hanging below
+        let root = at(Vec3::new(0.0, 0.0, 5.0));
+        let child = at(Vec3::new(0.0, 3.0, 2.0));
+        // and an independent floating cube
+        let loose = at(Vec3::new(4.0, 0.0, -3.0));
+        scene.set_parent(child, Some(root));
+
+        let mut selection = Selection::default();
+        selection.set(vec![root, child, loose], Some(root));
+        place_on_ground(&mut scene, &selection);
+
+        // the pair moved as ONE piece: the child's bottom (the lowest point
+        // of the subtree) sits at z = 0 and the 3 m gap is preserved
+        assert!((scene.lowest_point_z(child) - 0.0).abs() < 1e-4);
+        let root_z = scene.world_transform(root).location.z;
+        let child_z = scene.world_transform(child).location.z;
+        assert!((root_z - child_z - 3.0).abs() < 1e-4, "{root_z} vs {child_z}");
+        // the loose cube (below ground before) came UP to rest at z = 0
+        let w = scene.world_transform(loose);
+        assert!((w.location.z - 1.0).abs() < 1e-4, "{:?}", w.location);
+    }
+}
