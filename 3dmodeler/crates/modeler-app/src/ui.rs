@@ -65,8 +65,7 @@ pub struct McpStatus {
 pub struct UiLayout {
     pub top_offset: f32,     // menu bar height (logical)
     pub right_offset: f32,   // sidebar width (logical)
-    #[allow(dead_code)] // overlays may want it later
-    pub bottom_offset: f32, // status bar height (logical)
+    pub bottom_offset: f32,  // status bar height (logical)
 }
 
 impl UiState {
@@ -935,31 +934,51 @@ impl UiState {
                     egui::RichText::new(&display_name)
                 };
 
-                // drag a row onto another row to parent it there
-                let source = ui.dnd_drag_source(
-                    egui::Id::new(("outliner-drag", object.id.0)),
-                    object.id,
-                    |ui| {
-                        let row = ui.selectable_label(is_selected, label);
-                        if row.double_clicked() {
-                            start_rename = Some((object.id, object.name.clone()));
-                        } else if row.clicked() {
-                            clicked = Some(object.id);
-                        }
-                    },
-                );
+                // click selects, double-click renames, dragging a row onto
+                // another row parents it there. Senses are handled on the
+                // row itself — egui's dnd_drag_source wrapper swallows
+                // clicks (its drag overlay sits on top of the label).
+                let row = ui
+                    .selectable_label(is_selected, label)
+                    .interact(egui::Sense::click_and_drag());
+                if row.double_clicked() {
+                    start_rename = Some((object.id, object.name.clone()));
+                } else if row.clicked() {
+                    clicked = Some(object.id);
+                }
+                if row.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), object.id);
+                }
+                // floating name at the cursor while this row is dragged
+                if row.dragged()
+                    && egui::DragAndDrop::has_payload_of_type::<ObjectId>(ui.ctx())
+                {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            egui::Id::new("outliner-drag-preview"),
+                        ));
+                        painter.text(
+                            pos + egui::vec2(12.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            &object.name,
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::from_rgb(255, 170, 64),
+                        );
+                    }
+                }
 
                 // drop target: another object released on this row
-                if let Some(dragged) = source.response.dnd_release_payload::<ObjectId>() {
+                if let Some(dragged) = row.dnd_release_payload::<ObjectId>() {
                     if *dragged != object.id {
                         reparent = Some((*dragged, Some(object.id)));
                     }
                 }
                 // highlight while a compatible drag hovers this row
-                if let Some(dragged) = source.response.dnd_hover_payload::<ObjectId>() {
+                if let Some(dragged) = row.dnd_hover_payload::<ObjectId>() {
                     if *dragged != object.id {
                         ui.painter().rect_stroke(
-                            source.response.rect.expand(2.0),
+                            row.rect.expand(2.0),
                             3.0,
                             egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 170, 64)),
                             egui::StrokeKind::Outside,

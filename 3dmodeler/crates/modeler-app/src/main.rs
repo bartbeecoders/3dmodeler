@@ -258,8 +258,18 @@ pub fn main() {
                 }
 
                 // plain clicks on egui widgets are NOT flagged handled by
-                // three-d (only drags are), so track hover ourselves
+                // three-d (only drags are), so track hover ourselves.
+                // is_pointer_over_egui() misses the (deprecated-API) panels
+                // in egui 0.34, so also test against the chrome rects —
+                // otherwise clicks in the sidebar leak through to the
+                // viewport and clear the selection the sidebar just made.
                 pointer_over_ui = gui_context.is_pointer_over_egui();
+                if let Some(pos) = gui_context.input(|i| i.pointer.latest_pos()) {
+                    let screen = gui_context.content_rect();
+                    pointer_over_ui |= pos.x > screen.right() - layout.right_offset
+                        || pos.y < screen.top() + layout.top_offset
+                        || pos.y > screen.bottom() - layout.bottom_offset;
+                }
             },
         );
 
