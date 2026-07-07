@@ -32,9 +32,15 @@ pub enum Target {
     Element { id: ObjectId, point: Vec3, label: &'static str },
 }
 
-/// What the westward slots offer: wall openings or group/attach actions.
+/// What the westward slots offer: wall openings, brick→wall rebuild or
+/// group/attach actions.
 enum WheelKind {
-    Object { wall: Option<(f32, f32)> }, // (length, height) when a wall
+    Object {
+        /// (length, height) when the object is a pristine wall.
+        wall: Option<(f32, f32)>,
+        /// The bricks folder when the object came from a broken wall.
+        rebuild: Option<u64>,
+    },
     Element,
 }
 
@@ -130,6 +136,7 @@ impl ContextMenu {
                     }
                     _ => None,
                 };
+                let rebuild = crate::object_ops::rebuildable_folder(scene, id);
                 let multi =
                     selection.selected().len() >= 2 && selection.active().is_some();
                 let mut slots = vec![
@@ -143,6 +150,9 @@ impl ContextMenu {
                 if wall.is_some() {
                     slots.push(PieSlot::new("Add door", PieIcon::Door)); // W
                     slots.push(PieSlot::new("Add window", PieIcon::Window)); // NW
+                } else if rebuild.is_some() {
+                    slots.push(PieSlot::new("Rebuild wall", PieIcon::Wall)); // W
+                    slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
                 } else if is_group {
                     slots.push(PieSlot::new("Ungroup", PieIcon::Ungroup)); // W
                     slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
@@ -150,7 +160,7 @@ impl ContextMenu {
                     slots.push(PieSlot::new("Group", PieIcon::Glyph("❐")).enabled(multi)); // W
                     slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
                 }
-                (WheelKind::Object { wall }, slots, hub_label(&object.name))
+                (WheelKind::Object { wall, rebuild }, slots, hub_label(&object.name))
             }
             Target::Element { label, .. } => {
                 let slots = vec![
@@ -188,7 +198,7 @@ impl ContextMenu {
         library_panel: &mut LibraryPanel,
     ) -> Option<String> {
         match (kind, target) {
-            (WheelKind::Object { wall }, Target::Object { id, hit_local }) => {
+            (WheelKind::Object { wall, rebuild }, Target::Object { id, hit_local }) => {
                 let name = scene.object(id).map(|o| o.name.clone()).unwrap_or_default();
                 match slot {
                     0 => {
@@ -246,8 +256,22 @@ impl ContextMenu {
                             }
                             Some(format!("{what} added to '{name}'"))
                         }
-                        // object wheel: group/ungroup (W) or attach (NW)
+                        // object wheel W: rebuild wall (bricks), else
+                        // group/ungroup
                         None if slot == 6 => {
+                            if let Some(folder) = rebuild {
+                                return object_ops::rebuild_wall_from_folder(
+                                    scene, folder,
+                                )
+                                .map(|wall| {
+                                    selection.set(vec![wall], Some(wall));
+                                    let wall_name = scene
+                                        .object(wall)
+                                        .map(|o| o.name.clone())
+                                        .unwrap_or_default();
+                                    format!("bricks rebuilt into '{wall_name}'")
+                                });
+                            }
                             let is_group =
                                 scene.object(id).is_some_and(|o| o.group);
                             if is_group {

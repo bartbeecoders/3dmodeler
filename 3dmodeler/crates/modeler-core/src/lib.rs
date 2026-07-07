@@ -464,6 +464,10 @@ impl ReferenceImage {
 pub struct Folder {
     pub id: u64,
     pub name: String,
+    /// The original wall, stored by "Break Wall into Bricks" so the wall
+    /// can be rebuilt from the folder later. None for ordinary folders.
+    #[serde(default)]
+    pub source_wall: Option<Box<Object>>,
 }
 
 /// The scene document — the single source of truth that the renderer and the
@@ -641,8 +645,15 @@ impl Scene {
             }
             candidate
         };
-        self.folders.push(Folder { id, name });
+        self.folders.push(Folder { id, name, source_wall: None });
         id
+    }
+
+    /// Mutable access; bumps the version (callers are expected to change
+    /// something).
+    pub fn folder_mut(&mut self, id: u64) -> Option<&mut Folder> {
+        self.version += 1;
+        self.folders.iter_mut().find(|f| f.id == id)
     }
 
     pub fn rename_folder(&mut self, id: u64, name: String) {

@@ -249,8 +249,45 @@ pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<Obj
         }
         ids.push(brick);
     }
-    scene.remove_object(id);
+    // keep the original wall on the folder so it can be rebuilt later
+    if let Some(original) = scene.remove_object(id) {
+        if let Some(f) = scene.folder_mut(folder) {
+            f.source_wall = Some(Box::new(original));
+        }
+    }
     Some(ids)
+}
+
+/// The bricks folder a member of which can rebuild the wall, if any.
+pub fn rebuildable_folder(scene: &Scene, id: ObjectId) -> Option<u64> {
+    let folder = scene.object(id)?.folder?;
+    scene
+        .folder(folder)
+        .is_some_and(|f| f.source_wall.is_some())
+        .then_some(folder)
+}
+
+/// Inverse of `break_wall_into_bricks`: remove every object filed in the
+/// bricks folder (wherever the simulation scattered them), delete the folder
+/// and restore the stored wall at its original place. Returns the wall's
+/// new id.
+pub fn rebuild_wall_from_folder(scene: &mut Scene, folder_id: u64) -> Option<ObjectId> {
+    let wall = scene.folder(folder_id)?.source_wall.clone()?;
+    let members: Vec<ObjectId> = scene
+        .objects()
+        .iter()
+        .filter(|o| o.folder == Some(folder_id))
+        .map(|o| o.id)
+        .collect();
+    for id in members {
+        scene.remove_object(id);
+    }
+    scene.remove_folder(folder_id);
+    let mut wall = *wall;
+    wall.folder = None;
+    // the original parent may have been deleted in the meantime
+    wall.parent = wall.parent.filter(|&p| scene.object(p).is_some());
+    Some(scene.insert_object(wall))
 }
 
 /// The parts of `[x0, x1]` not covered by any blocked range.
@@ -317,6 +354,23 @@ mod tests {
                 || cz - hh >= 2.1 - 1e-3;
             assert!(outside, "brick at ({cx}, {cz}) w={hw} h={hh} is inside the door");
         }
+
+        // ...and back: rebuilding restores the wall and clears the bricks
+        let brick = bricks[0];
+        let folder_id = rebuildable_folder(&scene, brick).expect("bricks are rebuildable");
+        let restored = rebuild_wall_from_folder(&mut scene, folder_id).unwrap();
+        assert!(scene.folders().is_empty(), "bricks folder removed");
+        for &id in &bricks {
+            assert!(scene.object(id).is_none(), "brick {id:?} removed");
+        }
+        let wall = scene.object(restored).unwrap();
+        assert_eq!(wall.name, "Wall");
+        assert_eq!(
+            wall.primitive,
+            Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 }
+        );
+        assert_eq!(wall.cutouts.len(), 1, "the door survives the round trip");
+        assert_eq!(scene.objects().len(), 1);
     }
 
     #[test]

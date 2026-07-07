@@ -39,6 +39,8 @@ struct OutlinerActions {
     folder_eye: Option<u64>,
     delete_folder: Option<u64>,
     commit_folder_rename: Option<(u64, String)>,
+    /// Rebuild the wall stored in this bricks folder.
+    rebuild_wall: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1135,6 +1137,18 @@ impl UiState {
                 {
                     acts.delete_folder = Some(fid);
                 }
+                // bricks folders can restore their original wall
+                if scene.folder(fid).is_some_and(|f| f.source_wall.is_some())
+                    && ui
+                        .small_button("⟳")
+                        .on_hover_text(
+                            "Rebuild the wall: remove these bricks and restore \
+                             the original wall object",
+                        )
+                        .clicked()
+                {
+                    acts.rebuild_wall = Some(fid);
+                }
             });
         });
     }
@@ -1294,6 +1308,17 @@ impl UiState {
                 scene.rename_folder(fid, trimmed.to_string());
             }
             self.rename_folder = None;
+        }
+        if let Some(fid) = acts.rebuild_wall {
+            if let Some(wall) = object_ops::rebuild_wall_from_folder(scene, fid) {
+                selection.set(vec![wall], Some(wall));
+                let name = scene
+                    .object(wall)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_default();
+                self.status_message = Some(format!("bricks rebuilt into '{name}'"));
+                self.collapsed_folders.remove(&fid);
+            }
         }
 
         if let Some(id) = acts.visibility_toggle {
@@ -1531,6 +1556,32 @@ fn object_menu(
                 ));
                 let active = bricks.first().copied();
                 selection.set(bricks, active);
+            }
+        }
+        close = true;
+    }
+    let rebuild_folder = selection
+        .active()
+        .and_then(|id| object_ops::rebuildable_folder(scene, id));
+    if ui
+        .add_enabled(
+            rebuild_folder.is_some(),
+            egui::Button::new("Rebuild Wall from Bricks"),
+        )
+        .on_hover_text(
+            "Remove the bricks (wherever they tumbled) and restore the \
+             original wall object",
+        )
+        .clicked()
+    {
+        if let Some(folder) = rebuild_folder {
+            if let Some(wall) = object_ops::rebuild_wall_from_folder(scene, folder) {
+                selection.set(vec![wall], Some(wall));
+                let name = scene
+                    .object(wall)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_default();
+                *status = Some(format!("bricks rebuilt into '{name}'"));
             }
         }
         close = true;
