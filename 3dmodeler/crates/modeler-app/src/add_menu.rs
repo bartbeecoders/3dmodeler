@@ -20,35 +20,28 @@ enum PieItem {
     Wall,
 }
 
-/// Slot order around the wheel, starting north and going clockwise:
-/// N, NE, E, SE, S, SW, W, NW. Cube sits on top — it is used the most.
-fn pie_items() -> [(PieItem, &'static str); 8] {
-    let c = Primitive::catalog(); // [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus]
+/// Slot order around the wheel, starting north and going clockwise.
+/// Cube sits on top — it is used the most.
+fn pie_items() -> [(PieItem, &'static str); 9] {
+    // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
+    let c = Primitive::catalog();
     [
-        (PieItem::Primitive(c[1]), "Cube"),       // N
-        (PieItem::Primitive(c[2]), "UV Sphere"),  // NE
-        (PieItem::Primitive(c[3]), "Ico Sphere"), // E
-        (PieItem::Primitive(c[5]), "Cone"),       // SE
-        (PieItem::Primitive(c[4]), "Cylinder"),   // S
-        (PieItem::Primitive(c[6]), "Torus"),      // SW
-        (PieItem::Primitive(c[0]), "Plane"),      // W
-        (PieItem::Wall, "Wall"),                  // NW
+        (PieItem::Primitive(c[1]), "Cube"),
+        (PieItem::Primitive(c[2]), "UV Sphere"),
+        (PieItem::Primitive(c[3]), "Ico Sphere"),
+        (PieItem::Primitive(c[5]), "Cone"),
+        (PieItem::Primitive(c[4]), "Cylinder"),
+        (PieItem::Primitive(c[6]), "Torus"),
+        (PieItem::Primitive(c[0]), "Plane"),
+        (PieItem::Primitive(c[7]), "Empty"),
+        (PieItem::Wall, "Wall"),
     ]
 }
 
 fn slot_icon(item: PieItem) -> PieIcon {
     match item {
         PieItem::Wall => PieIcon::Wall,
-        PieItem::Primitive(primitive) => match primitive {
-            Primitive::Plane { .. } => PieIcon::Plane,
-            Primitive::Cube { .. } => PieIcon::Cube,
-            Primitive::UvSphere { .. } => PieIcon::UvSphere,
-            Primitive::IcoSphere { .. } => PieIcon::IcoSphere,
-            Primitive::Cylinder { .. } => PieIcon::Cylinder,
-            Primitive::Cone { .. } => PieIcon::Cone,
-            Primitive::Torus { .. } => PieIcon::Torus,
-            Primitive::Wall { .. } => PieIcon::Wall,
-        },
+        PieItem::Primitive(primitive) => pie::primitive_icon(&primitive),
     }
 }
 
@@ -181,8 +174,8 @@ impl AddMenu {
     }
 }
 
-/// The primitive list as menu buttons; returns the clicked primitive.
-/// Used by the menu-bar Add dropdown (the Shift+A popup is the pie above).
+/// The primitive list as menu buttons with pictograms; returns the clicked
+/// primitive. Used by the menu-bar Add dropdown (Shift+A opens the pie).
 pub fn mesh_menu_buttons(ui: &mut egui::Ui) -> Option<Primitive> {
     let mut clicked = None;
     for primitive in Primitive::catalog() {
@@ -191,7 +184,7 @@ pub fn mesh_menu_buttons(ui: &mut egui::Ui) -> Option<Primitive> {
             Primitive::IcoSphere { .. } => "Ico Sphere".to_string(),
             other => other.base_name().to_string(),
         };
-        if ui.button(label).clicked() {
+        if pie::icon_menu_button(ui, &pie::primitive_icon(&primitive), &label).clicked() {
             clicked = Some(primitive);
         }
     }

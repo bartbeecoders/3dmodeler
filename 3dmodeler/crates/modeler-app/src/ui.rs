@@ -1451,8 +1451,7 @@ fn add_menu_items(
         return true;
     }
     ui.separator();
-    if ui
-        .button("Wall")
+    if crate::pie::icon_menu_button(ui, &crate::pie::PieIcon::Wall, "Wall")
         .on_hover_text(
             "Draw wall segments on the floor: click the start point, then each \
              corner; Enter keeps the current segment, Esc/RMB ends the tool",
@@ -2347,6 +2346,16 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
             changed |= float_row(ui, "Length", length, 0.02);
             changed |= float_row(ui, "Height", height, 0.02);
             changed |= float_row(ui, "Thickness", thickness, 0.005);
+        }
+        Primitive::Empty { size } => {
+            changed |= float_row(ui, "Size", size, 0.02);
+            ui.label(
+                egui::RichText::new(
+                    "A marker / grouping parent — never collides or simulates.",
+                )
+                .weak()
+                .size(11.0),
+            );
         }
     }
     changed

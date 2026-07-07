@@ -62,7 +62,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "empty"]},
                     "length": {"type": "number", "description": "Wall only: length in meters (default 2)"},
                     "height": {"type": "number", "description": "Wall only: height in meters (default 2.5)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},

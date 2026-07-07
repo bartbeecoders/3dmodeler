@@ -115,6 +115,11 @@ impl PhysicsMirror {
                 if !object.visible {
                     continue; // hidden objects are not pickable / simulated
                 }
+                // empties are markers: pickable while editing (static
+                // mirror), but never collide or simulate
+                if simulate && matches!(object.primitive, Primitive::Empty { .. }) {
+                    continue;
+                }
                 let t = scene.world_transform(object.id);
                 let mut body_def = ffi::b3DefaultBodyDef();
                 body_def.position = bvec(t.location);
@@ -578,6 +583,33 @@ mod tests {
         }
         let z = scene.object(id).unwrap().transform.location.z;
         assert!((z - 3.0).abs() < 1e-5, "static object moved to {z}");
+    }
+
+    #[test]
+    fn empties_never_collide_in_simulation() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        scene.add_object(Primitive::Empty { size: 1.0 }, Transform::default());
+        let mut t = Transform::default();
+        t.location.z = 3.0;
+        let cube = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        scene.object_mut(cube).unwrap().dynamic = true;
+
+        let mut physics = PhysicsMirror::new();
+        physics.ground_plane = false;
+        physics.play(&scene);
+        for _ in 0..90 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+        // the cube fell straight through the empty at the origin
+        let z = scene.object(cube).unwrap().transform.location.z;
+        assert!(z < -2.0, "cube must fall through the empty, got z={z}");
+        physics.stop(&mut scene);
+
+        // but empties stay pickable in the editing (static) mirror
+        physics.sync(&scene);
+        let hit = physics.pick(Vec3::new(0.0, -10.0, 0.0), Vec3::Y);
+        assert_eq!(hit, scene.objects().first().map(|o| o.id));
     }
 
     #[test]

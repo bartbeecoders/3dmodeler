@@ -196,6 +196,7 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
         "cone" => Some(catalog[5]),
         "torus" => Some(catalog[6]),
         "wall" => Some(Primitive::Wall { length: 2.0, height: 2.5, thickness: 0.2 }),
+        "empty" => Some(catalog[7]),
         _ => None,
     }
 }

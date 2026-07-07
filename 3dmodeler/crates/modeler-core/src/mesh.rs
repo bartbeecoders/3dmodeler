@@ -105,6 +105,34 @@ impl WallCutout {
     }
 }
 
+/// Empty point (plain axes): three thin boxes crossing at the origin, one
+/// per axis, ±`size` long — reads as three lines in the viewport but stays
+/// a regular pickable mesh.
+pub fn empty_axes(size: f32) -> MeshData {
+    let s = size.max(0.01);
+    let t = (0.02 * s).max(0.004); // line half-thickness
+    let mut m = MeshData::default();
+    axis_box(&mut m, Vec3::new(-s, -t, -t), Vec3::new(s, t, t));
+    axis_box(&mut m, Vec3::new(-t, -s, -t), Vec3::new(t, s, t));
+    axis_box(&mut m, Vec3::new(-t, -t, -s), Vec3::new(t, t, s));
+    m
+}
+
+/// Axis-aligned box between `min` and `max` as six faces.
+fn axis_box(m: &mut MeshData, min: Vec3, max: Vec3) {
+    let v = Vec3::new;
+    let (a, b) = (min, max);
+    // +X / -X
+    face(m, [v(b.x, a.y, a.z), v(b.x, b.y, a.z), v(b.x, b.y, b.z), v(b.x, a.y, b.z)], Vec3::X);
+    face(m, [v(a.x, b.y, a.z), v(a.x, a.y, a.z), v(a.x, a.y, b.z), v(a.x, b.y, b.z)], -Vec3::X);
+    // +Y / -Y
+    face(m, [v(b.x, b.y, a.z), v(a.x, b.y, a.z), v(a.x, b.y, b.z), v(b.x, b.y, b.z)], Vec3::Y);
+    face(m, [v(a.x, a.y, a.z), v(b.x, a.y, a.z), v(b.x, a.y, b.z), v(a.x, a.y, b.z)], -Vec3::Y);
+    // +Z / -Z
+    face(m, [v(a.x, a.y, b.z), v(b.x, a.y, b.z), v(b.x, b.y, b.z), v(a.x, b.y, b.z)], Vec3::Z);
+    face(m, [v(a.x, b.y, a.z), v(b.x, b.y, a.z), v(b.x, a.y, a.z), v(a.x, a.y, a.z)], -Vec3::Z);
+}
+
 /// One quad with per-face vertices; `corners` counter-clockwise seen from
 /// the normal side.
 fn face(m: &mut MeshData, corners: [Vec3; 4], n: Vec3) {

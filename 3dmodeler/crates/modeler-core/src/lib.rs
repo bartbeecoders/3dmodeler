@@ -102,11 +102,15 @@ pub enum Primitive {
     /// standing on z = 0, thickness centered on the X axis. Door/window
     /// openings live on the OBJECT (`Object::cutouts`), not here.
     Wall { length: f32, height: f32, thickness: f32 },
+    /// Empty point (Blender's plain-axes empty): three thin axis lines
+    /// crossing at the origin, ±`size` long. A marker / grouping parent —
+    /// it never collides or simulates.
+    Empty { size: f32 },
 }
 
 impl Primitive {
     /// All primitives with Blender-default parameters, in Add-menu order.
-    pub fn catalog() -> [Primitive; 7] {
+    pub fn catalog() -> [Primitive; 8] {
         [
             Primitive::Plane { size: 2.0 },
             Primitive::Cube { size: 2.0 },
@@ -115,6 +119,7 @@ impl Primitive {
             Primitive::Cylinder { vertices: 32, radius: 1.0, depth: 2.0 },
             Primitive::Cone { vertices: 32, radius_bottom: 1.0, radius_top: 0.0, depth: 2.0 },
             Primitive::Torus { major_segments: 48, minor_segments: 12, major_radius: 1.0, minor_radius: 0.25 },
+            Primitive::Empty { size: 1.0 },
         ]
     }
 
@@ -129,6 +134,7 @@ impl Primitive {
             Primitive::Cone { .. } => "Cone",
             Primitive::Torus { .. } => "Torus",
             Primitive::Wall { .. } => "Wall",
+            Primitive::Empty { .. } => "Empty",
         }
     }
 
@@ -149,6 +155,7 @@ impl Primitive {
             Primitive::Wall { length, height, thickness } => {
                 (length * length + 0.25 * thickness * thickness + height * height).sqrt()
             }
+            Primitive::Empty { size } => size,
         }
     }
 
@@ -174,6 +181,7 @@ impl Primitive {
             Primitive::Wall { length, height, thickness } => {
                 Vec3::new(length, thickness, height)
             }
+            Primitive::Empty { size } => Vec3::splat(2.0 * size),
         }
     }
 
@@ -186,6 +194,7 @@ impl Primitive {
             Primitive::Cylinder { depth, .. } | Primitive::Cone { depth, .. } => 0.5 * depth,
             Primitive::Torus { minor_radius, .. } => minor_radius,
             Primitive::Wall { .. } => 0.0, // stands on its own floor line
+            Primitive::Empty { size } => size,
         }
     }
 
@@ -207,6 +216,7 @@ impl Primitive {
             Primitive::Wall { length, height, thickness } => {
                 mesh::wall(length, height, thickness, &[])
             }
+            Primitive::Empty { size } => mesh::empty_axes(size),
         };
         if smooth {
             m
@@ -1160,6 +1170,28 @@ mod tests {
         // cycles and self-attach rejected
         assert!(!scene.attach(table, cup, None));
         assert!(!scene.attach(table, table, None));
+    }
+
+    #[test]
+    fn empty_primitive_is_three_axis_lines() {
+        let empty = Primitive::Empty { size: 1.0 };
+        assert_eq!(empty.base_name(), "Empty");
+        let mesh = empty.generate(false);
+        // three thin boxes, six faces each
+        assert_eq!(mesh.indices.len(), 3 * 6 * 6);
+        // spans ±size on every axis
+        let max = mesh
+            .positions
+            .iter()
+            .fold(Vec3::ZERO, |m, p| m.max(p.abs()));
+        assert!((max - Vec3::ONE).length() < 1e-5, "{max:?}");
+        assert_eq!(empty.dimensions(), Vec3::splat(2.0));
+
+        // survives save/load
+        let mut scene = Scene::new();
+        scene.add_object(empty, Transform::default());
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.objects[0].primitive, empty);
     }
 
     #[test]

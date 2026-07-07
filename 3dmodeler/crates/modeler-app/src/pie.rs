@@ -24,6 +24,7 @@ pub enum PieIcon {
     Torus,
     Plane,
     Wall,
+    Empty,
     // actions (line-art)
     Duplicate,
     Anchor,
@@ -31,6 +32,47 @@ pub enum PieIcon {
     Attach,
     Door,
     Window,
+}
+
+/// The icon matching a primitive (shared by the pie and the Add dropdown).
+pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
+    use modeler_core::Primitive as P;
+    match primitive {
+        P::Plane { .. } => PieIcon::Plane,
+        P::Cube { .. } => PieIcon::Cube,
+        P::UvSphere { .. } => PieIcon::UvSphere,
+        P::IcoSphere { .. } => PieIcon::IcoSphere,
+        P::Cylinder { .. } => PieIcon::Cylinder,
+        P::Cone { .. } => PieIcon::Cone,
+        P::Torus { .. } => PieIcon::Torus,
+        P::Wall { .. } => PieIcon::Wall,
+        P::Empty { .. } => PieIcon::Empty,
+    }
+}
+
+/// A menu-style button with a small line-art icon before the label; the
+/// hover highlight spans the full row like a plain menu button.
+pub fn icon_menu_button(
+    ui: &mut egui::Ui,
+    icon: &PieIcon,
+    label: &str,
+) -> egui::Response {
+    // leading spaces reserve room for the icon inside the button
+    let response = ui.add(egui::Button::new(format!("       {label}")));
+    let color = if response.hovered() {
+        ui.visuals().widgets.hovered.fg_stroke.color
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    };
+    let center = egui::pos2(response.rect.left() + 14.0, response.rect.center().y);
+    draw_icon(
+        &ui.painter().with_clip_rect(response.rect),
+        icon,
+        center,
+        6.0,
+        egui::Stroke::new(1.2, color),
+    );
+    response
 }
 
 pub struct PieSlot {
@@ -293,6 +335,13 @@ fn draw_icon(
             painter.line_segment([p(-0.5, -0.22), p(-0.5, 0.22)], stroke);
             painter.line_segment([p(0.5, -0.22), p(0.5, 0.22)], stroke);
             painter.line_segment([p(0.0, 0.22), p(0.0, 0.65)], stroke);
+        }
+        // Empty: axes star (three lines through the origin)
+        PieIcon::Empty => {
+            painter.line_segment([p(-1.0, 0.0), p(1.0, 0.0)], stroke);
+            painter.line_segment([p(0.0, -1.0), p(0.0, 1.0)], stroke);
+            painter.line_segment([p(-0.65, 0.65), p(0.65, -0.65)], stroke);
+            painter.circle_filled(c, 0.14 * s, stroke.color);
         }
         // Duplicate: two overlapping squares
         PieIcon::Duplicate => {
