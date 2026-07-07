@@ -1082,7 +1082,7 @@ impl UiState {
                         (". / Home", "Frame selection / scene"),
                         ("End", "Place selection / reference image on the ground (z = 0)"),
                         ("G (image selected)", "Move the selected reference image"),
-                        ("Shift+A", "Add mesh"),
+                        ("Shift+A", "Add wheel: flick towards an item, click to add"),
                         ("G / R / S", "Move / Rotate / Scale"),
                         ("X / Y / Z (modal)", "Axis constraint (Shift: plane)"),
                         ("digits (modal)", "Exact value, Enter applies"),
