@@ -242,26 +242,15 @@ impl UiState {
         #[allow(deprecated)]
         let response = egui::Panel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let items = [
+                for (menu, label) in [
                     (Menu::File, "File"),
                     (Menu::Edit, "Edit"),
                     (Menu::Add, "Add"),
                     (Menu::Object, "Object"),
                     (Menu::View, "View"),
                     (Menu::Help, "Help"),
-                ];
-                // spread the items so together they fill the whole bar
-                let spacing = ui.spacing().item_spacing.x;
-                let item_width = ((ui.available_width()
-                    - spacing * (items.len() as f32 - 1.0))
-                    / items.len() as f32)
-                    .max(40.0);
-                let item_height = ui.spacing().interact_size.y;
-                for (menu, label) in items {
-                    let button = ui.add_sized(
-                        [item_width, item_height],
-                        egui::SelectableLabel::new(self.open_menu == Some(menu), label),
-                    );
+                ] {
+                    let button = ui.selectable_label(self.open_menu == Some(menu), label);
                     if button.clicked() {
                         self.open_menu = if self.open_menu == Some(menu) {
                             None
