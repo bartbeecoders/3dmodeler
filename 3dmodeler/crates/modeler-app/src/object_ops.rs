@@ -222,6 +222,7 @@ pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<Obj
     }
 
     let mut ids = Vec::with_capacity(layout.len());
+    let folder = scene.add_folder(&format!("{base_name} bricks"));
     for (i, (cx, cz, w)) in layout.into_iter().enumerate() {
         let transform = Transform {
             location: wall.transform_point(Vec3::new(cx, 0.0, cz)),
@@ -236,6 +237,7 @@ pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<Obj
         let brick = scene.add_object(Primitive::Cube { size: 1.0 }, transform);
         if let Some(o) = scene.object_mut(brick) {
             o.name = format!("{base_name} brick {}", i + 1);
+            o.folder = Some(folder);
             o.dynamic = true;
             o.density = density;
             o.material = material;
@@ -296,9 +298,17 @@ mod tests {
         assert!(scene.object(wall).is_none(), "the wall is replaced");
         assert!(bricks.len() > 40, "got {} bricks", bricks.len());
 
+        // the bricks land in their own outliner folder
+        let folder = scene
+            .folders()
+            .iter()
+            .find(|f| f.name == "Wall bricks")
+            .expect("brick folder created");
+
         for &id in &bricks {
             let o = scene.object(id).unwrap();
             assert!(o.dynamic, "bricks must simulate");
+            assert_eq!(o.folder, Some(folder.id), "bricks are filed in the folder");
             // no brick may reach into the door opening (interior overlap)
             let (cx, cz) = (o.transform.location.x, o.transform.location.z);
             let (hw, hh) = (0.5 * o.transform.scale.x, 0.5 * o.transform.scale.z);

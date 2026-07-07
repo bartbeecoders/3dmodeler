@@ -24,6 +24,23 @@ use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
 use three_d::Event;
 
+/// Pending outliner mutations, collected while the rows draw and applied
+/// afterwards (the rows only hold shared borrows of the scene).
+#[derive(Default)]
+struct OutlinerActions {
+    visibility_toggle: Option<ObjectId>,
+    clicked: Option<ObjectId>,
+    start_rename: Option<(ObjectId, String)>,
+    commit_rename: Option<(ObjectId, String)>,
+    reparent: Option<(ObjectId, Option<ObjectId>)>,
+    /// File an object under a folder; None sends it to the scene root
+    /// (clearing its parent too).
+    move_to_folder: Option<(ObjectId, Option<u64>)>,
+    folder_eye: Option<u64>,
+    delete_folder: Option<u64>,
+    commit_folder_rename: Option<(u64, String)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     File,
@@ -38,6 +55,11 @@ pub struct UiState {
     open_menu: Option<Menu>,
     menu_origin: egui::Pos2,
     rename: Option<(ObjectId, String)>,
+    rename_folder: Option<(u64, String)>,
+    /// Focus the rename field on its FIRST frame only — re-requesting focus
+    /// every frame would cancel the focus loss that commits the rename.
+    rename_needs_focus: bool,
+    collapsed_folders: std::collections::HashSet<u64>,
     pub show_sidebar: bool,
     show_keymap: bool,
     import_open: bool,
@@ -76,6 +98,9 @@ impl UiState {
             open_menu: None,
             menu_origin: egui::Pos2::ZERO,
             rename: None,
+            rename_folder: None,
+            rename_needs_focus: false,
+            collapsed_folders: std::collections::HashSet::new(),
             show_sidebar: true,
             show_keymap: false,
             import_open: false,
@@ -852,8 +877,36 @@ impl UiState {
         let response = egui::Panel::right("sidebar")
             .default_size(250.0)
             .show(ctx, |ui| {
-                theme::section_header(ui, "Outliner");
-                self.outliner(ui, scene, selection);
+                ui.horizontal(|ui| {
+                    theme::section_header(ui, "Outliner");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .small_button("+ 📂")
+                                .on_hover_text(
+                                    "New folder — drag outliner objects onto it",
+                                )
+                                .clicked()
+                            {
+                                let id = scene.add_folder("Folder");
+                                let name = scene
+                                    .folder(id)
+                                    .map(|f| f.name.clone())
+                                    .unwrap_or_default();
+                                self.rename_folder = Some((id, name));
+                                self.rename_needs_focus = true;
+                            }
+                        },
+                    );
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("outliner-scroll")
+                    .max_height(320.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        self.outliner(ui, scene, selection);
+                    });
                 ui.separator();
                 if let Some(message) = self.library_panel.section(ui, library) {
                     self.status_message = Some(message);
@@ -888,42 +941,218 @@ impl UiState {
     }
 
     fn outliner(&mut self, ui: &mut egui::Ui, scene: &mut Scene, selection: &mut Selection) {
-        let mut visibility_toggle: Option<ObjectId> = None;
-        let mut clicked: Option<ObjectId> = None;
-        let mut start_rename: Option<(ObjectId, String)> = None;
-        let mut commit_rename: Option<(ObjectId, String)> = None;
-        let mut reparent: Option<(ObjectId, Option<ObjectId>)> = None;
+        let mut acts = OutlinerActions::default();
 
-        // hierarchy view: roots first, children indented beneath their parent
-        let mut display: Vec<(ObjectId, u32)> = Vec::new();
+        // children indented beneath their parent
         fn push_children(
             scene: &Scene,
-            parent: Option<ObjectId>,
+            parent: ObjectId,
             depth: u32,
             out: &mut Vec<(ObjectId, u32)>,
         ) {
             for object in scene.objects() {
-                let is_child = match parent {
-                    None => object.parent.is_none()
-                        || object
-                            .parent
-                            .is_some_and(|p| scene.object(p).is_none()),
-                    Some(p) => object.parent == Some(p),
-                };
-                if is_child {
+                if object.parent == Some(parent) {
                     out.push((object.id, depth));
                     if depth < 32 {
-                        push_children(scene, Some(object.id), depth + 1, out);
+                        push_children(scene, object.id, depth + 1, out);
                     }
                 }
             }
         }
-        push_children(scene, None, 0, &mut display);
+        // a root shows at the top level (or under its folder)
+        fn is_root(scene: &Scene, object: &modeler_core::Object) -> bool {
+            object.parent.is_none()
+                || object.parent.is_some_and(|p| scene.object(p).is_none())
+        }
 
+        let folder_ids: Vec<u64> = scene.folders().iter().map(|f| f.id).collect();
+
+        // --- folders, each with its member roots -------------------------
+        for &fid in &folder_ids {
+            let Some(folder) = scene.folder(fid) else { continue };
+            let folder_name = folder.name.clone();
+            let open = !self.collapsed_folders.contains(&fid);
+            self.folder_row(ui, scene, fid, &folder_name, open, &mut acts);
+            if !open {
+                continue;
+            }
+            let mut display: Vec<(ObjectId, u32)> = Vec::new();
+            for object in scene.objects() {
+                if object.folder == Some(fid) && is_root(scene, object) {
+                    display.push((object.id, 1));
+                    push_children(scene, object.id, 2, &mut display);
+                }
+            }
+            if display.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.weak("empty — drag objects onto the folder");
+                });
+            }
+            for (id, depth) in display {
+                self.object_row(ui, scene, selection, id, depth, &mut acts);
+            }
+        }
+
+        // --- objects outside any folder -----------------------------------
+        let mut display: Vec<(ObjectId, u32)> = Vec::new();
+        for object in scene.objects() {
+            let unfoldered = object
+                .folder
+                .is_none_or(|f| !folder_ids.contains(&f));
+            if is_root(scene, object) && unfoldered {
+                display.push((object.id, 0));
+                push_children(scene, object.id, 1, &mut display);
+            }
+        }
         for (id, depth) in display {
-            let Some(object) = scene.object(id) else { continue };
-            ui.horizontal(|ui| {
-                ui.add_space(12.0 * depth as f32);
+            self.object_row(ui, scene, selection, id, depth, &mut acts);
+        }
+
+        // drop here (or on empty space below the tree) to leave parents and
+        // folders behind
+        let any_filed = scene
+            .objects()
+            .iter()
+            .any(|o| o.parent.is_some() || o.folder.is_some());
+        let drag_active =
+            egui::DragAndDrop::has_payload_of_type::<ObjectId>(ui.ctx());
+        if any_filed || drag_active {
+            let frame = egui::Frame::default()
+                .stroke(egui::Stroke::new(1.0, ui.visuals().window_stroke.color))
+                .inner_margin(4.0)
+                .corner_radius(3.0);
+            let (_, dropped) = ui.dnd_drop_zone::<ObjectId, ()>(frame, |ui| {
+                ui.weak("⤒ drop here: no parent, no folder");
+            });
+            if let Some(dragged) = dropped {
+                acts.move_to_folder = Some((*dragged, None));
+            }
+        }
+
+        self.apply_outliner_actions(ui, scene, selection, acts);
+    }
+
+    /// One folder header: collapse triangle, eye, name (drop target,
+    /// double-click renames), member count and delete.
+    fn folder_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene: &Scene,
+        fid: u64,
+        name: &str,
+        open: bool,
+        acts: &mut OutlinerActions,
+    ) {
+        ui.horizontal(|ui| {
+            let icon_resp = ui.allocate_response(
+                egui::vec2(12.0, 14.0),
+                egui::Sense::click(),
+            );
+            egui::collapsing_header::paint_default_icon(
+                ui,
+                if open { 1.0 } else { 0.0 },
+                &icon_resp,
+            );
+            if icon_resp.clicked() {
+                if open {
+                    self.collapsed_folders.insert(fid);
+                } else {
+                    self.collapsed_folders.remove(&fid);
+                }
+            }
+
+            let members: Vec<ObjectId> = scene
+                .objects()
+                .iter()
+                .filter(|o| o.folder == Some(fid))
+                .map(|o| o.id)
+                .collect();
+            let all_visible = members
+                .iter()
+                .all(|&id| scene.object(id).is_some_and(|o| o.visible));
+            let eye = if all_visible { "●" } else { "○" };
+            if ui
+                .small_button(eye)
+                .on_hover_text("Show / hide everything in this folder")
+                .clicked()
+            {
+                acts.folder_eye = Some(fid);
+            }
+
+            if let Some((rename_id, buffer)) = &mut self.rename_folder {
+                if *rename_id == fid {
+                    let edit = ui.text_edit_singleline(buffer);
+                    if self.rename_needs_focus {
+                        edit.request_focus();
+                        self.rename_needs_focus = false;
+                    }
+                    if edit.lost_focus() {
+                        acts.commit_folder_rename = Some((fid, buffer.clone()));
+                    }
+                    return;
+                }
+            }
+
+            let row = ui
+                .selectable_label(
+                    false,
+                    egui::RichText::new(format!("📂 {name}")).strong(),
+                )
+                .interact(egui::Sense::click());
+            ui.label(
+                egui::RichText::new(format!("{}", members.len()))
+                    .weak()
+                    .size(10.5),
+            );
+            if row.double_clicked() {
+                self.rename_folder = Some((fid, name.to_string()));
+                self.rename_needs_focus = true;
+            } else if row.clicked() {
+                if open {
+                    self.collapsed_folders.insert(fid);
+                } else {
+                    self.collapsed_folders.remove(&fid);
+                }
+            }
+            // dropping an object on the folder files it here
+            if let Some(dragged) = row.dnd_release_payload::<ObjectId>() {
+                acts.move_to_folder = Some((*dragged, Some(fid)));
+            }
+            if row.dnd_hover_payload::<ObjectId>().is_some() {
+                ui.painter().rect_stroke(
+                    row.rect.expand(2.0),
+                    3.0,
+                    egui::Stroke::new(1.5, theme::accent(ui)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("✖")
+                    .on_hover_text("Delete the folder (its objects are kept)")
+                    .clicked()
+                {
+                    acts.delete_folder = Some(fid);
+                }
+            });
+        });
+    }
+
+    /// One object row: eye, selectable name (drag source & drop target for
+    /// parenting), double-click renames.
+    fn object_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene: &Scene,
+        selection: &Selection,
+        id: ObjectId,
+        depth: u32,
+        acts: &mut OutlinerActions,
+    ) {
+        let Some(object) = scene.object(id) else { return };
+        ui.horizontal(|ui| {
+            ui.add_space(12.0 * depth as f32);
                 // visibility "eye"
                 let eye = if object.visible { "●" } else { "○" };
                 if ui
@@ -931,15 +1160,18 @@ impl UiState {
                     .on_hover_text("Show / hide (hidden objects are not selectable)")
                     .clicked()
                 {
-                    visibility_toggle = Some(object.id);
+                    acts.visibility_toggle = Some(object.id);
                 }
 
                 if let Some((rename_id, buffer)) = &mut self.rename {
                     if *rename_id == object.id {
                         let edit = ui.text_edit_singleline(buffer);
-                        edit.request_focus();
+                        if self.rename_needs_focus {
+                            edit.request_focus();
+                            self.rename_needs_focus = false;
+                        }
                         if edit.lost_focus() {
-                            commit_rename = Some((object.id, buffer.clone()));
+                            acts.commit_rename = Some((object.id, buffer.clone()));
                         }
                         return;
                     }
@@ -966,9 +1198,9 @@ impl UiState {
                     .selectable_label(is_selected, label)
                     .interact(egui::Sense::click_and_drag());
                 if row.double_clicked() {
-                    start_rename = Some((object.id, object.name.clone()));
+                    acts.start_rename = Some((object.id, object.name.clone()));
                 } else if row.clicked() {
-                    clicked = Some(object.id);
+                    acts.clicked = Some(object.id);
                 }
                 if row.drag_started() {
                     egui::DragAndDrop::set_payload(ui.ctx(), object.id);
@@ -995,7 +1227,7 @@ impl UiState {
                 // drop target: another object released on this row
                 if let Some(dragged) = row.dnd_release_payload::<ObjectId>() {
                     if *dragged != object.id {
-                        reparent = Some((*dragged, Some(object.id)));
+                        acts.reparent = Some((*dragged, Some(object.id)));
                     }
                 }
                 // highlight while a compatible drag hovers this row
@@ -1010,45 +1242,74 @@ impl UiState {
                     }
                 }
             });
-        }
+    }
 
-        // drop here (or on empty space below the tree) to clear the parent
-        let any_parented = scene.objects().iter().any(|o| o.parent.is_some());
-        let drag_active =
-            egui::DragAndDrop::has_payload_of_type::<ObjectId>(ui.ctx());
-        if any_parented || drag_active {
-            let frame = egui::Frame::default()
-                .stroke(egui::Stroke::new(1.0, ui.visuals().window_stroke.color))
-                .inner_margin(4.0)
-                .corner_radius(3.0);
-            let (_, dropped) = ui.dnd_drop_zone::<ObjectId, ()>(frame, |ui| {
-                ui.weak("⤒ drop here to unparent");
-            });
-            if let Some(dragged) = dropped {
-                reparent = Some((*dragged, None));
-            }
-        }
-
-        if let Some((child, parent)) = reparent {
+    fn apply_outliner_actions(
+        &mut self,
+        ui: &egui::Ui,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        acts: OutlinerActions,
+    ) {
+        if let Some((child, parent)) = acts.reparent {
             if !scene.set_parent(child, parent) {
                 self.status_message =
                     Some("can't parent an object to its own child".to_string());
             }
         }
+        if let Some((id, folder)) = acts.move_to_folder {
+            scene.set_folder(id, folder);
+        }
+        if let Some(fid) = acts.folder_eye {
+            // toggle the whole folder content (members and their subtrees)
+            let mut all: Vec<ObjectId> = Vec::new();
+            let members: Vec<ObjectId> = scene
+                .objects()
+                .iter()
+                .filter(|o| o.folder == Some(fid))
+                .map(|o| o.id)
+                .collect();
+            for id in members {
+                all.extend(scene.subtree(id));
+            }
+            let all_visible = all
+                .iter()
+                .all(|&id| scene.object(id).is_some_and(|o| o.visible));
+            for id in all {
+                if let Some(object) = scene.object_mut(id) {
+                    object.visible = !all_visible;
+                }
+            }
+        }
+        if let Some(fid) = acts.delete_folder {
+            scene.remove_folder(fid);
+            self.collapsed_folders.remove(&fid);
+            if self.rename_folder.as_ref().is_some_and(|(id, _)| *id == fid) {
+                self.rename_folder = None;
+            }
+        }
+        if let Some((fid, name)) = acts.commit_folder_rename {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                scene.rename_folder(fid, trimmed.to_string());
+            }
+            self.rename_folder = None;
+        }
 
-        if let Some(id) = visibility_toggle {
+        if let Some(id) = acts.visibility_toggle {
             if let Some(object) = scene.object_mut(id) {
                 object.visible = !object.visible;
             }
         }
-        if let Some(id) = clicked {
+        if let Some(id) = acts.clicked {
             let shift = ui.input(|i| i.modifiers.shift);
             selection.click(Some(id), shift);
         }
-        if let Some((id, name)) = start_rename {
+        if let Some((id, name)) = acts.start_rename {
             self.rename = Some((id, name));
+            self.rename_needs_focus = true;
         }
-        if let Some((id, name)) = commit_rename {
+        if let Some((id, name)) = acts.commit_rename {
             let trimmed = name.trim();
             if !trimmed.is_empty() {
                 if let Some(object) = scene.object_mut(id) {

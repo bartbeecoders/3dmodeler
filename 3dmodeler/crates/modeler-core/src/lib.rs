@@ -251,6 +251,11 @@ pub struct Object {
     /// Hierarchy: this object follows its parent's transform.
     #[serde(default)]
     pub parent: Option<ObjectId>,
+    /// Outliner folder this object is filed under (root objects only —
+    /// children display under their parent). Purely organizational: no
+    /// effect on transforms, rendering or physics.
+    #[serde(default)]
+    pub folder: Option<u64>,
     /// Viewport adornments.
     #[serde(default)]
     pub show_label: bool,
@@ -452,6 +457,15 @@ impl ReferenceImage {
     }
 }
 
+/// An outliner folder: an organizational bucket for root objects (children
+/// display under their parent regardless). Folders never affect transforms,
+/// rendering or physics — deleting one keeps its objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: u64,
+    pub name: String,
+}
+
 /// The scene document — the single source of truth that the renderer and the
 /// physics mirror derive their state from.
 #[derive(Debug)]
@@ -459,6 +473,7 @@ pub struct Scene {
     objects: Vec<Object>,
     measurements: Vec<Measurement>,
     reference_images: Vec<ReferenceImage>,
+    folders: Vec<Folder>,
     next_id: u64,
     version: u64,
     /// Process-unique id of this Scene value. Editors use it to notice the
@@ -475,6 +490,7 @@ impl Default for Scene {
             objects: Vec::new(),
             measurements: Vec::new(),
             reference_images: Vec::new(),
+            folders: Vec::new(),
             next_id: 0,
             version: 0,
             instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -522,6 +538,7 @@ impl Scene {
             dynamic: false,
             density: 1.0,
             parent: None,
+            folder: None,
             show_label: false,
             show_dimensions: false,
             pivot: Vec3::ZERO,
@@ -594,6 +611,76 @@ impl Scene {
             }
         }
         Some(self.objects.remove(index))
+    }
+
+    // --- outliner folders ---------------------------------------------------
+
+    pub fn folders(&self) -> &[Folder] {
+        &self.folders
+    }
+
+    pub fn folder(&self, id: u64) -> Option<&Folder> {
+        self.folders.iter().find(|f| f.id == id)
+    }
+
+    /// Create a folder with a unique name derived from `base`.
+    pub fn add_folder(&mut self, base: &str) -> u64 {
+        self.next_id += 1;
+        self.version += 1;
+        let id = self.next_id;
+        let name = if !self.folders.iter().any(|f| f.name == base) {
+            base.to_string()
+        } else {
+            let mut candidate = format!("{base}.{id}");
+            for i in 1..1000 {
+                let n = format!("{base}.{i:03}");
+                if !self.folders.iter().any(|f| f.name == n) {
+                    candidate = n;
+                    break;
+                }
+            }
+            candidate
+        };
+        self.folders.push(Folder { id, name });
+        id
+    }
+
+    pub fn rename_folder(&mut self, id: u64, name: String) {
+        if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+            folder.name = name;
+            self.version += 1;
+        }
+    }
+
+    /// Delete a folder; its objects are kept and drop back to the scene root.
+    pub fn remove_folder(&mut self, id: u64) {
+        let Some(index) = self.folders.iter().position(|f| f.id == id) else {
+            return;
+        };
+        self.version += 1;
+        self.folders.remove(index);
+        for object in &mut self.objects {
+            if object.folder == Some(id) {
+                object.folder = None;
+            }
+        }
+    }
+
+    /// File an object under a folder (None = scene root). Folder membership
+    /// is a root-object property, so a parented object is unparented first,
+    /// keeping its world transform.
+    pub fn set_folder(&mut self, id: ObjectId, folder: Option<u64>) {
+        if self.object(id).is_some_and(|o| o.parent.is_some()) {
+            let world = self.world_transform(id);
+            if let Some(object) = self.objects.iter_mut().find(|o| o.id == id) {
+                object.parent = None;
+                object.transform = world;
+            }
+        }
+        if let Some(object) = self.objects.iter_mut().find(|o| o.id == id) {
+            object.folder = folder;
+            self.version += 1;
+        }
     }
 
     /// Transform of an object in world space, composed through its parents.
@@ -835,6 +922,8 @@ pub struct SceneData {
     pub measurements: Vec<Measurement>,
     #[serde(default)]
     pub reference_images: Vec<ReferenceImage>,
+    #[serde(default)]
+    pub folders: Vec<Folder>,
     pub next_id: u64,
 }
 
@@ -844,6 +933,7 @@ impl Scene {
             objects: self.objects.clone(),
             measurements: self.measurements.clone(),
             reference_images: self.reference_images.clone(),
+            folders: self.folders.clone(),
             next_id: self.next_id,
         }
     }
@@ -852,6 +942,7 @@ impl Scene {
         self.objects = data.objects.clone();
         self.measurements = data.measurements.clone();
         self.reference_images = data.reference_images.clone();
+        self.folders = data.folders.clone();
         self.next_id = data.next_id;
         self.version += 1;
     }
@@ -1058,6 +1149,40 @@ mod tests {
         // cycles and self-attach rejected
         assert!(!scene.attach(table, cup, None));
         assert!(!scene.attach(table, table, None));
+    }
+
+    #[test]
+    fn folders_organize_roots_and_survive_json() {
+        let mut scene = Scene::new();
+        let a = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let b = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let folder = scene.add_folder("Bricks");
+        assert_eq!(scene.folder(folder).unwrap().name, "Bricks");
+        // duplicate base names get suffixed
+        let other = scene.add_folder("Bricks");
+        assert_ne!(scene.folder(other).unwrap().name, "Bricks");
+
+        // filing a parented object unparents it, keeping the world transform
+        scene.object_mut(a).unwrap().transform.location = Vec3::new(1.0, 2.0, 3.0);
+        scene.set_parent(b, Some(a));
+        let world_before = scene.world_transform(b);
+        scene.set_folder(b, Some(folder));
+        let object = scene.object(b).unwrap();
+        assert_eq!(object.parent, None);
+        assert_eq!(object.folder, Some(folder));
+        assert!((scene.world_transform(b).location - world_before.location).length() < 1e-5);
+
+        // save/load keeps folders; old files (no field) still load
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.folders.len(), 2);
+        assert_eq!(data.objects[1].folder, Some(folder));
+        let old: SceneData = serde_json::from_str(r#"{"objects": [], "next_id": 1}"#).unwrap();
+        assert!(old.folders.is_empty());
+
+        // deleting the folder keeps the objects
+        scene.remove_folder(folder);
+        assert_eq!(scene.folders().len(), 1);
+        assert_eq!(scene.object(b).unwrap().folder, None);
     }
 
     #[test]
