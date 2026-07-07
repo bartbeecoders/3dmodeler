@@ -1098,6 +1098,7 @@ impl UiState {
                         ("Ctrl+S / Ctrl+O / Ctrl+N", "Save / Open / New scene"),
                         ("Ctrl+P / Alt+P", "Parent to active / clear parent"),
                         ("Add ▸ Wall", "Draw walls on the floor: click corners, Esc ends"),
+                        ("Drag ⊕ handle (wall)", "Move a door/window opening; Esc cancels the drag"),
                         ("Add ▸ Measure", "Ruler: click two points"),
                         ("Esc", "Stop physics (restore)"),
                     ] {

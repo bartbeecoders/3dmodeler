@@ -10,6 +10,7 @@ mod axis_widget;
 mod control;
 mod camera;
 mod context_menu;
+mod cutout_handles;
 mod edit_mode;
 mod grid;
 mod library;
@@ -95,6 +96,7 @@ pub fn main() {
     let mut add_menu = add_menu::AddMenu::new();
     let mut modal = modal::ModalTransform::new();
     let mut delete_tool = object_ops::DeleteTool::new();
+    let mut cutout_handles = cutout_handles::CutoutHandles::new();
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
@@ -211,6 +213,22 @@ pub fn main() {
                     &calibrate,
                     settings.unit,
                 );
+                // grab handles on the openings of selected walls
+                if physics.is_stopped()
+                    && !modal.active()
+                    && !edit_mode.active()
+                    && !wall_tool.active()
+                {
+                    cutout_handles.draw(
+                        gui_context,
+                        &scene,
+                        &sel,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        settings.unit,
+                    );
+                }
                 if let Some(guides) = &modal_guides {
                     overlay::draw_modal_guides(
                         gui_context,
@@ -657,6 +675,21 @@ pub fn main() {
         // a commit click never falls through to the picking below
         ui_state.context_menu.handle_events(&mut frame_input.events);
 
+        // wall opening handles: grab/drag doors & windows of selected walls
+        if !modal.active() && physics.is_stopped() && !edit_mode.active() && !wall_tool.active() {
+            cutout_handles.handle_events(
+                &mut frame_input.events,
+                &mut scene,
+                &sel,
+                &camera,
+                frame_input.viewport,
+                frame_input.device_pixel_ratio,
+                pointer_over_ui,
+            );
+        } else {
+            cutout_handles.cancel();
+        }
+
         // external control API (MCP): execute queued agent commands
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(control) = control.as_mut() {
@@ -679,7 +712,11 @@ pub fn main() {
         // batch this frame's edits into undo checkpoints once things go quiet
         undo.on_frame(
             &scene,
-            modal.active() || edit_mode.grabbing() || wall_tool.drawing() || !physics.is_stopped(),
+            modal.active()
+                || edit_mode.grabbing()
+                || wall_tool.drawing()
+                || cutout_handles.dragging()
+                || !physics.is_stopped(),
         );
 
         // overlap warning while placing (grab/rotate/scale active)
