@@ -1396,6 +1396,19 @@ fn view_menu(
     });
     ui.checkbox(xray, "X-ray");
     ui.separator();
+    ui.label(egui::RichText::new("Color theme").weak().size(11.0));
+    ui.horizontal(|ui| {
+        for theme in Theme::ALL {
+            if ui
+                .selectable_label(settings.theme == theme, theme.label())
+                .on_hover_text(theme.description())
+                .clicked()
+            {
+                settings.theme = theme;
+            }
+        }
+    });
+    ui.separator();
     ui.label(egui::RichText::new("Grid spacing").weak().size(11.0));
     ui.horizontal(|ui| {
         let unit = settings.unit;
