@@ -2,7 +2,8 @@
 //! the Delete key (immediate).
 
 use crate::selection::Selection;
-use modeler_core::Scene;
+use modeler_core::glam::Vec3;
+use modeler_core::{ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
 use three_d::{Event, Key, Viewport};
 
@@ -156,11 +157,167 @@ pub fn place_on_ground(scene: &mut Scene, selection: &Selection) {
     }
 }
 
+/// Replace a wall with individual DYNAMIC bricks in a running bond (odd
+/// courses start with a half brick), openings respected. The bricks keep the
+/// wall's material (with a subtle per-brick shade variation) and density;
+/// they collide and can tumble once the simulation plays. Returns the new
+/// brick ids — None when the object is not a pristine wall.
+pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<ObjectId>> {
+    let object = scene.object(id)?;
+    let Primitive::Wall { length, height, thickness } = object.primitive else {
+        return None;
+    };
+    if object.edited_mesh.is_some() {
+        return None;
+    }
+    let wall = scene.world_transform(id);
+    let material = object.material;
+    let density = object.density;
+    let base_name = object.name.clone();
+    let cutouts = object.cutouts.clone();
+
+    // brick module ≈ 0.42 × 0.21 m, enlarged for big walls to cap the count
+    // (physics with thousands of bodies would crawl)
+    let mut cell_x = 0.42_f32;
+    let mut cell_z = 0.21_f32;
+    let estimate = (length / cell_x).max(1.0) * (height / cell_z).max(1.0);
+    const MAX_BRICKS: f32 = 600.0;
+    if estimate > MAX_BRICKS {
+        let grow = (estimate / MAX_BRICKS).sqrt();
+        cell_x *= grow;
+        cell_z *= grow;
+    }
+    let rows = ((height / cell_z).round().max(1.0)) as usize;
+    let cell_z = height / rows as f32;
+    const GAP: f32 = 0.006; // mortar joint, keeps stacked bricks collision-free
+
+    // course layout in the wall's local frame (X along the length, Z up)
+    let mut layout: Vec<(f32, f32, f32)> = Vec::new(); // (center x, center z, width)
+    for row in 0..rows {
+        let z0 = row as f32 * cell_z;
+        let z1 = z0 + cell_z;
+        // openings overlapping this course block their x-range
+        let blocked: Vec<(f32, f32)> = cutouts
+            .iter()
+            .filter(|c| c.bottom < z1 - 1e-3 && c.bottom + c.height > z0 + 1e-3)
+            .map(|c| (c.offset, c.offset + c.width))
+            .collect();
+        let mut x = 0.0_f32;
+        let mut half_first = row % 2 == 1;
+        while x < length - 1e-3 {
+            let step = if half_first { 0.5 * cell_x } else { cell_x };
+            half_first = false;
+            let end = (x + step).min(length);
+            for (s0, s1) in subtract_ranges(x, end, &blocked) {
+                if s1 - s0 < 0.22 * cell_x {
+                    continue; // skip slivers at opening edges
+                }
+                layout.push((0.5 * (s0 + s1), 0.5 * (z0 + z1), s1 - s0));
+            }
+            x = end;
+        }
+    }
+    if layout.is_empty() {
+        return None;
+    }
+
+    let mut ids = Vec::with_capacity(layout.len());
+    for (i, (cx, cz, w)) in layout.into_iter().enumerate() {
+        let transform = Transform {
+            location: wall.transform_point(Vec3::new(cx, 0.0, cz)),
+            rotation: wall.rotation,
+            scale: wall.scale
+                * Vec3::new(
+                    (w - GAP).max(0.02),
+                    (thickness - GAP).max(0.02),
+                    (cell_z - GAP).max(0.02),
+                ),
+        };
+        let brick = scene.add_object(Primitive::Cube { size: 1.0 }, transform);
+        if let Some(o) = scene.object_mut(brick) {
+            o.name = format!("{base_name} brick {}", i + 1);
+            o.dynamic = true;
+            o.density = density;
+            o.material = material;
+            // subtle deterministic shade variation so the bond reads
+            let shade = 0.88 + 0.24 * ((i as f32) * 0.618_034).fract();
+            for channel in &mut o.material.base_color {
+                *channel = (*channel * shade).clamp(0.0, 1.0);
+            }
+        }
+        ids.push(brick);
+    }
+    scene.remove_object(id);
+    Some(ids)
+}
+
+/// The parts of `[x0, x1]` not covered by any blocked range.
+fn subtract_ranges(x0: f32, x1: f32, blocked: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut free = vec![(x0, x1)];
+    for &(b0, b1) in blocked {
+        let mut next = Vec::new();
+        for (f0, f1) in free {
+            if b1 <= f0 || b0 >= f1 {
+                next.push((f0, f1));
+                continue;
+            }
+            if b0 > f0 {
+                next.push((f0, b0));
+            }
+            if b1 < f1 {
+                next.push((b1, f1));
+            }
+        }
+        free = next;
+    }
+    free
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modeler_core::glam::Vec3;
-    use modeler_core::{Primitive, Transform};
+
+    #[test]
+    fn wall_breaks_into_dynamic_bricks_around_openings() {
+        let mut scene = Scene::new();
+        let wall = scene.add_object(
+            Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 },
+            Transform::default(),
+        );
+        // a 1 m door in the middle: 1.5..2.5 × 0..2.1
+        scene.object_mut(wall).unwrap().cutouts.push(modeler_core::WallCutout {
+            offset: 1.5,
+            width: 1.0,
+            bottom: 0.0,
+            height: 2.1,
+        });
+
+        let bricks = break_wall_into_bricks(&mut scene, wall).unwrap();
+        assert!(scene.object(wall).is_none(), "the wall is replaced");
+        assert!(bricks.len() > 40, "got {} bricks", bricks.len());
+
+        for &id in &bricks {
+            let o = scene.object(id).unwrap();
+            assert!(o.dynamic, "bricks must simulate");
+            // no brick may reach into the door opening (interior overlap)
+            let (cx, cz) = (o.transform.location.x, o.transform.location.z);
+            let (hw, hh) = (0.5 * o.transform.scale.x, 0.5 * o.transform.scale.z);
+            let outside = cx + hw <= 1.5 + 1e-3
+                || cx - hw >= 2.5 - 1e-3
+                || cz - hh >= 2.1 - 1e-3;
+            assert!(outside, "brick at ({cx}, {cz}) w={hw} h={hh} is inside the door");
+        }
+    }
+
+    #[test]
+    fn subtract_ranges_cuts_blocked_spans() {
+        assert_eq!(subtract_ranges(0.0, 1.0, &[]), vec![(0.0, 1.0)]);
+        assert_eq!(
+            subtract_ranges(0.0, 1.0, &[(0.4, 0.6)]),
+            vec![(0.0, 0.4), (0.6, 1.0)]
+        );
+        assert_eq!(subtract_ranges(0.0, 1.0, &[(-1.0, 2.0)]), vec![]);
+    }
 
     #[test]
     fn end_places_selection_roots_on_the_ground() {

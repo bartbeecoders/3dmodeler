@@ -296,7 +296,7 @@ impl UiState {
                                 }
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
-                                    &mut self.library_panel,
+                                    &mut self.library_panel, &mut self.status_message,
                                 ),
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
@@ -880,7 +880,9 @@ impl UiState {
                     }
                     ui.separator();
                 }
-                properties(ui, scene, selection, settings, edit_point);
+                if let Some(message) = properties(ui, scene, selection, settings, edit_point) {
+                    self.status_message = Some(message);
+                }
             });
         response.response.rect.width()
     }
@@ -1190,6 +1192,7 @@ fn add_menu_items(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn object_menu(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -1197,6 +1200,7 @@ fn object_menu(
     modal: &mut ModalTransform,
     physics: &mut PhysicsMirror,
     library_panel: &mut LibraryPanel,
+    status: &mut Option<String>,
 ) -> bool {
     let has_selection = !selection.is_empty();
     let mut close = false;
@@ -1240,6 +1244,34 @@ fn object_menu(
         .clicked()
     {
         set_selected_smooth(scene, selection, false);
+        close = true;
+    }
+    ui.separator();
+    let wall_active = selection
+        .active()
+        .and_then(|id| scene.object(id))
+        .is_some_and(|o| {
+            matches!(o.primitive, Primitive::Wall { .. }) && o.edited_mesh.is_none()
+        });
+    if ui
+        .add_enabled(wall_active, egui::Button::new("Break Wall into Bricks"))
+        .on_hover_text(
+            "Replace the active wall with individual dynamic bricks (running \
+             bond, openings kept) that collide and tumble when the simulation \
+             plays (Space)",
+        )
+        .clicked()
+    {
+        if let Some(id) = selection.active() {
+            if let Some(bricks) = object_ops::break_wall_into_bricks(scene, id) {
+                *status = Some(format!(
+                    "wall broken into {} bricks — Space simulates",
+                    bricks.len()
+                ));
+                let active = bricks.first().copied();
+                selection.set(bricks, active);
+            }
+        }
         close = true;
     }
     ui.separator();
@@ -1649,16 +1681,16 @@ fn calibrate_window(
 fn properties(
     ui: &mut egui::Ui,
     scene: &mut Scene,
-    selection: &Selection,
+    selection: &mut Selection,
     settings: &Settings,
     edit_point: Option<(ObjectId, Vec3)>,
-) {
+) -> Option<String> {
     let Some(active_id) = selection.active() else {
         ui.weak("No active object");
-        return;
+        return None;
     };
     let Some(object) = scene.object(active_id) else {
-        return;
+        return None;
     };
 
     // editable object name (also renamable by double-click in the outliner)
@@ -1672,7 +1704,7 @@ fn properties(
             object.name = name;
         }
     }
-    let Some(object) = scene.object(active_id) else { return };
+    let Some(object) = scene.object(active_id) else { return None };
     if let Some(parent) = object.parent {
         if let Some(parent_object) = scene.object(parent) {
             ui.label(
@@ -1695,6 +1727,7 @@ fn properties(
     let mut anchor = object.anchor;
     let mut changed = false;
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
+    let mut break_wall = false;
 
     egui::CollapsingHeader::new("Transform")
         .default_open(true)
@@ -1815,6 +1848,17 @@ fn properties(
             if cut_changed {
                 edited_cutouts = Some(cutouts);
             }
+            if ui
+                .button("Break into bricks")
+                .on_hover_text(
+                    "Replace this wall with individual dynamic bricks (running \
+                     bond, openings kept). They collide and can tumble when the \
+                     simulation plays (Space)",
+                )
+                .clicked()
+            {
+                break_wall = true;
+            }
         }
     }
 
@@ -1887,6 +1931,17 @@ fn properties(
             object.mesh_revision += 1;
         }
     }
+    if break_wall {
+        if let Some(bricks) = object_ops::break_wall_into_bricks(scene, active_id) {
+            let count = bricks.len();
+            let active = bricks.first().copied();
+            selection.set(bricks, active);
+            return Some(format!(
+                "wall broken into {count} bricks — Space simulates"
+            ));
+        }
+    }
+    None
 }
 
 fn vec3_row(
