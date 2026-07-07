@@ -14,11 +14,13 @@ use modeler_core::glam::Vec3;
 use three_d::egui;
 use three_d::{Event, MouseButton, Viewport};
 
-/// Velocity change at the hit point (m/s), from a tap to a full charge.
+/// Velocity change at the hit point (m/s): MIN at a tap, MAX at 100%.
 const MIN_SPEED: f32 = 2.0;
 const MAX_SPEED: f32 = 15.0;
-/// Seconds of holding for full strength.
+/// Seconds of holding to reach 100%.
 const CHARGE_TIME: f32 = 1.2;
+/// Keep charging past 100%, up to 300% (three times the 100% strength).
+const MAX_CHARGE: f32 = 3.0;
 
 pub struct PokeTool {
     /// Seconds the button has been held; None = not charging.
@@ -73,7 +75,7 @@ impl PokeTool {
                     ..
                 } if self.charge.is_some() => {
                     let held = self.charge.take().unwrap_or(0.0);
-                    let strength = (held / CHARGE_TIME).clamp(0.0, 1.0);
+                    let strength = (held / CHARGE_TIME).clamp(0.0, MAX_CHARGE);
                     let speed = MIN_SPEED + (MAX_SPEED - MIN_SPEED) * strength;
                     let (origin, dir) =
                         camera.pick_ray(viewport, position.x, position.y);
@@ -98,15 +100,19 @@ impl PokeTool {
         else {
             return;
         };
-        let t = (held / CHARGE_TIME).clamp(0.0, 1.0);
+        let t = (held / CHARGE_TIME).clamp(0.0, MAX_CHARGE);
         let visuals = ctx.global_style().visuals.clone();
-        let color = lerp_color(visuals.hyperlink_color, visuals.error_fg_color, t);
+        let color = lerp_color(
+            visuals.hyperlink_color,
+            visuals.error_fg_color,
+            t / MAX_CHARGE,
+        );
 
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("poke-charge"),
         ));
-        let radius = 10.0 + 20.0 * t;
+        let radius = 10.0 + 12.0 * t;
         painter.circle_stroke(pos, radius, egui::Stroke::new(3.0, color));
         painter.circle_filled(pos, 3.0, color);
         painter.text(
