@@ -18,6 +18,7 @@ mod object_ops;
 mod io;
 mod overlay;
 mod physics;
+mod pie;
 mod preview;
 mod ref_image;
 mod scene_render;
@@ -652,6 +653,9 @@ pub fn main() {
                 frame_input.device_pixel_ratio,
             );
         }
+        // context wheel (also available in edit mode): consume clicks/Esc so
+        // a commit click never falls through to the picking below
+        ui_state.context_menu.handle_events(&mut frame_input.events);
 
         // external control API (MCP): execute queued agent commands
         #[cfg(not(target_arch = "wasm32"))]

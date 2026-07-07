@@ -1,22 +1,28 @@
-//! Right-click context menu in the viewport.
+//! Right-click context menu in the viewport, as a pie / wheel menu
+//! (see pie.rs).
 //!
 //! Object mode: right-clicking an object selects it (unless it is already
-//! part of the selection) and opens a menu at the cursor — set the pivot or
-//! anchor to the exact clicked surface point, reset them, and the common
-//! object operations. Edit mode: right-clicking a vertex/edge/face selects
-//! that element and offers "set as pivot / anchor" (same as the P/A keys).
+//! part of the selection) and opens the wheel at the cursor — pivot/anchor
+//! at the exact clicked surface point plus the common object operations.
+//! On walls the west/northwest slots become "add door / window here" (their
+//! dimensions and materials are edited in the sidebar). Edit mode:
+//! right-clicking a vertex/edge/face offers "set as pivot / anchor" (same
+//! as the P/A keys).
 //!
 //! main.rs decides what was hit (physics ray in object mode, element pick in
-//! edit mode) and calls `open`; the menu itself is drawn from UiState::draw.
+//! edit mode) and calls `open`; the wheel is drawn from UiState::draw. Like
+//! the Shift+A wheel, clicks are consumed in `handle_events` (runs after the
+//! egui pass) and committed on the next `ui` call via `pending_click`.
 
 use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
+use crate::pie::{self, PieIcon, PieSlot};
 use crate::selection::Selection;
-use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::{ObjectId, Primitive, Scene, WallCutout};
 use three_d::egui;
+use three_d::{Event, Key, MouseButton};
 
 #[derive(Clone, Copy)]
 pub enum Target {
@@ -26,27 +32,77 @@ pub enum Target {
     Element { id: ObjectId, point: Vec3, label: &'static str },
 }
 
+/// What the westward slots offer: wall openings or group/attach actions.
+enum WheelKind {
+    Object { wall: Option<(f32, f32)> }, // (length, height) when a wall
+    Element,
+}
+
 pub struct ContextMenu {
     state: Option<(egui::Pos2, Target)>,
-    /// Guards `clicked_elsewhere` on the frame the menu opened.
+    /// Guards event handling on the frame the menu opened (the opening RMB
+    /// press is already in this frame's event list, marked handled).
     just_opened: bool,
+    /// LMB arrived in `handle_events`; commit on the next `ui` pass.
+    pending_click: bool,
+    /// 0 → 1 scale-in animation (owned here, rendered by pie::draw).
+    anim: f32,
 }
 
 impl ContextMenu {
     pub fn new() -> Self {
-        Self { state: None, just_opened: false }
+        Self {
+            state: None,
+            just_opened: false,
+            pending_click: false,
+            anim: 0.0,
+        }
     }
 
     pub fn open(&mut self, pos: egui::Pos2, target: Target) {
         self.state = Some((pos, target));
         self.just_opened = true;
+        self.pending_click = false;
+        self.anim = 0.0;
     }
 
     pub fn close(&mut self) {
         self.state = None;
+        self.pending_click = false;
     }
 
-    /// Draw the menu; returns a status-bar message when an action ran.
+    /// Consume clicks/Esc while the wheel is open so a commit click never
+    /// falls through to viewport picking. Runs after the egui pass and
+    /// after the RMB opener (see main.rs), hence the `just_opened` guard.
+    pub fn handle_events(&mut self, events: &mut [Event]) {
+        if self.state.is_none() || self.just_opened {
+            return;
+        }
+        for event in events.iter_mut() {
+            match event {
+                Event::KeyPress { kind: Key::Escape, handled, .. } if !*handled => {
+                    self.close();
+                    *handled = true;
+                }
+                Event::MousePress { button, handled, .. } => {
+                    if *handled {
+                        // egui took it (menu bar, sidebar…): just dismiss
+                        self.close();
+                    } else {
+                        *handled = true;
+                        if *button == MouseButton::Left {
+                            self.pending_click = true;
+                        } else {
+                            self.close(); // RMB / MMB cancels
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Draw the wheel; returns a status-bar message when an action ran.
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -54,285 +110,196 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
-        unit: Unit,
     ) -> Option<String> {
         let Some((pos, target)) = self.state else { return None };
         let mut status = None;
-        let mut close = false;
 
-        let area = egui::Area::new(egui::Id::new("viewport-context-menu"))
-            .fixed_pos(pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::menu(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(190.0);
-                    close = match target {
-                        Target::Object { id, hit_local } => object_menu(
-                            ui, scene, selection, modal, library_panel, id, hit_local, unit,
-                            &mut status,
-                        ),
-                        Target::Element { id, point, label } => {
-                            element_menu(ui, scene, id, point, label, &mut status)
-                        }
-                    };
-                });
-            });
+        // build the slot ring for the current target
+        let (kind, slots, hub) = match target {
+            Target::Object { id, .. } => {
+                let Some(object) = scene.object(id) else {
+                    self.close();
+                    return None;
+                };
+                let is_group = object.group;
+                let wall = match object.primitive {
+                    Primitive::Wall { length, height, .. }
+                        if object.edited_mesh.is_none() =>
+                    {
+                        Some((length, height))
+                    }
+                    _ => None,
+                };
+                let multi =
+                    selection.selected().len() >= 2 && selection.active().is_some();
+                let mut slots = vec![
+                    PieSlot::new("Duplicate", PieIcon::Duplicate), // N
+                    PieSlot::new("Pivot here", PieIcon::Glyph("⌖")), // NE
+                    PieSlot::new("Anchor here", PieIcon::Anchor),  // E
+                    PieSlot::new("Reset P/A", PieIcon::Glyph("↩")), // SE
+                    PieSlot::new("Delete", PieIcon::Glyph("✖")),   // S
+                    PieSlot::new("To Library…", PieIcon::Glyph("💾")), // SW
+                ];
+                if wall.is_some() {
+                    slots.push(PieSlot::new("Add door", PieIcon::Door)); // W
+                    slots.push(PieSlot::new("Add window", PieIcon::Window)); // NW
+                } else if is_group {
+                    slots.push(PieSlot::new("Ungroup", PieIcon::Ungroup)); // W
+                    slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
+                } else {
+                    slots.push(PieSlot::new("Group", PieIcon::Glyph("❐")).enabled(multi)); // W
+                    slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
+                }
+                (WheelKind::Object { wall }, slots, hub_label(&object.name))
+            }
+            Target::Element { label, .. } => {
+                let slots = vec![
+                    PieSlot::new("Pivot  (P)", PieIcon::Glyph("⌖")), // N
+                    PieSlot::new("Anchor  (A)", PieIcon::Anchor),    // S
+                ];
+                (WheelKind::Element, slots, label.to_string())
+            }
+        };
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            close = true;
-        }
-        if !self.just_opened && area.response.clicked_elsewhere() {
-            close = true;
-        }
-        self.just_opened = false;
-        if close {
+        let hovered = pie::draw(ctx, "context-pie", pos, &hub, &slots, &mut self.anim);
+
+        if self.pending_click {
+            self.pending_click = false;
+            if let Some(slot) = hovered {
+                status = self.execute(
+                    slot, kind, target, scene, selection, modal, library_panel,
+                );
+            }
             self.state = None;
         }
+        self.just_opened = false;
         status
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn object_menu(
-    ui: &mut egui::Ui,
-    scene: &mut Scene,
-    selection: &mut Selection,
-    modal: &mut ModalTransform,
-    library_panel: &mut LibraryPanel,
-    id: ObjectId,
-    hit_local: Vec3,
-    unit: Unit,
-    status: &mut Option<String>,
-) -> bool {
-    let Some(object) = scene.object(id) else { return true };
-    let name = object.name.clone();
-    let is_group = object.group;
-    let wall = match object.primitive {
-        Primitive::Wall { .. } if object.edited_mesh.is_none() => Some(object.primitive),
-        _ => None,
-    };
-    ui.label(
-        egui::RichText::new(if is_group { format!("❐ {name} (group)") } else { name.clone() })
-            .weak()
-            .size(11.0),
-    );
-    let mut close = false;
-
-    if is_group {
-        if ui
-            .button("Ungroup")
-            .on_hover_text(
-                "Break the group into its parts: clicks select parts \
-                 individually again (the parent hierarchy is kept)",
-            )
-            .clicked()
-        {
-            if let Some(object) = scene.object_mut(id) {
-                object.group = false;
-            }
-            *status = Some(format!("ungrouped '{name}' — parts are now selectable"));
-            close = true;
-        }
-        ui.separator();
-    }
-
-    // wall section: dimensions, material and openings at the clicked point
-    if let Some(Primitive::Wall { length, height, thickness }) = wall {
-        ui.label(egui::RichText::new("Wall").weak().size(11.0));
-
-        for (label, value, min, max, speed) in [
-            ("Height", height, 0.1f32, 20.0f32, 0.02f64),
-            ("Thickness", thickness, 0.01, 2.0, 0.005),
-        ] {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                let mut shown = unit.from_meters(value);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut shown)
-                            .speed(speed * unit.per_meter() as f64)
-                            .range(unit.from_meters(min)..=unit.from_meters(max))
-                            .suffix(format!(" {}", unit.suffix())),
-                    )
-                    .changed()
-                {
-                    let value = unit.to_meters(shown).clamp(min, max);
-                    if let Some(object) = scene.object_mut(id) {
-                        object.primitive = match label {
-                            "Height" => Primitive::Wall { length, height: value, thickness },
-                            _ => Primitive::Wall { length, height, thickness: value },
-                        };
+    #[allow(clippy::too_many_arguments)]
+    fn execute(
+        &mut self,
+        slot: usize,
+        kind: WheelKind,
+        target: Target,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        modal: &mut ModalTransform,
+        library_panel: &mut LibraryPanel,
+    ) -> Option<String> {
+        match (kind, target) {
+            (WheelKind::Object { wall }, Target::Object { id, hit_local }) => {
+                let name = scene.object(id).map(|o| o.name.clone()).unwrap_or_default();
+                match slot {
+                    0 => {
+                        if modal::duplicate_selection(scene, selection) {
+                            modal.begin_grab(scene, selection);
+                        }
+                        None
                     }
-                }
-            });
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Material");
-            let mut color = scene.object(id).map(|o| o.material.base_color).unwrap_or_default();
-            if ui.color_edit_button_rgb(&mut color).changed() {
-                if let Some(object) = scene.object_mut(id) {
-                    object.material.base_color = color;
-                }
-            }
-        });
-
-        if ui
-            .button("Add door here")
-            .on_hover_text("Cut a 0.9 × 2.1 m door opening centered on the clicked point")
-            .clicked()
-        {
-            if let Some(object) = scene.object_mut(id) {
-                object.cutouts.push(WallCutout::door(hit_local.x, length, height));
-                object.mesh_revision += 1;
-            }
-            *status = Some(format!("door added to '{name}'"));
-            close = true;
-        }
-        if ui
-            .button("Add window here")
-            .on_hover_text("Cut a 1.2 × 1.2 m window opening centered on the clicked point")
-            .clicked()
-        {
-            if let Some(object) = scene.object_mut(id) {
-                object
-                    .cutouts
-                    .push(WallCutout::window(hit_local.x, hit_local.z, length, height));
-                object.mesh_revision += 1;
-            }
-            *status = Some(format!("window added to '{name}'"));
-            close = true;
-        }
-        let cutout_count = scene.object(id).map(|o| o.cutouts.len()).unwrap_or(0);
-        if cutout_count > 0 {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{cutout_count} opening{} — edit in the sidebar (N)",
-                    if cutout_count == 1 { "" } else { "s" }
-                ))
-                .weak()
-                .size(11.0),
-            );
-        }
-        ui.separator();
-    }
-
-    if ui
-        .button("Set pivot to this point")
-        .on_hover_text("The clicked surface point becomes the rotation pivot (R)")
-        .clicked()
-    {
-        if let Some(object) = scene.object_mut(id) {
-            object.pivot = hit_local;
-        }
-        *status = Some(format!("pivot of '{name}' set"));
-        close = true;
-    }
-    if ui
-        .button("Set anchor to this point")
-        .on_hover_text("The clicked surface point becomes the attachment anchor")
-        .clicked()
-    {
-        if let Some(object) = scene.object_mut(id) {
-            object.anchor = hit_local;
-        }
-        *status = Some(format!("anchor of '{name}' set"));
-        close = true;
-    }
-    if ui.button("Reset pivot / anchor to origin").clicked() {
-        if let Some(object) = scene.object_mut(id) {
-            object.pivot = Vec3::ZERO;
-            object.anchor = Vec3::ZERO;
-        }
-        *status = Some(format!("pivot and anchor of '{name}' reset"));
-        close = true;
-    }
-    ui.separator();
-
-    if ui.button("Duplicate  (Shift+D)").clicked() {
-        if modal::duplicate_selection(scene, selection) {
-            modal.begin_grab(scene, selection);
-        }
-        close = true;
-    }
-    if ui.button("Delete  (X)").clicked() {
-        object_ops::delete_selected(scene, selection);
-        close = true;
-    }
-    ui.separator();
-
-    let can_attach = selection.selected().len() >= 2 && selection.active().is_some();
-    if ui
-        .add_enabled(can_attach, egui::Button::new("Attach to Active"))
-        .on_hover_text(
-            "Move each selected object so its anchor lands on the active \
-             object's anchor, then parent it there",
-        )
-        .clicked()
-    {
-        if let Some(active) = selection.active() {
-            for id in selection.selected().to_vec() {
-                if id != active {
-                    scene.attach(id, active, None);
+                    1 => {
+                        if let Some(object) = scene.object_mut(id) {
+                            object.pivot = hit_local;
+                        }
+                        Some(format!("pivot of '{name}' set"))
+                    }
+                    2 => {
+                        if let Some(object) = scene.object_mut(id) {
+                            object.anchor = hit_local;
+                        }
+                        Some(format!("anchor of '{name}' set"))
+                    }
+                    3 => {
+                        if let Some(object) = scene.object_mut(id) {
+                            object.pivot = Vec3::ZERO;
+                            object.anchor = Vec3::ZERO;
+                        }
+                        Some(format!("pivot and anchor of '{name}' reset"))
+                    }
+                    4 => {
+                        object_ops::delete_selected(scene, selection);
+                        None
+                    }
+                    5 => {
+                        library_panel.open_create_dialog(scene, selection);
+                        None
+                    }
+                    6 | 7 => match wall {
+                        // wall wheel: cut an opening at the clicked point
+                        Some((length, height)) => {
+                            let (cutout, what) = if slot == 6 {
+                                (WallCutout::door(hit_local.x, length, height), "door")
+                            } else {
+                                (
+                                    WallCutout::window(
+                                        hit_local.x,
+                                        hit_local.z,
+                                        length,
+                                        height,
+                                    ),
+                                    "window",
+                                )
+                            };
+                            if let Some(object) = scene.object_mut(id) {
+                                object.cutouts.push(cutout);
+                                object.mesh_revision += 1;
+                            }
+                            Some(format!("{what} added to '{name}'"))
+                        }
+                        // object wheel: group/ungroup (W) or attach (NW)
+                        None if slot == 6 => {
+                            let is_group =
+                                scene.object(id).is_some_and(|o| o.group);
+                            if is_group {
+                                if let Some(object) = scene.object_mut(id) {
+                                    object.group = false;
+                                }
+                                Some(format!(
+                                    "ungrouped '{name}' — parts are now selectable"
+                                ))
+                            } else {
+                                crate::ui::group_selection(scene, selection);
+                                Some("grouped the selection".to_string())
+                            }
+                        }
+                        None => {
+                            if let Some(active) = selection.active() {
+                                for id in selection.selected().to_vec() {
+                                    if id != active {
+                                        scene.attach(id, active, None);
+                                    }
+                                }
+                            }
+                            None
+                        }
+                    },
+                    _ => None,
                 }
             }
+            (WheelKind::Element, Target::Element { id, point, label }) => {
+                let what = label.to_lowercase();
+                if slot == 0 {
+                    if let Some(object) = scene.object_mut(id) {
+                        object.pivot = point;
+                    }
+                    Some(format!("pivot set to the selected {what}"))
+                } else {
+                    if let Some(object) = scene.object_mut(id) {
+                        object.anchor = point;
+                    }
+                    Some(format!("anchor set to the selected {what}"))
+                }
+            }
+            _ => None,
         }
-        close = true;
     }
-    if !is_group {
-        let can_group = selection.selected().len() >= 2 && selection.active().is_some();
-        if ui
-            .add_enabled(can_group, egui::Button::new("Group Selection"))
-            .on_hover_text(
-                "Parent the selected objects to the active one and make it a \
-                 group: clicks then select the assembly as one unit",
-            )
-            .clicked()
-        {
-            crate::ui::group_selection(scene, selection);
-            *status = Some("grouped the selection".to_string());
-            close = true;
-        }
-    }
-    if ui.button("Save Selection to Library…").clicked() {
-        library_panel.open_create_dialog(scene, selection);
-        close = true;
-    }
-    close
 }
 
-fn element_menu(
-    ui: &mut egui::Ui,
-    scene: &mut Scene,
-    id: ObjectId,
-    point: Vec3,
-    label: &str,
-    status: &mut Option<String>,
-) -> bool {
-    ui.label(egui::RichText::new(label).weak().size(11.0));
-    let mut close = false;
-
-    if ui
-        .button("Set as pivot point  (P)")
-        .on_hover_text("Rotations (R) spin the object around this point")
-        .clicked()
-    {
-        if let Some(object) = scene.object_mut(id) {
-            object.pivot = point;
-        }
-        *status = Some(format!("pivot set to the selected {}", label.to_lowercase()));
-        close = true;
+/// Object name shortened to fit the wheel hub.
+fn hub_label(name: &str) -> String {
+    if name.chars().count() > 9 {
+        format!("{}…", name.chars().take(8).collect::<String>())
+    } else {
+        name.to_string()
     }
-    if ui
-        .button("Set as anchor point  (A)")
-        .on_hover_text("The object attaches to other objects by this point")
-        .clicked()
-    {
-        if let Some(object) = scene.object_mut(id) {
-            object.anchor = point;
-        }
-        *status = Some(format!("anchor set to the selected {}", label.to_lowercase()));
-        close = true;
-    }
-    close
 }

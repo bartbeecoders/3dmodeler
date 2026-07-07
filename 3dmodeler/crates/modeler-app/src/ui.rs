@@ -206,7 +206,6 @@ impl UiState {
             selection,
             modal,
             &mut self.library_panel,
-            settings.unit,
         ) {
             self.status_message = Some(message);
         }
