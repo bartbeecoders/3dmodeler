@@ -336,6 +336,39 @@ impl PhysicsMirror {
         }
     }
 
+    /// Physics-mode poke: cast the ray and kick the closest DYNAMIC body,
+    /// changing its velocity at the hit point by `speed` m/s along the ray
+    /// (mass-relative, so light and heavy objects react alike). Returns the
+    /// kicked object.
+    pub fn poke(&mut self, origin: Vec3, direction: Vec3, speed: f32) -> Option<ObjectId> {
+        if self.sim != SimState::Playing {
+            return None;
+        }
+        unsafe {
+            let result = ffi::b3World_CastRayClosest(
+                self.world,
+                bvec(origin),
+                bvec(direction * 10_000.0),
+                ffi::b3DefaultQueryFilter(),
+            );
+            if !result.hit {
+                return None;
+            }
+            let user_data = ffi::b3Shape_GetUserData(result.shapeId) as usize as u64;
+            if user_data == 0 {
+                return None; // ground plane
+            }
+            let body = ffi::b3Shape_GetBody(result.shapeId);
+            if ffi::b3Body_GetType(body) != ffi::b3BodyType_b3_dynamicBody {
+                return None;
+            }
+            let mass = ffi::b3Body_GetMass(body).max(1e-6);
+            let dir = direction.normalize_or_zero();
+            ffi::b3Body_ApplyLinearImpulse(body, bvec(dir * (mass * speed)), result.point, true);
+            Some(ObjectId(user_data))
+        }
+    }
+
     /// AABB-based overlap test for the given objects (coarse warning while
     /// placing). Returns the subset that overlaps something else.
     pub fn overlapping(&self, ids: &[ObjectId]) -> HashSet<ObjectId> {
@@ -545,6 +578,37 @@ mod tests {
         }
         let z = scene.object(id).unwrap().transform.location.z;
         assert!((z - 3.0).abs() < 1e-5, "static object moved to {z}");
+    }
+
+    #[test]
+    fn poke_kicks_dynamic_bodies_only() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        let mut t = Transform::default();
+        t.location.z = 5.0;
+        let cube = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        scene.object_mut(cube).unwrap().dynamic = true;
+        let mut wall_t = Transform::default();
+        wall_t.location.x = 10.0;
+        let wall = scene.add_object(Primitive::Cube { size: 2.0 }, wall_t); // static
+        let mut physics = PhysicsMirror::new();
+
+        // no kick while stopped
+        assert_eq!(physics.poke(Vec3::new(-10.0, 0.0, 5.0), Vec3::X, 10.0), None);
+
+        physics.play(&scene);
+        // kick the dynamic cube along +X, at its center height
+        let hit = physics.poke(Vec3::new(-10.0, 0.0, 5.0), Vec3::X, 10.0);
+        assert_eq!(hit, Some(cube));
+        // static objects are never kicked
+        assert_eq!(physics.poke(Vec3::new(10.0, -10.0, 1.0), Vec3::Y, 10.0), None);
+
+        for _ in 0..12 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+        let x = scene.object(cube).unwrap().transform.location.x;
+        assert!(x > 0.5, "kicked cube must fly along +X, got x={x}");
+        physics.stop(&mut scene);
     }
 
     #[test]

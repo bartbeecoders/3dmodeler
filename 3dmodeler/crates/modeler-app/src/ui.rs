@@ -773,7 +773,11 @@ impl UiState {
                     }
                 } else {
                     match physics.sim_state() {
-                    SimState::Playing => "SIMULATING · Space pause · Esc stop".to_string(),
+                    SimState::Playing => {
+                        "SIMULATING · hold LMB to charge a poke, release to kick · \
+                         Space pause · Esc stop"
+                            .to_string()
+                    }
                     SimState::Paused => "PAUSED · Space resume · Esc stop".to_string(),
                     SimState::Stopped => match modal_status {
                         Some(status) => format!("{status}   |   LMB/Enter confirm · RMB/Esc cancel"),
@@ -1382,6 +1386,7 @@ impl UiState {
                         ("P / A (edit)", "Selected element becomes pivot / anchor"),
                         ("N", "Toggle sidebar"),
                         ("Space", "Play / pause physics"),
+                        ("LMB hold (simulating)", "Charge a poke; release kicks the object under the cursor"),
                         ("Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y", "Undo / redo"),
                         ("Ctrl+S / Ctrl+O / Ctrl+N", "Save / Open / New scene"),
                         ("Ctrl+P / Alt+P", "Parent to active / clear parent"),

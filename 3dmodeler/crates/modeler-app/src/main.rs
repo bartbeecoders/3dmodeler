@@ -20,6 +20,7 @@ mod io;
 mod overlay;
 mod physics;
 mod pie;
+mod poke;
 mod preview;
 mod ref_image;
 mod scene_render;
@@ -97,6 +98,7 @@ pub fn main() {
     let mut modal = modal::ModalTransform::new();
     let mut delete_tool = object_ops::DeleteTool::new();
     let mut cutout_handles = cutout_handles::CutoutHandles::new();
+    let mut poke_tool = poke::PokeTool::new();
     let mut ui_state = ui::UiState::new();
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
@@ -265,6 +267,7 @@ pub fn main() {
                     layout.top_offset,
                 );
                 axis_widget::view_label(gui_context, &camera, 0.0, layout.top_offset);
+                poke_tool.draw(gui_context);
 
                 // Blender-style operator status while transforming
                 if let Some(status) = &modal_status {
@@ -674,6 +677,19 @@ pub fn main() {
         // context wheel (also available in edit mode): consume clicks/Esc so
         // a commit click never falls through to the picking below
         ui_state.context_menu.handle_events(&mut frame_input.events);
+
+        // physics mode: hold LMB to charge, release to kick the object under
+        // the cursor (consumes the click so it never changes the selection)
+        if let Some(message) = poke_tool.handle_events(
+            &mut frame_input.events,
+            &mut physics,
+            &camera,
+            frame_input.viewport,
+            pointer_over_ui,
+        ) {
+            ui_state.status_message = Some(message);
+        }
+        poke_tool.update(frame_input.elapsed_time as f32 / 1000.0, &physics);
 
         // wall opening handles: grab/drag doors & windows of selected walls
         if !modal.active() && physics.is_stopped() && !edit_mode.active() && !wall_tool.active() {
