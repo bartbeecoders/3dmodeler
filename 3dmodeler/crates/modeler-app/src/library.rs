@@ -137,7 +137,7 @@ impl LibraryPanel {
         library: &mut Library,
     ) -> Option<String> {
         let mut status = None;
-        ui.strong("Library");
+        crate::theme::section_header(ui, "Library");
         if library.assets().is_empty() {
             ui.weak("Empty — select objects and use\nObject ▸ Save Selection to Library…");
             return None;

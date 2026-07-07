@@ -17,6 +17,7 @@ use crate::ref_image::{self, CalibrateTool};
 use crate::scene_render::ShadeMode;
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
+use crate::theme::{self, Theme};
 use modeler_core::ImagePlane;
 use modeler_core::glam::{EulerRot, Quat, Vec3};
 use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
@@ -46,6 +47,7 @@ pub struct UiState {
     settings_window: SettingsWindow,
     pub library_panel: LibraryPanel,
     pub context_menu: ContextMenu,
+    applied_theme: Option<Theme>,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
     #[cfg(target_arch = "wasm32")]
@@ -83,6 +85,7 @@ impl UiState {
             settings_window: SettingsWindow::new(),
             library_panel: LibraryPanel::new(),
             context_menu: ContextMenu::new(),
+            applied_theme: None,
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
             #[cfg(target_arch = "wasm32")]
@@ -133,6 +136,11 @@ impl UiState {
         fps: f32,
         mcp: Option<Option<McpStatus>>,
     ) -> UiLayout {
+        // restyle egui when the theme changed (and on the first frame)
+        if self.applied_theme != Some(settings.theme) {
+            settings.theme.apply(ctx);
+            self.applied_theme = Some(settings.theme);
+        }
         // finished reference-image picks arrive here
         if let Some((name, bytes)) = ref_image::poll_image() {
             match ref_image::make_reference(name, &bytes) {
@@ -234,15 +242,26 @@ impl UiState {
         #[allow(deprecated)]
         let response = egui::Panel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for (menu, label) in [
+                let items = [
                     (Menu::File, "File"),
                     (Menu::Edit, "Edit"),
                     (Menu::Add, "Add"),
                     (Menu::Object, "Object"),
                     (Menu::View, "View"),
                     (Menu::Help, "Help"),
-                ] {
-                    let button = ui.selectable_label(self.open_menu == Some(menu), label);
+                ];
+                // spread the items so together they fill the whole bar
+                let spacing = ui.spacing().item_spacing.x;
+                let item_width = ((ui.available_width()
+                    - spacing * (items.len() as f32 - 1.0))
+                    / items.len() as f32)
+                    .max(40.0);
+                let item_height = ui.spacing().interact_size.y;
+                for (menu, label) in items {
+                    let button = ui.add_sized(
+                        [item_width, item_height],
+                        egui::SelectableLabel::new(self.open_menu == Some(menu), label),
+                    );
                     if button.clicked() {
                         self.open_menu = if self.open_menu == Some(menu) {
                             None
@@ -271,30 +290,40 @@ impl UiState {
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     egui::Frame::menu(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(160.0);
-                        close = match menu {
-                            Menu::File => self.file_menu(ui, scene, selection, undo, settings),
-                            Menu::Edit => {
-                                edit_menu(ui, scene, undo, &mut self.settings_window)
-                            }
-                            Menu::Add => add_menu_items(ui, scene, measure, wall_tool, settings),
-                            Menu::Object => object_menu(
-                                ui, scene, selection, modal, physics,
-                                &mut self.library_panel,
-                            ),
-                            Menu::View => view_menu(
-                                ui, camera, scene, selection, settings, snap_to_grid,
-                                shade_mode, xray,
-                            ),
-                            Menu::Help => {
-                                let mut close = false;
-                                if ui.button("Keymap").clicked() {
-                                    self.show_keymap = !self.show_keymap;
-                                    close = true;
+                        ui.set_min_width(180.0);
+                        // full-width entries: the hover highlight and click
+                        // area span the whole menu, not just the label text
+                        let justified =
+                            egui::Layout::top_down_justified(egui::Align::Min);
+                        ui.with_layout(justified, |ui| {
+                            close = match menu {
+                                Menu::File => {
+                                    self.file_menu(ui, scene, selection, undo, settings)
                                 }
-                                close
-                            }
-                        };
+                                Menu::Edit => {
+                                    edit_menu(ui, scene, undo, &mut self.settings_window)
+                                }
+                                Menu::Add => {
+                                    add_menu_items(ui, scene, measure, wall_tool, settings)
+                                }
+                                Menu::Object => object_menu(
+                                    ui, scene, selection, modal, physics,
+                                    &mut self.library_panel,
+                                ),
+                                Menu::View => view_menu(
+                                    ui, camera, scene, selection, settings, snap_to_grid,
+                                    shade_mode, xray,
+                                ),
+                                Menu::Help => {
+                                    let mut close = false;
+                                    if ui.button("Keymap").clicked() {
+                                        self.show_keymap = !self.show_keymap;
+                                        close = true;
+                                    }
+                                    close
+                                }
+                            };
+                        });
                     });
                 });
             // close when clicking anywhere outside the dropdown (egui's own
@@ -744,7 +773,7 @@ impl UiState {
                     ui.label(
                         egui::RichText::new(message)
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(140, 200, 255)),
+                            .color(theme::accent(ui)),
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -767,13 +796,14 @@ impl UiState {
 
                     // MCP control API indicator (native builds)
                     if let Some(mcp) = mcp {
+                        let palette = settings.theme.palette();
                         ui.separator();
                         match mcp {
                             None => {
                                 ui.label(
                                     egui::RichText::new("● MCP off")
                                         .size(12.0)
-                                        .color(egui::Color32::from_rgb(200, 90, 80)),
+                                        .color(palette.err),
                                 )
                                 .on_hover_text(
                                     "Control port already in use — agents cannot connect                                      to this instance",
@@ -783,13 +813,10 @@ impl UiState {
                                 let active =
                                     status.seconds_since_last.is_some_and(|s| s < 3.0);
                                 let (color, text) = if active {
-                                    (
-                                        egui::Color32::from_rgb(90, 220, 110),
-                                        "● MCP active".to_string(),
-                                    )
+                                    (palette.ok, "● MCP active".to_string())
                                 } else {
                                     (
-                                        egui::Color32::from_rgb(110, 150, 115),
+                                        palette.ok.gamma_multiply(0.55),
                                         format!("● MCP :{}", status.port),
                                     )
                                 };
@@ -837,7 +864,7 @@ impl UiState {
         let response = egui::Panel::right("sidebar")
             .default_size(250.0)
             .show(ctx, |ui| {
-                ui.strong("Outliner");
+                theme::section_header(ui, "Outliner");
                 self.outliner(ui, scene, selection);
                 ui.separator();
                 if let Some(message) = self.library_panel.section(ui, library) {
@@ -845,12 +872,12 @@ impl UiState {
                 }
                 ui.separator();
                 if !scene.reference_images().is_empty() {
-                    ui.strong("Reference Images");
+                    theme::section_header(ui, "Reference Images");
                     reference_image_rows(ui, scene, settings, calibrate);
                     ui.separator();
                 }
                 if !scene.measurements().is_empty() {
-                    ui.strong("Measurements");
+                    theme::section_header(ui, "Measurements");
                     let mut remove: Option<usize> = None;
                     for (i, m) in scene.measurements().iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -970,7 +997,7 @@ impl UiState {
                             egui::Align2::LEFT_CENTER,
                             &object.name,
                             egui::FontId::proportional(13.0),
-                            egui::Color32::from_rgb(255, 170, 64),
+                            theme::accent(ui),
                         );
                     }
                 }
@@ -987,7 +1014,7 @@ impl UiState {
                         ui.painter().rect_stroke(
                             row.rect.expand(2.0),
                             3.0,
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 170, 64)),
+                            egui::Stroke::new(1.5, theme::accent(ui)),
                             egui::StrokeKind::Outside,
                         );
                     }
@@ -1001,7 +1028,7 @@ impl UiState {
             egui::DragAndDrop::has_payload_of_type::<ObjectId>(ui.ctx());
         if any_parented || drag_active {
             let frame = egui::Frame::default()
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                .stroke(egui::Stroke::new(1.0, ui.visuals().window_stroke.color))
                 .inner_margin(4.0)
                 .corner_radius(3.0);
             let (_, dropped) = ui.dnd_drop_zone::<ObjectId, ()>(frame, |ui| {

@@ -6,6 +6,7 @@
 //! recent-files list, web in localStorage. `#[serde(default)]` keeps old
 //! settings files loadable when new fields are added.
 
+use crate::theme::{self, Theme};
 use serde::{Deserialize, Serialize};
 use three_d::egui;
 
@@ -78,6 +79,8 @@ impl Unit {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// UI color theme (panels, accents and the viewport background).
+    pub theme: Theme,
     /// Grid line spacing in meters (world units).
     pub grid_spacing: f32,
     pub grid_minor_color: [u8; 3],
@@ -93,6 +96,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: Theme::default(),
             grid_spacing: 1.0,
             grid_minor_color: [58, 61, 66],
             grid_major_color: [76, 80, 87],
@@ -199,6 +203,7 @@ fn poll_pick_dir() -> Option<String> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Theme,
     Viewport,
     Tools,
     Units,
@@ -206,10 +211,11 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Viewport, Tab::Tools, Tab::Units, Tab::Files];
+    const ALL: [Tab; 5] = [Tab::Theme, Tab::Viewport, Tab::Tools, Tab::Units, Tab::Files];
 
     fn label(self) -> &'static str {
         match self {
+            Tab::Theme => "Theme",
             Tab::Viewport => "Viewport",
             Tab::Tools => "Tools",
             Tab::Units => "Units",
@@ -227,7 +233,7 @@ impl SettingsWindow {
     pub fn new() -> Self {
         Self {
             open: false,
-            tab: Tab::Viewport,
+            tab: Tab::Theme,
         }
     }
 
@@ -268,6 +274,7 @@ impl SettingsWindow {
                     ui.vertical(|ui| {
                         ui.set_min_height(400.0);
                         egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+                            Tab::Theme => theme_tab(ui, settings),
                             Tab::Viewport => viewport_tab(ui, settings),
                             Tab::Tools => tools_tab(ui, settings),
                             Tab::Units => units_tab(ui, settings),
@@ -278,6 +285,29 @@ impl SettingsWindow {
             });
         self.open = open;
     }
+}
+
+fn theme_tab(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.heading("Color theme");
+    ui.add_space(6.0);
+
+    for t in Theme::ALL {
+        let palette = t.palette();
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut settings.theme, t, t.label());
+            ui.add_space(4.0);
+            // panel / accent / viewport preview
+            theme::swatch(ui, palette.panel);
+            theme::swatch(ui, palette.accent);
+            theme::swatch(ui, palette.viewport_color32());
+            ui.weak(t.description());
+        });
+        ui.add_space(2.0);
+    }
+
+    ui.add_space(10.0);
+    ui.weak("Applied immediately and saved with the other preferences.");
+    ui.weak("Swatches: panel · accent · viewport background.");
 }
 
 fn viewport_tab(ui: &mut egui::Ui, settings: &mut Settings) {
@@ -416,7 +446,7 @@ fn files_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         match settings.save_dir() {
             Some(path) if !path.is_dir() => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(230, 160, 80),
+                    ui.visuals().warn_fg_color,
                     "⚠ this folder does not exist — dialogs will fall back to the last used location",
                 );
             }

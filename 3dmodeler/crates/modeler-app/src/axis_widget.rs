@@ -123,10 +123,12 @@ pub fn view_label(ctx: &egui::Context, camera: &BlenderCamera, left_offset: f32,
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(ctx, |ui| {
+            // theme-aware so it stays readable on light viewport backgrounds
+            let color = ui.visuals().text_color().gamma_multiply(0.8);
             ui.label(
                 egui::RichText::new(camera.view_name())
                     .size(13.0)
-                    .color(egui::Color32::from_rgba_unmultiplied(220, 220, 225, 180)),
+                    .color(color),
             );
         });
 }

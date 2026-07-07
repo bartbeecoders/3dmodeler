@@ -23,6 +23,7 @@ mod ref_image;
 mod scene_render;
 mod selection;
 mod settings;
+mod theme;
 mod ui;
 mod undo;
 mod wall_tool;
@@ -257,10 +258,9 @@ pub fn main() {
                         .order(egui::Order::Foreground)
                         .interactable(false)
                         .show(gui_context, |ui| {
+                            let color = ui.visuals().warn_fg_color;
                             ui.label(
-                                egui::RichText::new(status)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(255, 200, 120)),
+                                egui::RichText::new(status).size(13.0).color(color),
                             );
                         });
                 }
@@ -793,9 +793,10 @@ pub fn main() {
         // reference images last: they blend over the grid and the meshes
         render_objects.extend(ref_render.models().map(|m| m as &dyn Object));
 
+        let bg = settings.theme.viewport_clear();
         frame_input
             .screen()
-            .clear(ClearState::color_and_depth(0.12, 0.13, 0.16, 1.0, 1.0))
+            .clear(ClearState::color_and_depth(bg[0], bg[1], bg[2], 1.0, 1.0))
             .render(&cam, render_objects, &[&ambient, &key, &fill])
             .write(|| gui.render())
             .unwrap();
