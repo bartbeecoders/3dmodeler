@@ -28,6 +28,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # winit/glutin need the Wayland + X11 dev libraries at build time.
+      - name: Install windowing dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
       - name: Build box3d (C library)
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBOX3D_SAMPLES=OFF -DBOX3D_UNIT_TESTS=OFF -DBOX3D_BENCHMARKS=OFF
