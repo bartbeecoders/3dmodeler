@@ -259,13 +259,14 @@ fn tool_definitions() -> Value {
                     "rotation_deg": {"type": "number", "description": "In-plane rotation in degrees"},
                     "width_m": {"type": "number", "description": "World width in meters (default 2; height follows the aspect ratio)"},
                     "opacity": {"type": "number", "description": "0..1, default 0.5"},
-                    "visible": {"type": "boolean"}
+                    "visible": {"type": "boolean"},
+                    "flip_h": {"type": "boolean", "description": "Mirror horizontally — needed for back/left elevations so they read correctly from their viewing direction"}
                 }
             }
         },
         {
             "name": "update_reference_image",
-            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility or name. Reference it by name or id (see get_scene).",
+            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility, horizontal mirroring (flip_h) or name. Reference it by name or id (see get_scene).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -276,7 +277,8 @@ fn tool_definitions() -> Value {
                     "rotation_deg": {"type": "number"},
                     "width_m": {"type": "number"},
                     "opacity": {"type": "number"},
-                    "visible": {"type": "boolean"}
+                    "visible": {"type": "boolean"},
+                    "flip_h": {"type": "boolean"}
                 },
                 "required": ["image"]
             }

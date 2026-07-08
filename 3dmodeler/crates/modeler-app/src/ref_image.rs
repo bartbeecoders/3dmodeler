@@ -89,6 +89,89 @@ pub fn request_image() {
     onchange.forget();
 }
 
+/// Files picked for the smart reference setup dialog (multi-select) — kept
+/// separate from `PENDING_IMAGE` so they land in the dialog's tray instead
+/// of being added straight to the scene.
+static PENDING_SETUP: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+
+pub fn poll_setup_images() -> Vec<(String, Vec<u8>)> {
+    PENDING_SETUP
+        .lock()
+        .map(|mut p| std::mem::take(&mut *p))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_setup_images() {
+    std::thread::spawn(|| {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg"])
+            .pick_files()
+        else {
+            return;
+        };
+        for path in paths {
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Image".into());
+            if let Ok(mut pending) = PENDING_SETUP.lock() {
+                pending.push((name, bytes));
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn request_setup_images() {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+    let Ok(el) = document.create_element("input") else { return };
+    let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() else { return };
+    input.set_type("file");
+    input.set_accept("image/png,image/jpeg");
+    input.set_multiple(true);
+    if let Some(html_el) = input.dyn_ref::<web_sys::HtmlElement>() {
+        let _ = html_el.style().set_property("display", "none");
+    }
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&input);
+    }
+
+    let input_for_closure = input.clone();
+    let onchange = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e: web_sys::Event| {
+        let Some(files) = input_for_closure.files() else { return };
+        for i in 0..files.length() {
+            let Some(file) = files.get(i) else { continue };
+            let name = file
+                .name()
+                .rsplit_once('.')
+                .map(|(stem, _)| stem.to_string())
+                .unwrap_or_else(|| file.name());
+            let Ok(reader) = web_sys::FileReader::new() else { continue };
+            let reader_for_load = reader.clone();
+            let onload = Closure::once(move || {
+                let Ok(result) = reader_for_load.result() else { return };
+                let array = js_sys::Uint8Array::new(&result);
+                let bytes = array.to_vec();
+                if let Ok(mut pending) = PENDING_SETUP.lock() {
+                    pending.push((name, bytes));
+                }
+            });
+            reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+            onload.forget();
+            let _ = reader.read_as_array_buffer(&file);
+        }
+        input_for_closure.remove();
+    });
+    input.set_onchange(Some(onchange.as_ref().unchecked_ref()));
+    input.click();
+    onchange.forget();
+}
+
 /// Build a `ReferenceImage` from raw file bytes: validates/decodes the image
 /// for its aspect ratio and places it upright on the front (Y) plane.
 pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, String> {
@@ -107,6 +190,7 @@ pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, Stri
         aspect,
         opacity: 0.5,
         visible: true,
+        flip_h: false,
         data_base64: BASE64.encode(bytes),
     })
 }
@@ -519,6 +603,7 @@ mod tests {
             aspect: 1.0,
             opacity: 0.5,
             visible: true,
+            flip_h: false,
             data_base64: String::new(),
         }
     }

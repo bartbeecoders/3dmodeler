@@ -14,6 +14,7 @@ use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
 use crate::ref_image::{self, CalibrateTool};
+use crate::ref_setup::RefSetupDialog;
 use crate::scene_render::{LightingMode, ShadeMode};
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
@@ -82,6 +83,7 @@ pub struct UiState {
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
     settings_window: SettingsWindow,
+    ref_setup: RefSetupDialog,
     pub library_panel: LibraryPanel,
     pub context_menu: ContextMenu,
     applied_theme: Option<Theme>,
@@ -127,6 +129,7 @@ impl UiState {
             status_message: None,
             current_file: None,
             settings_window: SettingsWindow::new(),
+            ref_setup: RefSetupDialog::new(),
             library_panel: LibraryPanel::new(),
             context_menu: ContextMenu::new(),
             applied_theme: None,
@@ -243,6 +246,9 @@ impl UiState {
         self.save_as_window(ctx, scene, settings);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
+        if let Some(message) = self.ref_setup.window(ctx, scene, settings) {
+            self.status_message = Some(message);
+        }
         if let Some(message) = self.library_panel.dialog_window(ctx, scene, selection, library) {
             self.status_message = Some(message);
         }
@@ -340,7 +346,7 @@ impl UiState {
                                 }
                                 Menu::Add => add_menu_items(
                                     ui, scene, selection, measure, wall_tool, settings,
-                                    &mut self.status_message,
+                                    &mut self.ref_setup, &mut self.status_message,
                                 ),
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
@@ -1612,6 +1618,7 @@ fn edit_menu(
     close
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_menu_items(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -1619,6 +1626,7 @@ fn add_menu_items(
     measure: &mut MeasureTool,
     wall_tool: &mut crate::wall_tool::WallTool,
     settings: &Settings,
+    ref_setup: &mut RefSetupDialog,
     status: &mut Option<String>,
 ) -> bool {
     if let Some(primitive) = crate::add_menu::mesh_menu_buttons(ui) {
@@ -1669,6 +1677,18 @@ fn add_menu_items(
         .clicked()
     {
         ref_image::request_image();
+        return true;
+    }
+    if ui
+        .button("Reference Setup…")
+        .on_hover_text(
+            "Load a whole drawing set at once and drag each picture onto the \
+             view it shows (front, side, floor plan…) — all images are placed \
+             around the origin, oriented and scaled consistently",
+        )
+        .clicked()
+    {
+        ref_setup.open();
         return true;
     }
     ui.separator();
@@ -2133,6 +2153,14 @@ fn reference_image_rows(
                         .add(egui::Slider::new(&mut edited.opacity, 0.0..=1.0))
                         .changed();
                 });
+
+                changed |= ui
+                    .checkbox(&mut edited.flip_h, "Mirror horizontally")
+                    .on_hover_text(
+                        "Back/left elevations are drawn as seen from behind/left — \
+                         mirror them so they read correctly from that side",
+                    )
+                    .changed();
 
                 let calibrating = calibrate.target == Some(id);
                 if calibrating {

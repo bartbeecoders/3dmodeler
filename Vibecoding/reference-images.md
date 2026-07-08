@@ -17,3 +17,11 @@ Make sure that the loading and calibration of reference images also can be done 
 
 Make reference images selectable and movable in the 3D view.
 The end key should also work for reference images.
+
+
+Add a smart reference image upload feature.
+This could be a dialog box where the user can drag the different views of the reference image onto the different planes.
+(front, side, back, top view, ground floor, 1st floor, 2nd floor etc)
+Once accepted, you can then place these reference images on the canvas in the correct orientation and place.
+
+The user will then start blocking out the structure using the reference images as a guide.

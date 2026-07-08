@@ -541,6 +541,11 @@ pub struct ReferenceImage {
     /// 0 = invisible, 1 = opaque.
     pub opacity: f32,
     pub visible: bool,
+    /// Mirror the image horizontally. Back/left elevations are drawn as seen
+    /// from behind/left, so they must be mirrored to read correctly from
+    /// their viewing direction.
+    #[serde(default)]
+    pub flip_h: bool,
     /// Original file bytes (PNG or JPEG), base64-encoded.
     pub data_base64: String,
 }
@@ -550,9 +555,14 @@ impl ReferenceImage {
         self.width_m * self.aspect.max(1e-6)
     }
 
-    /// Basis with the in-plane rotation applied: (right, up, normal).
+    /// Basis with the horizontal flip and in-plane rotation applied:
+    /// (right, up, normal). The flip negates "right", so rendering,
+    /// picking and calibration all see the mirrored image consistently.
     pub fn oriented_basis(&self) -> (Vec3, Vec3, Vec3) {
-        let (u, v, n) = self.plane.basis();
+        let (mut u, v, n) = self.plane.basis();
+        if self.flip_h {
+            u = -u;
+        }
         let (s, c) = self.rotation_deg.to_radians().sin_cos();
         (u * c + v * s, v * c - u * s, n)
     }
@@ -1449,6 +1459,7 @@ mod tests {
             aspect: 0.5,
             opacity: 0.6,
             visible: true,
+            flip_h: false,
             data_base64: "aGVsbG8=".into(),
         };
         let a = scene.add_reference_image(image.clone());
@@ -1487,6 +1498,7 @@ mod tests {
             aspect: 0.5,
             opacity: 0.5,
             visible: true,
+            flip_h: false,
             data_base64: String::new(),
         };
         // corners span x -2..2, z 0..2 at y = 0

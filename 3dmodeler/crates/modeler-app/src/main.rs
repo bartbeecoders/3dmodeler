@@ -23,6 +23,7 @@ mod pie;
 mod poke;
 mod preview;
 mod ref_image;
+mod ref_setup;
 mod scene_render;
 mod selection;
 mod settings;
