@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/bartbeecoders/3dmodeler/actions/workflows/build.yml/badge.svg)](https://github.com/bartbeecoders/3dmodeler/actions/workflows/build.yml)
 
-**Version 0.2.0** — browser-hosted 3D modeler with Blender-style interaction.
+**Version 0.2.1** — browser-hosted 3D modeler with Blender-style interaction.
 See [plan.md](plan.md) for the roadmap and progress tracking.
 
 ## What's new in 0.2.0

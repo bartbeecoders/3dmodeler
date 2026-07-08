@@ -64,6 +64,9 @@ pub struct UiState {
     collapsed_folders: std::collections::HashSet<u64>,
     pub show_sidebar: bool,
     show_keymap: bool,
+    show_about: bool,
+    /// Decoded-once GPU texture of the embedded About banner.
+    about_texture: Option<egui::TextureHandle>,
     import_open: bool,
     import_buffer: String,
     pub status_message: Option<String>,
@@ -105,6 +108,8 @@ impl UiState {
             collapsed_folders: std::collections::HashSet::new(),
             show_sidebar: true,
             show_keymap: false,
+            show_about: false,
+            about_texture: None,
             import_open: false,
             import_buffer: String::new(),
             status_message: None,
@@ -221,6 +226,7 @@ impl UiState {
             0.0
         };
         self.keymap_window(ctx);
+        self.about_window(ctx);
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
         self.settings_window.ui(ctx, settings);
@@ -335,6 +341,10 @@ impl UiState {
                                     let mut close = false;
                                     if ui.button("Keymap").clicked() {
                                         self.show_keymap = !self.show_keymap;
+                                        close = true;
+                                    }
+                                    if ui.button("About…").clicked() {
+                                        self.show_about = true;
                                         close = true;
                                     }
                                     close
@@ -1429,6 +1439,68 @@ impl UiState {
                 });
             });
         self.show_keymap = open;
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        // Decode the embedded banner once, then reuse the GPU texture.
+        let texture = self
+            .about_texture
+            .get_or_insert_with(|| {
+                let bytes = include_bytes!("../assets/about.jpg");
+                let rgba = image::load_from_memory(bytes)
+                    .expect("embedded about banner decodes")
+                    .to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                ctx.load_texture("about-banner", pixels, egui::TextureOptions::LINEAR)
+            })
+            .clone();
+
+        let mut open = self.show_about;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let width = 440.0;
+                ui.set_width(width);
+                ui.add(
+                    egui::Image::new(&texture)
+                        .fit_to_exact_size(egui::vec2(width, width / texture.aspect_ratio())),
+                );
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("3D Modeler");
+                    ui.label(
+                        egui::RichText::new(concat!("version ", env!("CARGO_PKG_VERSION"))).weak(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "A Blender-style 3D modeler with real physics at its core: \
+                         every object lives in a box3d world — stack it, poke it, \
+                         knock it over.",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Rust · egui · three-d — runs natively and in the browser (WebAssembly)",
+                        )
+                        .size(12.0)
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "bartbeecoders/3dmodeler on GitHub",
+                        "https://github.com/bartbeecoders/3dmodeler",
+                    );
+                    ui.add_space(4.0);
+                });
+            });
+        self.show_about = open;
     }
 }
 
