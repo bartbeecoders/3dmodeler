@@ -7,7 +7,7 @@
 pub mod library;
 pub mod mesh;
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 pub use glam;
 pub use library::{Library, LibraryAsset};
 pub use mesh::{MeshData, WallCutout};
@@ -128,6 +128,13 @@ pub enum Primitive {
     /// standing on z = 0, thickness centered on the X axis. Door/window
     /// openings live on the OBJECT (`Object::cutouts`), not here.
     Wall { length: f32, height: f32, thickness: f32 },
+    /// Floor slab: a thin box centered on the origin in XY, standing on
+    /// z = 0 (top face at z = thickness), so walls at z = 0 sit in it like
+    /// a poured slab. Add ▸ Floor sizes it to the selected walls; when they
+    /// close a loop the slab follows their shape via the footprint polygon
+    /// on the OBJECT (`Object::floor_outline`), not here — width/depth then
+    /// only mirror the outline's bounds.
+    Floor { width: f32, depth: f32, thickness: f32 },
     /// Empty point (Blender's plain-axes empty): three thin axis lines
     /// crossing at the origin, ±`size` long. A marker / grouping parent —
     /// it never collides or simulates.
@@ -191,6 +198,7 @@ impl Primitive {
             Primitive::Cone { .. } => "Cone",
             Primitive::Torus { .. } => "Torus",
             Primitive::Wall { .. } => "Wall",
+            Primitive::Floor { .. } => "Floor",
             Primitive::Empty { .. } => "Empty",
             Primitive::Light { kind, .. } => kind.label(),
         }
@@ -212,6 +220,10 @@ impl Primitive {
             // most distant point
             Primitive::Wall { length, height, thickness } => {
                 (length * length + 0.25 * thickness * thickness + height * height).sqrt()
+            }
+            // origin at the bottom center: a top corner is farthest
+            Primitive::Floor { width, depth, thickness } => {
+                (0.25 * (width * width + depth * depth) + thickness * thickness).sqrt()
             }
             Primitive::Empty { size } => size,
             // + 0.01: spoke corners stick out past the nominal extents
@@ -248,6 +260,9 @@ impl Primitive {
             Primitive::Wall { length, height, thickness } => {
                 Vec3::new(length, thickness, height)
             }
+            Primitive::Floor { width, depth, thickness } => {
+                Vec3::new(width, depth, thickness)
+            }
             Primitive::Empty { size } => Vec3::splat(2.0 * size),
             Primitive::Light { kind, spot_angle_deg, .. } => match kind {
                 LightKind::Point => Vec3::splat(2.0 * mesh::POINT_GIZMO_EXTENT),
@@ -269,6 +284,7 @@ impl Primitive {
             Primitive::Cylinder { depth, .. } | Primitive::Cone { depth, .. } => 0.5 * depth,
             Primitive::Torus { minor_radius, .. } => minor_radius,
             Primitive::Wall { .. } => 0.0, // stands on its own floor line
+            Primitive::Floor { .. } => 0.0, // ditto
             Primitive::Empty { size } => size,
             Primitive::Light { kind, .. } => match kind {
                 LightKind::Point => mesh::POINT_GIZMO_EXTENT,
@@ -299,6 +315,9 @@ impl Primitive {
             // solid wall; cutouts need the object and go through render_mesh
             Primitive::Wall { length, height, thickness } => {
                 mesh::wall(length, height, thickness, &[])
+            }
+            Primitive::Floor { width, depth, thickness } => {
+                mesh::floor(width, depth, thickness)
             }
             Primitive::Empty { size } => mesh::empty_axes(size),
             Primitive::Light { .. } => unreachable!("handled above"),
@@ -374,6 +393,13 @@ pub struct Object {
     /// so the render/physics caches resync.
     #[serde(default)]
     pub cutouts: Vec<WallCutout>,
+    /// Footprint polygon (local XY, implicitly closed), for
+    /// `Primitive::Floor` objects only (ignored elsewhere): when non-empty
+    /// the slab follows this outline instead of the width × depth rectangle
+    /// (Add ▸ Floor with a closed run of walls). Editors must bump
+    /// `mesh_revision` when they change it.
+    #[serde(default)]
+    pub floor_outline: Vec<Vec2>,
     /// Result of mesh editing (Tab edit mode): when present it replaces the
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
@@ -393,6 +419,11 @@ impl Object {
             (None, Primitive::Wall { length, height, thickness }) => {
                 mesh::wall(length, height, thickness, &self.cutouts)
             }
+            (None, Primitive::Floor { thickness, .. })
+                if !self.floor_outline.is_empty() =>
+            {
+                mesh::floor_polygon(&self.floor_outline, thickness)
+            }
             (None, primitive) => primitive.generate(self.smooth),
         }
     }
@@ -404,6 +435,11 @@ impl Object {
             (Some(mesh), _) => mesh.clone(),
             (None, Primitive::Wall { length, height, thickness }) => {
                 mesh::wall(length, height, thickness, &self.cutouts)
+            }
+            (None, Primitive::Floor { thickness, .. })
+                if !self.floor_outline.is_empty() =>
+            {
+                mesh::floor_polygon(&self.floor_outline, thickness)
             }
             (None, primitive) => primitive.generate(true),
         }
@@ -644,6 +680,7 @@ impl Scene {
             anchor: Vec3::ZERO,
             group: false,
             cutouts: Vec::new(),
+            floor_outline: Vec::new(),
             edited_mesh: None,
             mesh_revision: 0,
         });

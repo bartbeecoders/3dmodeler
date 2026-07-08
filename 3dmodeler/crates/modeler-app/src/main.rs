@@ -253,7 +253,11 @@ pub fn main() {
                         edit,
                     );
                 }
-                add_menu.ui(gui_context, &mut scene, &mut wall_tool, &settings);
+                if let Some(message) =
+                    add_menu.ui(gui_context, &mut scene, &mut sel, &mut wall_tool, &settings)
+                {
+                    ui_state.status_message = Some(message);
+                }
                 delete_tool.ui(gui_context, &mut scene, &mut sel);
                 axis_widget::axis_widget(
                     gui_context,
@@ -521,7 +525,8 @@ pub fn main() {
 
         // right-click: context menu on the object (object mode) or the
         // vertex/edge/face (edit mode) under the cursor — set pivot/anchor
-        // and common actions. Cancel-RMB during modal/grab stays theirs.
+        // and common actions. On empty canvas (object mode) it opens the
+        // Add wheel instead. Cancel-RMB during modal/grab stays theirs.
         if physics.is_stopped() && !modal.active() && !edit_mode.grabbing() && !wall_tool.active() {
             for event in frame_input.events.iter_mut() {
                 if let Event::MousePress {
@@ -577,7 +582,13 @@ pub fn main() {
                     };
                     match target {
                         Some(target) => ui_state.context_menu.open(menu_pos, target),
-                        None => ui_state.context_menu.close(),
+                        None => {
+                            ui_state.context_menu.close();
+                            // empty canvas (object mode): offer the Add wheel
+                            if !edit_mode.active() {
+                                add_menu.open_at(menu_pos);
+                            }
+                        }
                     }
                     *handled = true;
                 }
@@ -790,10 +801,11 @@ pub fn main() {
         }
 
         let logical_height = frame_input.viewport.height as f32 / frame_input.device_pixel_ratio;
-        camera.handle_events(&mut frame_input.events, logical_height);
+        camera.handle_events(&mut frame_input.events, logical_height, pointer_over_ui);
 
         // '.' frames the selection (and re-pivots the orbit on it); Home
-        // frames all; End places the selection on the ground (z = 0)
+        // frames all; End drops the selection onto the ground (z = 0) or
+        // the objects below it, whichever is higher
         for event in frame_input.events.iter() {
             if let Event::KeyPress { kind, handled: false, .. } = event {
                 match kind {
@@ -832,7 +844,8 @@ pub fn main() {
                                 }
                             }
                         } else {
-                            object_ops::place_on_ground(&mut scene, &sel);
+                            physics.sync(&scene); // rays need a current mirror
+                            physics.drop_to_floor(&mut scene, &sel);
                         }
                     }
                     _ => {}

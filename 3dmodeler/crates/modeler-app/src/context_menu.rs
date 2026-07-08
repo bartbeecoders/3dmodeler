@@ -151,7 +151,7 @@ impl ContextMenu {
                     slots.push(PieSlot::new("Add door", PieIcon::Door)); // W
                     slots.push(PieSlot::new("Add window", PieIcon::Window)); // NW
                 } else if rebuild.is_some() {
-                    slots.push(PieSlot::new("Rebuild wall", PieIcon::Wall)); // W
+                    slots.push(PieSlot::new("Rebuild", PieIcon::Wall)); // W
                     slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
                 } else if is_group {
                     slots.push(PieSlot::new("Ungroup", PieIcon::Ungroup)); // W
@@ -159,6 +159,12 @@ impl ContextMenu {
                 } else {
                     slots.push(PieSlot::new("Group", PieIcon::Glyph("❐")).enabled(multi)); // W
                     slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
+                }
+                // slot 8: any solid object can shatter into dynamic bricks
+                let breakable = !object.primitive.is_light()
+                    && !matches!(object.primitive, Primitive::Empty { .. });
+                if breakable {
+                    slots.push(PieSlot::new("Bricks", PieIcon::Bricks));
                 }
                 (WheelKind::Object { wall, rebuild }, slots, hub_label(&object.name))
             }
@@ -297,6 +303,12 @@ impl ContextMenu {
                             None
                         }
                     },
+                    8 => crate::object_ops::break_into_bricks(scene, id).map(|bricks| {
+                        let count = bricks.len();
+                        let active = bricks.first().copied();
+                        selection.set(bricks, active);
+                        format!("broken into {count} bricks — Space simulates")
+                    }),
                     _ => None,
                 }
             }

@@ -21,3 +21,6 @@ The floor should be able to be deleted.
 The floor should be able to be saved and loaded.
 
 Add this floor tool to the shift+A menu. and the Add menu in the toolbar.
+
+
+Make it possible to apply the 'break into bricks' feature on all object (blocks, spheres etc)

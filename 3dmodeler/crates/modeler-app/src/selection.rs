@@ -113,6 +113,19 @@ impl Selection {
         }
     }
 
+    /// Extend the selection with `ids`, keeping the current members, and
+    /// make `active` the active object (outliner range select).
+    pub fn extend(&mut self, ids: &[ObjectId], active: ObjectId) {
+        for &id in ids {
+            if !self.selected.contains(&id) {
+                self.selected.push(id);
+            }
+        }
+        self.active = Some(active);
+        self.image = None;
+        self.stamp += 1;
+    }
+
     /// Replace the whole selection (used by duplicate).
     pub fn set(&mut self, ids: Vec<ObjectId>, active: Option<ObjectId>) {
         self.selected = ids;
@@ -191,6 +204,26 @@ mod tests {
         sel.select_image(7);
         sel.clear_image();
         assert_eq!(sel.image(), None);
+    }
+
+    #[test]
+    fn extend_adds_a_range_without_losing_the_selection() {
+        let rows: Vec<ObjectId> = (1..=5).map(ObjectId).collect();
+        let mut sel = Selection::default();
+        // active anchor on row 1, plus an unrelated member (row 5)
+        sel.click(Some(rows[4]), false);
+        sel.click(Some(rows[0]), true);
+        assert_eq!(sel.active(), Some(rows[0]));
+
+        // shift-click row 3 → rows 1..=3 join, row 5 stays, clicked is active
+        sel.extend(&rows[0..=2], rows[2]);
+        assert_eq!(sel.selected(), &[rows[4], rows[0], rows[1], rows[2]]);
+        assert_eq!(sel.active(), Some(rows[2]));
+
+        // extending over already-selected rows does not duplicate them
+        sel.extend(&rows[1..=3], rows[3]);
+        assert_eq!(sel.selected(), &[rows[4], rows[0], rows[1], rows[2], rows[3]]);
+        assert_eq!(sel.active(), Some(rows[3]));
     }
 
     #[test]

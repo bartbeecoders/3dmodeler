@@ -697,20 +697,10 @@ pub fn duplicate_selection(scene: &mut Scene, selection: &mut Selection) -> bool
     let mut id_map: std::collections::HashMap<ObjectId, ObjectId> =
         std::collections::HashMap::new();
     for source in &sources {
-        let id = scene.add_object(source.primitive, source.transform);
-        if let Some(object) = scene.object_mut(id) {
-            object.smooth = source.smooth;
-            object.material = source.material;
-            object.dynamic = source.dynamic;
-            object.density = source.density;
-            object.parent = source.parent; // remapped below if inside the set
-            object.show_label = source.show_label;
-            object.show_dimensions = source.show_dimensions;
-            object.pivot = source.pivot;
-            object.anchor = source.anchor;
-            object.group = source.group;
-            object.edited_mesh = source.edited_mesh.clone();
-        }
+        // clone the WHOLE object (cutouts, floor outline, edited mesh, …);
+        // insert_object assigns a fresh id and a unique name. The parent is
+        // remapped below when it is inside the duplicated set.
+        let id = scene.insert_object(source.clone());
         id_map.insert(source.id, id);
         if selection.active() == Some(source.id) {
             new_active = Some(id);
@@ -769,6 +759,44 @@ fn vertex_snap_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use modeler_core::glam::Vec2;
+    use modeler_core::{Primitive, Scene, Transform, WallCutout};
+
+    #[test]
+    fn duplicate_keeps_wall_openings_and_floor_shape() {
+        let mut scene = Scene::new();
+        let wall = scene.add_object(
+            Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 },
+            Transform::default(),
+        );
+        scene.object_mut(wall).unwrap().cutouts.push(WallCutout::door(1.0, 4.0, 2.5));
+        let floor = scene.add_object(
+            Primitive::Floor { width: 4.0, depth: 4.0, thickness: 0.1 },
+            Transform::default(),
+        );
+        let outline =
+            vec![Vec2::new(-2.0, -2.0), Vec2::new(2.0, -2.0), Vec2::new(0.0, 2.0)];
+        scene.object_mut(floor).unwrap().floor_outline = outline.clone();
+
+        let mut selection = Selection::default();
+        selection.set(vec![wall, floor], Some(floor));
+        assert!(duplicate_selection(&mut scene, &mut selection));
+
+        // the new selection is the two clones, with their shape data intact
+        let clones = selection.selected().to_vec();
+        assert_eq!(clones.len(), 2);
+        assert!(!clones.contains(&wall) && !clones.contains(&floor));
+        let cloned_wall = scene
+            .object(clones[0])
+            .filter(|o| matches!(o.primitive, Primitive::Wall { .. }))
+            .expect("wall clone exists");
+        assert_eq!(cloned_wall.cutouts.len(), 1, "the door survives duplication");
+        let cloned_floor = scene
+            .object(clones[1])
+            .filter(|o| matches!(o.primitive, Primitive::Floor { .. }))
+            .expect("floor clone exists");
+        assert_eq!(cloned_floor.floor_outline, outline, "the shape survives");
+    }
 
     #[test]
     fn vertex_snap_picks_cursor_candidate_and_closest_source() {

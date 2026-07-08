@@ -1,8 +1,9 @@
 //! Blender's Shift+A "Add" menu as a pie / wheel menu (see pie.rs).
 //!
-//! Opens centered on the cursor: eight chips (the seven primitives + Wall)
-//! around a hub. LMB commits the hovered slot, RMB / Esc / clicking other
-//! UI cancels.
+//! Opens centered on the cursor — via Shift+A or a right-click on empty
+//! canvas (main.rs calls `open_at` when the pick hits nothing): eight chips
+//! (the seven primitives + Wall) around a hub. LMB commits the hovered
+//! slot, RMB / Esc / clicking other UI cancels.
 //!
 //! Events are consumed in `handle_events` (which runs after the egui pass,
 //! see main.rs) so a commit click never falls through to viewport picking;
@@ -18,11 +19,12 @@ use three_d::{Event, Key, MouseButton, Viewport};
 enum PieItem {
     Primitive(Primitive),
     Wall,
+    Floor,
 }
 
 /// Slot order around the wheel, starting north and going clockwise.
 /// Cube sits on top — it is used the most.
-fn pie_items() -> [(PieItem, &'static str); 10] {
+fn pie_items() -> [(PieItem, &'static str); 11] {
     // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
     let c = Primitive::catalog();
     // point light; other kinds via the properties panel or the Add menu
@@ -37,6 +39,7 @@ fn pie_items() -> [(PieItem, &'static str); 10] {
         (PieItem::Primitive(c[0]), "Plane"),
         (PieItem::Primitive(light), "Light"),
         (PieItem::Primitive(c[7]), "Empty"),
+        (PieItem::Floor, "Floor"),
         (PieItem::Wall, "Wall"),
     ]
 }
@@ -44,6 +47,7 @@ fn pie_items() -> [(PieItem, &'static str); 10] {
 fn slot_icon(item: PieItem) -> PieIcon {
     match item {
         PieItem::Wall => PieIcon::Wall,
+        PieItem::Floor => PieIcon::Floor,
         PieItem::Primitive(primitive) => pie::primitive_icon(&primitive),
     }
 }
@@ -54,6 +58,9 @@ pub struct AddMenu {
     last_mouse: egui::Pos2,
     /// LMB arrived in `handle_events`; commit on the next `ui` pass.
     pending_click: bool,
+    /// Guards event handling on the frame the menu opened (an opening RMB
+    /// press is already in this frame's event list, marked handled).
+    just_opened: bool,
     /// 0 → 1 scale-in animation (owned here, rendered by pie::draw).
     anim: f32,
 }
@@ -65,6 +72,7 @@ impl AddMenu {
             position: egui::Pos2::new(200.0, 200.0),
             last_mouse: egui::Pos2::new(200.0, 200.0),
             pending_click: false,
+            just_opened: false,
             anim: 0.0,
         }
     }
@@ -117,7 +125,9 @@ impl AddMenu {
                     self.pending_click = false;
                     *handled = true;
                 }
-                Event::MousePress { button, handled, .. } if self.open => {
+                Event::MousePress { button, handled, .. }
+                    if self.open && !self.just_opened =>
+                {
                     if *handled {
                         // egui took it (menu bar, sidebar…): just dismiss
                         self.open = false;
@@ -136,22 +146,27 @@ impl AddMenu {
         }
     }
 
-    fn open_at(&mut self, pos: egui::Pos2) {
+    /// Open the wheel at `pos`. Also called from main.rs when a right-click
+    /// lands on empty canvas (the opening press is marked handled there).
+    pub fn open_at(&mut self, pos: egui::Pos2) {
         self.open = true;
         self.position = pos;
         self.pending_click = false;
+        self.just_opened = true;
         self.anim = 0.0;
     }
 
+    /// Draw the wheel; returns a status-bar message when an action ran.
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
         scene: &mut Scene,
+        selection: &mut crate::selection::Selection,
         wall_tool: &mut crate::wall_tool::WallTool,
         settings: &crate::settings::Settings,
-    ) {
+    ) -> Option<String> {
         if !self.open {
-            return;
+            return None;
         }
         let items = pie_items();
         let slots: Vec<PieSlot> = items
@@ -162,6 +177,7 @@ impl AddMenu {
 
         // commit / cancel (the click was consumed in handle_events);
         // clicking the hub or dead center closes without adding
+        let mut status = None;
         if self.pending_click {
             self.pending_click = false;
             if let Some(slot) = hovered {
@@ -170,10 +186,15 @@ impl AddMenu {
                         scene.add_object(primitive, Transform::default());
                     }
                     PieItem::Wall => wall_tool.start(settings),
+                    PieItem::Floor => {
+                        status = Some(crate::object_ops::add_floor(scene, selection));
+                    }
                 }
             }
             self.open = false;
         }
+        self.just_opened = false;
+        status
     }
 }
 

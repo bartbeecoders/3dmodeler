@@ -225,8 +225,16 @@ impl BlenderCamera {
     }
 
     /// Consume viewport navigation events. Events already handled (e.g. by
-    /// egui) are skipped; events we use are marked handled.
-    pub fn handle_events(&mut self, events: &mut [Event], logical_viewport_height: f32) {
+    /// egui) are skipped; events we use are marked handled. Wheel/pinch zoom
+    /// is skipped while the pointer is over UI chrome (three-d does not flag
+    /// wheel events over egui panels as handled, so scrolling the outliner
+    /// would also zoom the canvas).
+    pub fn handle_events(
+        &mut self,
+        events: &mut [Event],
+        logical_viewport_height: f32,
+        pointer_over_ui: bool,
+    ) {
         for event in events.iter_mut() {
             match event {
                 Event::MouseMotion {
@@ -250,12 +258,12 @@ impl BlenderCamera {
                         *handled = true;
                     }
                 }
-                Event::MouseWheel { delta, handled, .. } if !*handled => {
+                Event::MouseWheel { delta, handled, .. } if !*handled && !pointer_over_ui => {
                     let notches = delta.1 / 24.0;
                     self.zoom_by_factor(WHEEL_ZOOM_FACTOR.powf(notches));
                     *handled = true;
                 }
-                Event::PinchGesture { delta, handled, .. } if !*handled => {
+                Event::PinchGesture { delta, handled, .. } if !*handled && !pointer_over_ui => {
                     self.zoom_by_factor(1.0 - *delta);
                     *handled = true;
                 }

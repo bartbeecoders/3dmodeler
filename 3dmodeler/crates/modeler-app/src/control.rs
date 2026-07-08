@@ -252,6 +252,7 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
         "cone" => Some(catalog[5]),
         "torus" => Some(catalog[6]),
         "wall" => Some(Primitive::Wall { length: 2.0, height: 2.5, thickness: 0.2 }),
+        "floor" => Some(Primitive::Floor { width: 4.0, depth: 4.0, thickness: 0.1 }),
         "empty" => Some(catalog[7]),
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
@@ -661,6 +662,34 @@ fn execute_inner(
             apply_object_params(scene, id, command)?;
             let object = scene.object(id).unwrap();
             Ok(json!({"id": id.0, "name": object.name}))
+        }
+        "add_floor" => {
+            // explicit wall list, else every wall in the scene
+            let walls: Vec<ObjectId> = match command.get("walls").filter(|v| !v.is_null()) {
+                Some(refs) => refs
+                    .as_array()
+                    .ok_or("'walls' must be an array of names/ids")?
+                    .iter()
+                    .map(|r| resolve(scene, r))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => scene
+                    .objects()
+                    .iter()
+                    .filter(|o| matches!(o.primitive, Primitive::Wall { .. }))
+                    .map(|o| o.id)
+                    .collect(),
+            };
+            let (id, message) = crate::object_ops::add_floor_for_walls(scene, &walls);
+            apply_object_params(scene, id, command)?;
+            let object = scene.object(id).unwrap();
+            Ok(json!({"id": id.0, "name": object.name, "status": message}))
+        }
+        "break_into_bricks" => {
+            let id = resolve(scene, &command["object"])?;
+            let bricks = crate::object_ops::break_into_bricks(scene, id)
+                .ok_or("this object cannot break into bricks (no volume)")?;
+            selection.retain_existing(|i| scene.object(i).is_some());
+            Ok(json!({"count": bricks.len()}))
         }
         "update_object" => {
             let id = resolve(scene, &command["object"])?;

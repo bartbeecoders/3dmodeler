@@ -73,7 +73,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "empty", "light", "sun", "spot"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "empty", "light", "sun", "spot"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
@@ -101,6 +101,29 @@ fn tool_definitions() -> Value {
                     "group": {"type": "boolean", "description": "Group root flag: this object + its (later-parented) descendants select as ONE unit in the viewport"}
                 },
                 "required": ["primitive"]
+            }
+        },
+        {
+            "name": "add_floor",
+            "description": "Add a floor slab under walls, standing on z=0. When the walls chain end-to-end into a closed loop the floor follows their shape (centerline polygon, concave rooms included); otherwise it covers their bounding rectangle. Takes the same optional object fields as add_object (color, new_name, ...).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "walls": {"type": "array", "items": {"type": "string"}, "description": "Wall names (or ids as strings) to size the floor from; omit to use every wall in the scene"},
+                    "new_name": {"type": "string"},
+                    "color": {"type": "array", "items": {"type": "number"}, "description": "[r, g, b] each 0..1"}
+                }
+            }
+        },
+        {
+            "name": "break_into_bricks",
+            "description": "Replace an object with individual dynamic bricks in a running bond (they collide and tumble when the simulation plays). Walls keep their door/window openings; other shapes (cubes, spheres, cones, floors, ...) are filled with bricks, curved surfaces getting a stepped approximation. The bricks land in a '<name> bricks' folder that can rebuild the original.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object name (or id as string)"}
+                },
+                "required": ["object"]
             }
         },
         {
@@ -351,7 +374,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
-        "add_object" | "update_object" | "delete_object" | "set_parent" | "attach_object"
+        "add_object" | "add_floor" | "break_into_bricks" | "update_object" | "delete_object" | "set_parent" | "attach_object"
         | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"
         | "add_reference_image" | "update_reference_image" | "delete_reference_image"
         | "calibrate_reference_image" | "create_library_object" | "update_library_object"

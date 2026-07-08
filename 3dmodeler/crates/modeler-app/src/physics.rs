@@ -206,6 +206,15 @@ impl PhysicsMirror {
                 let mesh = object.collision_mesh();
                 self.create_mesh_shape(body, shape_def, &mesh, scale);
             }
+            // floors shaped to walls may be concave (L/U rooms): exact
+            // triangle mesh so the notches stay open
+            Primitive::Floor { .. }
+                if !object.floor_outline.is_empty()
+                    && (!object.dynamic || self.sim == SimState::Stopped) =>
+            {
+                let mesh = object.collision_mesh();
+                self.create_mesh_shape(body, shape_def, &mesh, scale);
+            }
             // everything else is convex: simplified hull of the scaled mesh
             _ => {
                 let mesh = object.primitive.generate(true);
@@ -425,8 +434,12 @@ impl PhysicsMirror {
         result
     }
 
-    /// Drop each selected object straight down onto whatever is below it
-    /// (other objects via box3d ray cast, else the ground plane at z = 0).
+    /// Drop the selection straight down onto whatever is below it: the
+    /// ground plane (z = 0) or the highest object underneath, whichever is
+    /// higher (End key). Each selection root moves with its whole subtree
+    /// as one piece; support is probed with a ray grid over the subtree's
+    /// world-space footprint so partial overhangs still land on their
+    /// support instead of falling through.
     pub fn drop_to_floor(&self, scene: &mut Scene, selection: &Selection) {
         struct Ctx {
             exclude: HashSet<u64>,
@@ -445,36 +458,82 @@ impl PhysicsMirror {
             let ctx = &mut *(context as *mut Ctx);
             let user_data = ffi::b3Shape_GetUserData(shape) as usize as u64;
             if ctx.exclude.contains(&user_data) {
-                return -1.0; // ignore selected objects, keep going
+                return -1.0; // ignore the moving objects, keep going
             }
             let z = point.z;
             ctx.best_z = Some(ctx.best_z.map_or(z, |b: f32| b.max(z)));
             fraction // clip: we only care about the closest hit below
         }
 
-        let ids: Vec<ObjectId> = selection.selected().to_vec();
-        let exclude: HashSet<u64> = ids.iter().map(|id| id.0).collect();
-        for id in ids {
-            let Some(object) = scene.object(id) else { continue };
-            let world = scene.world_transform(id);
-            let origin = world.location;
-            let bottom = object.primitive.bottom_offset() * world.scale.z.abs();
+        let selected = selection.selected().to_vec();
+        // selection roots: selected objects whose parent is not selected —
+        // children follow their root through the hierarchy
+        let roots: Vec<ObjectId> = selected
+            .iter()
+            .copied()
+            .filter(|&id| {
+                scene
+                    .object(id)
+                    .is_some_and(|o| o.parent.map_or(true, |p| !selected.contains(&p)))
+            })
+            .collect();
+        // the rays ignore every moving object, subtrees included
+        let exclude: HashSet<u64> = roots
+            .iter()
+            .flat_map(|&root| scene.subtree(root))
+            .map(|id| id.0)
+            .collect();
 
-            let mut ctx = Ctx { exclude: exclude.clone(), best_z: None };
-            unsafe {
-                ffi::b3World_CastRay(
-                    self.world,
-                    bvec(origin),
-                    bvec(Vec3::new(0.0, 0.0, -1000.0)),
-                    ffi::b3DefaultQueryFilter(),
-                    Some(callback),
-                    &mut ctx as *mut Ctx as *mut c_void,
-                );
+        for root in roots {
+            // Each member probes its own footprint; the assembly moves by
+            // the most constraining member (its bottom meets its support,
+            // everything else stays at or above theirs) — a table selected
+            // with a high overhang stacks by the leg, not the overhang.
+            let mut delta = f32::NEG_INFINITY;
+            for member in scene.subtree(root) {
+                let Some(object) = scene.object(member) else { continue };
+                // member's world AABB from the actual collision mesh
+                // (rotation- and scale-aware)
+                let world = scene.world_transform(member);
+                let mut min = Vec3::splat(f32::INFINITY);
+                let mut max = Vec3::splat(f32::NEG_INFINITY);
+                for p in object.collision_mesh().positions {
+                    let w = world.transform_point(p);
+                    min = min.min(w);
+                    max = max.max(w);
+                }
+                if !min.z.is_finite() {
+                    continue;
+                }
+                // ray grid over the footprint, cast from just above the
+                // member's lowest point; best_z accumulates across rays
+                const GRID: usize = 5;
+                let mut ctx = Ctx { exclude: exclude.clone(), best_z: None };
+                for i in 0..GRID {
+                    for j in 0..GRID {
+                        let x = min.x + (max.x - min.x) * i as f32 / (GRID - 1) as f32;
+                        let y = min.y + (max.y - min.y) * j as f32 / (GRID - 1) as f32;
+                        unsafe {
+                            ffi::b3World_CastRay(
+                                self.world,
+                                bvec(Vec3::new(x, y, min.z + 1e-3)),
+                                bvec(Vec3::new(0.0, 0.0, -1000.0)),
+                                ffi::b3DefaultQueryFilter(),
+                                Some(callback),
+                                &mut ctx as *mut Ctx as *mut c_void,
+                            );
+                        }
+                    }
+                }
+                // this member's support: highest hit below it, or the ground
+                let support = ctx.best_z.unwrap_or(0.0).max(0.0);
+                delta = delta.max(support - min.z);
             }
-            let floor_z = ctx.best_z.unwrap_or(0.0).max(0.0);
-            let mut world = scene.world_transform(id);
-            world.location.z = floor_z + bottom;
-            scene.set_world_transform(id, world);
+            if delta.is_finite() {
+                let mut world = scene.world_transform(root);
+                world.location.z += delta;
+                scene.set_world_transform(root, world);
+            }
         }
     }
 
@@ -700,6 +759,43 @@ mod tests {
         physics.drop_to_floor(&mut scene, &sel);
         let z = scene.object(sphere).unwrap().transform.location.z;
         assert!((z - 3.0).abs() < 0.02, "sphere should rest at z=3, got {z}");
+    }
+
+    #[test]
+    fn drop_to_floor_moves_assemblies_as_one_piece() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        let at = |scene: &mut Scene, x: f32, y: f32, z: f32| {
+            let mut t = Transform::default();
+            t.location = Vec3::new(x, y, z);
+            scene.add_object(Primitive::Cube { size: 2.0 }, t)
+        };
+        // a floating pair: root at z=5, child hanging at z=8 over a table
+        let root = at(&mut scene, 0.0, 0.0, 5.0);
+        let child = at(&mut scene, 0.0, 3.0, 8.0);
+        scene.set_parent(child, Some(root));
+        // static table under the CHILD's footprint only, top at z = 2
+        at(&mut scene, 0.0, 3.0, 1.0);
+
+        let mut physics = PhysicsMirror::new();
+        physics.sync(&scene);
+        let mut sel = crate::selection::Selection::default();
+        sel.set(vec![root, child], Some(root));
+        physics.drop_to_floor(&mut scene, &sel);
+
+        // the root's ground contact constrains the drop: root rests at z=0
+        // (center 1), the child keeps its 3 m offset and floats above the
+        // table instead of sinking into it
+        let root_z = scene.world_transform(root).location.z;
+        let child_z = scene.world_transform(child).location.z;
+        assert!((root_z - 1.0).abs() < 1e-3, "root center at z=1, got {root_z}");
+        assert!((child_z - 4.0).abs() < 1e-3, "child center at z=4, got {child_z}");
+
+        // drop again: already resting — nothing moves (idempotent)
+        physics.sync(&scene);
+        physics.drop_to_floor(&mut scene, &sel);
+        let again = scene.world_transform(root).location.z;
+        assert!((again - 1.0).abs() < 1e-3, "stable on repeat, got {again}");
     }
 
     #[test]

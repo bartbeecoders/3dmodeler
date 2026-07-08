@@ -2,7 +2,7 @@
 //! origin, matching Blender's conventions (cylinder/cone axis along Z, plane
 //! and torus in the XY plane).
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
@@ -335,7 +335,117 @@ pub fn plane(size: f32) -> MeshData {
 }
 
 pub fn cube(size: f32) -> MeshData {
-    let h = 0.5 * size;
+    box_mesh(Vec3::splat(0.5 * size), Vec3::ZERO)
+}
+
+/// Floor slab: centered on the origin in XY, spanning z ∈ [0, thickness].
+pub fn floor(width: f32, depth: f32, thickness: f32) -> MeshData {
+    box_mesh(
+        Vec3::new(0.5 * width, 0.5 * depth, 0.5 * thickness),
+        Vec3::new(0.0, 0.0, 0.5 * thickness),
+    )
+}
+
+/// Floor slab following a footprint polygon (simple, convex or concave, any
+/// winding), spanning z ∈ [0, thickness]: flat caps plus perimeter sides.
+pub fn floor_polygon(outline: &[Vec2], thickness: f32) -> MeshData {
+    let mut m = MeshData::default();
+    // work in CCW order so cap triangles face +Z and edge normals point out
+    let doubled_area: f32 = outline
+        .iter()
+        .zip(outline.iter().cycle().skip(1))
+        .take(outline.len())
+        .map(|(a, b)| a.perp_dot(*b))
+        .sum();
+    let ccw: Vec<Vec2> = if doubled_area < 0.0 {
+        outline.iter().rev().copied().collect()
+    } else {
+        outline.to_vec()
+    };
+    let tris = triangulate(&ccw);
+
+    // top & bottom caps
+    for (z, normal) in [(thickness, Vec3::Z), (0.0, Vec3::NEG_Z)] {
+        let base = m.positions.len() as u32;
+        for p in &ccw {
+            m.positions.push(Vec3::new(p.x, p.y, z));
+            m.normals.push(normal);
+        }
+        for &[a, b, c] in &tris {
+            if normal == Vec3::Z {
+                m.indices.extend_from_slice(&[base + a, base + b, base + c]);
+            } else {
+                m.indices.extend_from_slice(&[base + a, base + c, base + b]);
+            }
+        }
+    }
+
+    // perimeter sides; for a CCW polygon the outward normal of edge a→b is
+    // its direction rotated -90°
+    for i in 0..ccw.len() {
+        let a = ccw[i];
+        let b = ccw[(i + 1) % ccw.len()];
+        let n = Vec3::new(b.y - a.y, a.x - b.x, 0.0).normalize_or_zero();
+        let base = m.positions.len() as u32;
+        m.positions.extend_from_slice(&[
+            Vec3::new(a.x, a.y, 0.0),
+            Vec3::new(b.x, b.y, 0.0),
+            Vec3::new(b.x, b.y, thickness),
+            Vec3::new(a.x, a.y, thickness),
+        ]);
+        m.normals.extend_from_slice(&[n, n, n, n]);
+        m.quad(base, base + 1, base + 2, base + 3);
+    }
+    m
+}
+
+/// Ear-clipping triangulation of a simple CCW polygon; returns index triples
+/// into `points`. Degenerate input yields a partial (possibly empty) result
+/// rather than looping forever.
+fn triangulate(points: &[Vec2]) -> Vec<[u32; 3]> {
+    let mut idx: Vec<u32> = (0..points.len() as u32).collect();
+    let mut tris = Vec::new();
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
+    while idx.len() > 3 {
+        let m = idx.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let (pi, ci, ni) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+            let (p, c, n) =
+                (points[pi as usize], points[ci as usize], points[ni as usize]);
+            if cross(p, c, n) <= 1e-9 {
+                continue; // reflex or collinear corner: not an ear
+            }
+            // an ear must not contain any other polygon vertex
+            let blocked = idx.iter().any(|&j| {
+                if j == pi || j == ci || j == ni {
+                    return false;
+                }
+                let q = points[j as usize];
+                cross(p, c, q) >= -1e-9
+                    && cross(c, n, q) >= -1e-9
+                    && cross(n, p, q) >= -1e-9
+            });
+            if blocked {
+                continue;
+            }
+            tris.push([pi, ci, ni]);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            return tris; // numerically degenerate: keep what we have
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0], idx[1], idx[2]]);
+    }
+    tris
+}
+
+/// Axis-aligned box with the given half-extents, centered on `center`.
+fn box_mesh(half: Vec3, center: Vec3) -> MeshData {
     let mut m = MeshData::default();
     // (normal, u, v) per face, CCW seen from outside
     let faces = [
@@ -349,7 +459,7 @@ pub fn cube(size: f32) -> MeshData {
     for (n, u, v) in faces {
         let base = m.positions.len() as u32;
         for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-            m.positions.push((n + u * su + v * sv) * h);
+            m.positions.push((n + u * su + v * sv) * half + center);
             m.normals.push(n);
         }
         m.quad(base, base + 1, base + 2, base + 3);

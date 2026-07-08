@@ -24,6 +24,7 @@ pub enum PieIcon {
     Torus,
     Plane,
     Wall,
+    Floor,
     Empty,
     LightPoint,
     LightSun,
@@ -35,6 +36,7 @@ pub enum PieIcon {
     Attach,
     Door,
     Window,
+    Bricks,
 }
 
 /// The icon matching a primitive (shared by the pie and the Add dropdown).
@@ -49,6 +51,7 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Cone { .. } => PieIcon::Cone,
         P::Torus { .. } => PieIcon::Torus,
         P::Wall { .. } => PieIcon::Wall,
+        P::Floor { .. } => PieIcon::Floor,
         P::Empty { .. } => PieIcon::Empty,
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
@@ -343,6 +346,34 @@ fn draw_icon(
             painter.line_segment([p(-0.5, -0.22), p(-0.5, 0.22)], stroke);
             painter.line_segment([p(0.5, -0.22), p(0.5, 0.22)], stroke);
             painter.line_segment([p(0.0, 0.22), p(0.0, 0.65)], stroke);
+        }
+        // Bricks: two stacked bricks, a third tumbling away
+        PieIcon::Bricks => {
+            let brick = |center: egui::Pos2, angle: f32| {
+                let (sin, cos) = angle.sin_cos();
+                let rot = |x: f32, y: f32| {
+                    center + egui::vec2(x * cos - y * sin, x * sin + y * cos)
+                };
+                let (w, h) = (0.5 * s, 0.28 * s);
+                egui::Shape::closed_line(
+                    vec![rot(-w, -h), rot(w, -h), rot(w, h), rot(-w, h)],
+                    stroke,
+                )
+            };
+            painter.add(brick(p(-0.45, 0.62), 0.0));
+            painter.add(brick(p(-0.45, -0.05), 0.0));
+            painter.add(brick(p(0.62, 0.4), -0.55));
+        }
+        // Floor: flat slab — parallelogram top with a visible thickness
+        PieIcon::Floor => {
+            let top = [p(-1.0, -0.1), p(-0.35, -0.85), p(1.0, -0.85), p(0.35, -0.1)];
+            painter.add(egui::Shape::closed_line(top.to_vec(), stroke));
+            let d = egui::vec2(0.0, 0.45 * s);
+            for corner in [top[0], top[2], top[3]] {
+                painter.line_segment([corner, corner + d], stroke);
+            }
+            painter.line_segment([top[0] + d, top[3] + d], stroke);
+            painter.line_segment([top[3] + d, top[2] + d], stroke);
         }
         // Empty: axes star (three lines through the origin)
         PieIcon::Empty => {

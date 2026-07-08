@@ -41,6 +41,9 @@ struct OutlinerActions {
     commit_folder_rename: Option<(u64, String)>,
     /// Rebuild the wall stored in this bricks folder.
     rebuild_wall: Option<u64>,
+    /// Every object row drawn this frame, top to bottom (collapsed folder
+    /// members excluded) — the order Shift+Click range selection walks.
+    row_order: Vec<ObjectId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,13 @@ pub struct UiState {
     /// every frame would cancel the focus loss that commits the rename.
     rename_needs_focus: bool,
     collapsed_folders: std::collections::HashSet<u64>,
+    /// Objects whose children are hidden in the outliner (collapse triangle
+    /// on rows that have parented children).
+    collapsed_objects: std::collections::HashSet<ObjectId>,
+    /// Bricks folders already auto-collapsed once: they start closed so
+    /// hundreds of brick rows don't flood the outliner, but re-expanding
+    /// one by hand sticks (it is never auto-collapsed again).
+    seen_brick_folders: std::collections::HashSet<u64>,
     pub show_sidebar: bool,
     show_keymap: bool,
     show_about: bool,
@@ -106,6 +116,8 @@ impl UiState {
             rename_folder: None,
             rename_needs_focus: false,
             collapsed_folders: std::collections::HashSet::new(),
+            collapsed_objects: std::collections::HashSet::new(),
+            seen_brick_folders: std::collections::HashSet::new(),
             show_sidebar: true,
             show_keymap: false,
             show_about: false,
@@ -326,9 +338,10 @@ impl UiState {
                                 Menu::Edit => {
                                     edit_menu(ui, scene, undo, &mut self.settings_window)
                                 }
-                                Menu::Add => {
-                                    add_menu_items(ui, scene, measure, wall_tool, settings)
-                                }
+                                Menu::Add => add_menu_items(
+                                    ui, scene, selection, measure, wall_tool, settings,
+                                    &mut self.status_message,
+                                ),
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
                                     &mut self.library_panel, &mut self.status_message,
@@ -986,18 +999,35 @@ impl UiState {
     fn outliner(&mut self, ui: &mut egui::Ui, scene: &mut Scene, selection: &mut Selection) {
         let mut acts = OutlinerActions::default();
 
-        // children indented beneath their parent
+        // a fresh Break-into-Bricks folder starts collapsed, whichever path
+        // created it (menu, wheel, properties, MCP) — hundreds of brick rows
+        // would drown the outliner. Prune first: a new scene may reuse ids.
+        self.seen_brick_folders.retain(|&id| scene.folder(id).is_some());
+        for folder in scene.folders() {
+            if folder.source_wall.is_some() && self.seen_brick_folders.insert(folder.id) {
+                self.collapsed_folders.insert(folder.id);
+            }
+        }
+
+        self.collapsed_objects.retain(|&id| scene.object(id).is_some());
+
+        // children indented beneath their parent; collapsed parents keep
+        // their subtree hidden
         fn push_children(
             scene: &Scene,
             parent: ObjectId,
             depth: u32,
+            collapsed: &std::collections::HashSet<ObjectId>,
             out: &mut Vec<(ObjectId, u32)>,
         ) {
+            if collapsed.contains(&parent) {
+                return;
+            }
             for object in scene.objects() {
                 if object.parent == Some(parent) {
                     out.push((object.id, depth));
                     if depth < 32 {
-                        push_children(scene, object.id, depth + 1, out);
+                        push_children(scene, object.id, depth + 1, collapsed, out);
                     }
                 }
             }
@@ -1023,7 +1053,7 @@ impl UiState {
             for object in scene.objects() {
                 if object.folder == Some(fid) && is_root(scene, object) {
                     display.push((object.id, 1));
-                    push_children(scene, object.id, 2, &mut display);
+                    push_children(scene, object.id, 2, &self.collapsed_objects, &mut display);
                 }
             }
             if display.is_empty() {
@@ -1033,6 +1063,7 @@ impl UiState {
                 });
             }
             for (id, depth) in display {
+                acts.row_order.push(id);
                 self.object_row(ui, scene, selection, id, depth, &mut acts);
             }
         }
@@ -1045,10 +1076,11 @@ impl UiState {
                 .is_none_or(|f| !folder_ids.contains(&f));
             if is_root(scene, object) && unfoldered {
                 display.push((object.id, 0));
-                push_children(scene, object.id, 1, &mut display);
+                push_children(scene, object.id, 1, &self.collapsed_objects, &mut display);
             }
         }
         for (id, depth) in display {
+            acts.row_order.push(id);
             self.object_row(ui, scene, selection, id, depth, &mut acts);
         }
 
@@ -1206,8 +1238,30 @@ impl UiState {
         acts: &mut OutlinerActions,
     ) {
         let Some(object) = scene.object(id) else { return };
+        let has_children = scene.objects().iter().any(|o| o.parent == Some(id));
         ui.horizontal(|ui| {
             ui.add_space(12.0 * depth as f32);
+                // collapse triangle for objects with children; the slot is
+                // always allocated so leaf rows line up with parent rows
+                let icon_resp = ui.allocate_response(
+                    egui::vec2(12.0, 14.0),
+                    egui::Sense::click(),
+                );
+                if has_children {
+                    let open = !self.collapsed_objects.contains(&id);
+                    egui::collapsing_header::paint_default_icon(
+                        ui,
+                        if open { 1.0 } else { 0.0 },
+                        &icon_resp,
+                    );
+                    if icon_resp.clicked() {
+                        if open {
+                            self.collapsed_objects.insert(id);
+                        } else {
+                            self.collapsed_objects.remove(&id);
+                        }
+                    }
+                }
                 // visibility "eye"
                 let eye = if object.visible { "●" } else { "○" };
                 if ui
@@ -1368,8 +1422,26 @@ impl UiState {
             }
         }
         if let Some(id) = acts.clicked {
-            let shift = ui.input(|i| i.modifiers.shift);
-            selection.click(Some(id), shift);
+            let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+            if shift {
+                // range select (Blender/file-manager): everything between
+                // the active object and the clicked row, in displayed order
+                let anchor = selection
+                    .active()
+                    .and_then(|a| acts.row_order.iter().position(|&r| r == a));
+                let clicked = acts.row_order.iter().position(|&r| r == id);
+                match (anchor, clicked) {
+                    (Some(a), Some(c)) => {
+                        let (lo, hi) = if a <= c { (a, c) } else { (c, a) };
+                        selection.extend(&acts.row_order[lo..=hi], id);
+                    }
+                    // no anchor (or a hidden one): extend with the row alone
+                    _ => selection.click(Some(id), true),
+                }
+            } else {
+                // Ctrl+Click toggles one object, a plain click selects it
+                selection.click(Some(id), ctrl);
+            }
         }
         if let Some((id, name)) = acts.start_rename {
             self.rename = Some((id, name));
@@ -1400,6 +1472,7 @@ impl UiState {
                 egui::Grid::new("keymap-grid").striped(true).show(ui, |ui| {
                     for (keys, action) in [
                         ("LMB / Shift+LMB", "Select / extend selection"),
+                        ("Outliner Shift/Ctrl+Click", "Select range to active / toggle one"),
                         ("RMB (viewport)", "Context menu: pivot/anchor & object actions"),
                         ("MMB drag", "Orbit"),
                         ("Shift+MMB", "Pan"),
@@ -1408,7 +1481,7 @@ impl UiState {
                         ("4 / 6 / 8 / 2", "Step-rotate view"),
                         ("5", "Orthographic / perspective"),
                         (". / Home", "Frame selection / scene"),
-                        ("End", "Place selection / reference image on the ground (z = 0)"),
+                        ("End", "Drop selection onto the ground or the objects below it"),
                         ("G (image selected)", "Move the selected reference image"),
                         ("Shift+A", "Add wheel: flick towards an item, click to add"),
                         ("G / R / S", "Move / Rotate / Scale"),
@@ -1428,6 +1501,7 @@ impl UiState {
                         ("Ctrl+S / Ctrl+O / Ctrl+N", "Save / Open / New scene"),
                         ("Ctrl+P / Alt+P", "Parent to active / clear parent"),
                         ("Add ▸ Wall", "Draw walls on the floor: click corners, Esc ends"),
+                        ("Add ▸ Floor", "Floor slab encompassing the selected walls"),
                         ("Drag ⊕ handle (wall)", "Move a door/window opening; Esc cancels the drag"),
                         ("Add ▸ Measure", "Ruler: click two points"),
                         ("Esc", "Stop physics (restore)"),
@@ -1541,9 +1615,11 @@ fn edit_menu(
 fn add_menu_items(
     ui: &mut egui::Ui,
     scene: &mut Scene,
+    selection: &mut Selection,
     measure: &mut MeasureTool,
     wall_tool: &mut crate::wall_tool::WallTool,
     settings: &Settings,
+    status: &mut Option<String>,
 ) -> bool {
     if let Some(primitive) = crate::add_menu::mesh_menu_buttons(ui) {
         scene.add_object(primitive, Transform::default());
@@ -1558,6 +1634,16 @@ fn add_menu_items(
         .clicked()
     {
         wall_tool.start(settings);
+        return true;
+    }
+    if crate::pie::icon_menu_button(ui, &crate::pie::PieIcon::Floor, "Floor")
+        .on_hover_text(
+            "Add a floor slab sized to encompass the selected walls \
+             (all walls when none are selected)",
+        )
+        .clicked()
+    {
+        *status = Some(crate::object_ops::add_floor(scene, selection));
         return true;
     }
     ui.separator();
@@ -1620,8 +1706,10 @@ fn object_menu(
         close = true;
     }
     if ui
-        .add_enabled(has_selection, egui::Button::new("Drop to Floor"))
-        .on_hover_text("Drop onto whatever is below (other objects or the ground)")
+        .add_enabled(has_selection, egui::Button::new("Drop to Floor  (End)"))
+        .on_hover_text(
+            "Drop onto the ground or the objects below, whichever is higher",
+        )
         .clicked()
     {
         physics.sync(scene); // mirror must match before ray casting
@@ -1629,8 +1717,11 @@ fn object_menu(
         close = true;
     }
     if ui
-        .add_enabled(has_selection, egui::Button::new("Place on Ground  (End)"))
-        .on_hover_text("Move the selection vertically so its lowest point sits at z = 0")
+        .add_enabled(has_selection, egui::Button::new("Place on Ground"))
+        .on_hover_text(
+            "Move the selection vertically so its lowest point sits at z = 0, \
+             ignoring objects below",
+        )
         .clicked()
     {
         object_ops::place_on_ground(scene, selection);
@@ -1652,25 +1743,26 @@ fn object_menu(
         close = true;
     }
     ui.separator();
-    let wall_active = selection
+    let breakable_active = selection
         .active()
         .and_then(|id| scene.object(id))
         .is_some_and(|o| {
-            matches!(o.primitive, Primitive::Wall { .. }) && o.edited_mesh.is_none()
+            !o.primitive.is_light() && !matches!(o.primitive, Primitive::Empty { .. })
         });
     if ui
-        .add_enabled(wall_active, egui::Button::new("Break Wall into Bricks"))
+        .add_enabled(breakable_active, egui::Button::new("Break into Bricks"))
         .on_hover_text(
-            "Replace the active wall with individual dynamic bricks (running \
-             bond, openings kept) that collide and tumble when the simulation \
-             plays (Space)",
+            "Replace the active object with individual dynamic bricks \
+             (running bond; walls keep their openings, curved shapes get a \
+             stepped approximation) that collide and tumble when the \
+             simulation plays (Space)",
         )
         .clicked()
     {
         if let Some(id) = selection.active() {
-            if let Some(bricks) = object_ops::break_wall_into_bricks(scene, id) {
+            if let Some(bricks) = object_ops::break_into_bricks(scene, id) {
                 *status = Some(format!(
-                    "wall broken into {} bricks — Space simulates",
+                    "broken into {} bricks — Space simulates",
                     bricks.len()
                 ));
                 let active = bricks.first().copied();
@@ -1685,7 +1777,7 @@ fn object_menu(
     if ui
         .add_enabled(
             rebuild_folder.is_some(),
-            egui::Button::new("Rebuild Wall from Bricks"),
+            egui::Button::new("Rebuild from Bricks"),
         )
         .on_hover_text(
             "Remove the bricks (wherever they tumbled) and restore the \
@@ -2174,7 +2266,7 @@ fn properties(
     let mut anchor = object.anchor;
     let mut changed = false;
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
-    let mut break_wall = false;
+    let mut break_bricks = false;
 
     egui::CollapsingHeader::new("Transform")
         .default_open(true)
@@ -2281,7 +2373,8 @@ fn properties(
         egui::CollapsingHeader::new(header)
             .default_open(true)
             .show(ui, |ui| {
-                changed |= primitive_params(ui, &mut primitive);
+                changed |=
+                    primitive_params(ui, &mut primitive, !object.floor_outline.is_empty());
                 if !primitive.is_light() {
                     changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
                 }
@@ -2298,18 +2391,23 @@ fn properties(
             if cut_changed {
                 edited_cutouts = Some(cutouts);
             }
-            if ui
-                .button("Break into bricks")
-                .on_hover_text(
-                    "Replace this wall with individual dynamic bricks (running \
-                     bond, openings kept). They collide and can tumble when the \
-                     simulation plays (Space)",
-                )
-                .clicked()
-            {
-                break_wall = true;
-            }
         }
+    }
+    // any solid object can shatter; lights and empties have no volume
+    let breakable = !object.primitive.is_light()
+        && !matches!(object.primitive, Primitive::Empty { .. });
+    if breakable
+        && ui
+            .button("Break into bricks")
+            .on_hover_text(
+                "Replace this object with individual dynamic bricks (running \
+                 bond; walls keep their openings, curved shapes get a stepped \
+                 approximation). They collide and can tumble when the \
+                 simulation plays (Space)",
+            )
+            .clicked()
+    {
+        break_bricks = true;
     }
 
     egui::CollapsingHeader::new("Adornments")
@@ -2384,14 +2482,12 @@ fn properties(
             object.mesh_revision += 1;
         }
     }
-    if break_wall {
-        if let Some(bricks) = object_ops::break_wall_into_bricks(scene, active_id) {
+    if break_bricks {
+        if let Some(bricks) = object_ops::break_into_bricks(scene, active_id) {
             let count = bricks.len();
             let active = bricks.first().copied();
             selection.set(bricks, active);
-            return Some(format!(
-                "wall broken into {count} bricks — Space simulates"
-            ));
+            return Some(format!("broken into {count} bricks — Space simulates"));
         }
     }
     None
@@ -2442,7 +2538,7 @@ fn float_row(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64) -> boo
     .inner
 }
 
-fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
+fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive, shaped: bool) -> bool {
     let mut changed = false;
     match primitive {
         Primitive::Plane { size } | Primitive::Cube { size } => {
@@ -2482,6 +2578,22 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
         Primitive::Wall { length, height, thickness } => {
             changed |= float_row(ui, "Length", length, 0.02);
             changed |= float_row(ui, "Height", height, 0.02);
+            changed |= float_row(ui, "Thickness", thickness, 0.005);
+        }
+        Primitive::Floor { width, depth, thickness } => {
+            if shaped {
+                ui.label(
+                    egui::RichText::new(
+                        "Footprint follows the walls it was created from \
+                         (scale with S).",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            } else {
+                changed |= float_row(ui, "Width", width, 0.02);
+                changed |= float_row(ui, "Depth", depth, 0.02);
+            }
             changed |= float_row(ui, "Thickness", thickness, 0.005);
         }
         Primitive::Empty { size } => {
