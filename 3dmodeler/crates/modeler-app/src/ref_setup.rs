@@ -311,11 +311,17 @@ impl RefSetupDialog {
         scene: &mut Scene,
         settings: &Settings,
     ) -> Option<String> {
+        // poll before the open-check: files dropped from the OS onto the
+        // window arrive here too, and should open the dialog by themselves
+        let arrived = ref_image::poll_setup_images();
+        if !arrived.is_empty() {
+            self.open = true;
+        }
+        for (name, bytes) in arrived {
+            self.add_image(name, bytes);
+        }
         if !self.open {
             return None;
-        }
-        for (name, bytes) in ref_image::poll_setup_images() {
-            self.add_image(name, bytes);
         }
 
         let unit = settings.unit;
@@ -336,8 +342,9 @@ impl RefSetupDialog {
                     }
                     ui.label(
                         egui::RichText::new(
-                            "Load your drawing set, then drag each picture onto the view it shows \
-                             (or click a picture, then a slot).",
+                            "Load your drawing set — or drop image files straight from your file \
+                             manager — then drag each picture onto the view it shows (or click a \
+                             picture, then a slot).",
                         )
                         .weak(),
                     );

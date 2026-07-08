@@ -172,6 +172,27 @@ pub fn request_setup_images() {
     onchange.forget();
 }
 
+/// A file dropped onto the window from the OS (file manager drag): feed it
+/// to the reference setup dialog's tray. Non-image files are ignored.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn push_setup_file(path: &std::path::Path) {
+    let is_image = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
+    if !is_image {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Image".into());
+    if let Ok(mut pending) = PENDING_SETUP.lock() {
+        pending.push((name, bytes));
+    }
+}
+
 /// Build a `ReferenceImage` from raw file bytes: validates/decodes the image
 /// for its aspect ratio and places it upright on the front (Y) plane.
 pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, String> {

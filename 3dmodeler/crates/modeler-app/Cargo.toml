@@ -1,6 +1,6 @@
 [package]
 name = "modeler-app"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2021"
 description = "3D modeler application: viewport, tools, UI (native + browser)"
 
@@ -14,6 +14,7 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+winit = "0.28" # same version as three-d's (we own the event loop for OS file drops)
 tiny_http = "0.12"
 png = "0.17"
 rfd = "0.15"

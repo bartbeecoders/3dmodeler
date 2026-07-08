@@ -83,11 +83,35 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
+    // Native: own the winit window and event loop instead of using
+    // three_d::Window::render_loop — three-d does not forward OS file-drop
+    // events, and the reference setup dialog accepts drops from the file
+    // manager. The loop below replicates render_loop's behavior exactly,
+    // plus WindowEvent::DroppedFile.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (event_loop, winit_window, gl) = {
+        let event_loop = winit::event_loop::EventLoop::new();
+        let winit_window = winit::window::WindowBuilder::new()
+            .with_title("3D Modeler")
+            .with_min_inner_size(winit::dpi::LogicalSize::new(2.0, 2.0))
+            .with_maximized(true)
+            .build(&event_loop)
+            .unwrap();
+        winit_window.focus_window();
+        let gl = WindowedContext::from_winit_window(&winit_window, SurfaceSettings::default())
+            .unwrap();
+        (event_loop, winit_window, gl)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let context: Context = (*gl).clone();
+
+    #[cfg(target_arch = "wasm32")]
     let window = Window::new(WindowSettings {
         title: "3D Modeler".to_string(),
         ..Default::default()
     })
     .unwrap();
+    #[cfg(target_arch = "wasm32")]
     let context = window.gl();
 
     let mut camera = BlenderCamera::new();
@@ -142,7 +166,9 @@ pub fn main() {
     let mut gui = three_d::GUI::new(&context);
     let mut egui_kb_last_frame = false;
 
-    window.render_loop(move |mut frame_input| {
+    // `mut` is used by the native loop below; render_loop takes it by value
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut on_frame = move |mut frame_input: FrameInput| -> FrameOutput {
         edit_mode.sync(&mut scene);
         // claim Tab for edit mode BEFORE egui grabs it for widget-focus
         // traversal; when a text field had focus last frame, egui keeps it
@@ -904,5 +930,50 @@ pub fn main() {
         }
 
         FrameOutput::default()
-    });
+    };
+
+    #[cfg(target_arch = "wasm32")]
+    window.render_loop(on_frame);
+
+    // native main loop: three_d::Window::render_loop plus OS file drops
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use winit::event::{Event as WinitEvent, WindowEvent};
+        use winit::event_loop::ControlFlow;
+
+        let mut frame_input_generator = FrameInputGenerator::from_winit_window(&winit_window);
+        event_loop.run(move |event, _, control_flow| match event {
+            WinitEvent::MainEventsCleared => winit_window.request_redraw(),
+            WinitEvent::RedrawRequested(_) => {
+                let frame_input = frame_input_generator.generate(&gl);
+                let frame_output = on_frame(frame_input);
+                if frame_output.exit {
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    if frame_output.swap_buffers {
+                        gl.swap_buffers().unwrap();
+                    }
+                    if frame_output.wait_next_event {
+                        *control_flow = ControlFlow::Wait;
+                    } else {
+                        *control_flow = ControlFlow::Poll;
+                        winit_window.request_redraw();
+                    }
+                }
+            }
+            WinitEvent::WindowEvent { ref event, .. } => {
+                frame_input_generator.handle_winit_window_event(event);
+                match event {
+                    WindowEvent::Resized(physical_size) => gl.resize(*physical_size),
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        gl.resize(**new_inner_size)
+                    }
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::DroppedFile(path) => ref_image::push_setup_file(path),
+                    _ => (),
+                }
+            }
+            _ => (),
+        });
+    }
 }
