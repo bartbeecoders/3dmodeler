@@ -22,9 +22,11 @@ enum PieItem {
 
 /// Slot order around the wheel, starting north and going clockwise.
 /// Cube sits on top — it is used the most.
-fn pie_items() -> [(PieItem, &'static str); 9] {
+fn pie_items() -> [(PieItem, &'static str); 10] {
     // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
     let c = Primitive::catalog();
+    // point light; other kinds via the properties panel or the Add menu
+    let light = Primitive::light_catalog()[0];
     [
         (PieItem::Primitive(c[1]), "Cube"),
         (PieItem::Primitive(c[2]), "UV Sphere"),
@@ -33,6 +35,7 @@ fn pie_items() -> [(PieItem, &'static str); 9] {
         (PieItem::Primitive(c[4]), "Cylinder"),
         (PieItem::Primitive(c[6]), "Torus"),
         (PieItem::Primitive(c[0]), "Plane"),
+        (PieItem::Primitive(light), "Light"),
         (PieItem::Primitive(c[7]), "Empty"),
         (PieItem::Wall, "Wall"),
     ]

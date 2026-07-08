@@ -87,6 +87,32 @@ impl Transform {
     }
 }
 
+/// Kinds of light sources (Add ▸ Light). Position and orientation come from
+/// the object transform; Sun and Spot shine along the object's local -Z axis
+/// (Blender's convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LightKind {
+    /// Shines in all directions from a point; intensity falls off with
+    /// distance.
+    Point,
+    /// Parallel rays from infinitely far away (direction only, no falloff).
+    Sun,
+    /// A cone of light along -Z with an adjustable angle.
+    Spot,
+}
+
+impl LightKind {
+    pub const ALL: [LightKind; 3] = [LightKind::Point, LightKind::Sun, LightKind::Spot];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LightKind::Point => "Point",
+            LightKind::Sun => "Sun",
+            LightKind::Spot => "Spot",
+        }
+    }
+}
+
 /// Primitive shapes with their creation parameters. Defaults match Blender's
 /// Add > Mesh entries.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -106,6 +132,17 @@ pub enum Primitive {
     /// crossing at the origin, ±`size` long. A marker / grouping parent —
     /// it never collides or simulates.
     Empty { size: f32 },
+    /// Light source. The mesh is only a viewport gizmo (emissive, pickable);
+    /// like `Empty` it never collides or simulates. `spot_angle_deg` is the
+    /// full cone angle, used by `LightKind::Spot` only; `shadows` applies to
+    /// Sun and Spot (point lights cannot cast shadows in the renderer).
+    Light {
+        kind: LightKind,
+        color: [f32; 3],
+        intensity: f32,
+        spot_angle_deg: f32,
+        shadows: bool,
+    },
 }
 
 impl Primitive {
@@ -123,6 +160,26 @@ impl Primitive {
         ]
     }
 
+    /// The three light kinds with sensible defaults, in Add-menu order.
+    pub fn light_catalog() -> [Primitive; 3] {
+        let light = |kind, intensity| Primitive::Light {
+            kind,
+            color: [1.0, 1.0, 1.0],
+            intensity,
+            spot_angle_deg: 45.0,
+            shadows: true,
+        };
+        [
+            light(LightKind::Point, 3.0),
+            light(LightKind::Sun, 1.5),
+            light(LightKind::Spot, 5.0),
+        ]
+    }
+
+    pub fn is_light(&self) -> bool {
+        matches!(self, Primitive::Light { .. })
+    }
+
     /// Base object name, matching Blender's naming.
     pub fn base_name(&self) -> &'static str {
         match self {
@@ -135,6 +192,7 @@ impl Primitive {
             Primitive::Torus { .. } => "Torus",
             Primitive::Wall { .. } => "Wall",
             Primitive::Empty { .. } => "Empty",
+            Primitive::Light { kind, .. } => kind.label(),
         }
     }
 
@@ -156,6 +214,15 @@ impl Primitive {
                 (length * length + 0.25 * thickness * thickness + height * height).sqrt()
             }
             Primitive::Empty { size } => size,
+            // + 0.01: spoke corners stick out past the nominal extents
+            Primitive::Light { kind, spot_angle_deg, .. } => match kind {
+                LightKind::Point => mesh::POINT_GIZMO_EXTENT + 0.01,
+                LightKind::Sun => mesh::SUN_GIZMO_EXTENT + 0.01,
+                LightKind::Spot => {
+                    let r = mesh::spot_gizmo_radius(spot_angle_deg);
+                    (mesh::SPOT_GIZMO_LENGTH * mesh::SPOT_GIZMO_LENGTH + r * r).sqrt() + 0.01
+                }
+            },
         }
     }
 
@@ -182,6 +249,14 @@ impl Primitive {
                 Vec3::new(length, thickness, height)
             }
             Primitive::Empty { size } => Vec3::splat(2.0 * size),
+            Primitive::Light { kind, spot_angle_deg, .. } => match kind {
+                LightKind::Point => Vec3::splat(2.0 * mesh::POINT_GIZMO_EXTENT),
+                LightKind::Sun => Vec3::new(0.9, 0.9, mesh::SUN_GIZMO_EXTENT + 0.45),
+                LightKind::Spot => {
+                    let r = mesh::spot_gizmo_radius(spot_angle_deg);
+                    Vec3::new(2.0 * r, 2.0 * r, mesh::SPOT_GIZMO_LENGTH)
+                }
+            },
         }
     }
 
@@ -195,11 +270,20 @@ impl Primitive {
             Primitive::Torus { minor_radius, .. } => minor_radius,
             Primitive::Wall { .. } => 0.0, // stands on its own floor line
             Primitive::Empty { size } => size,
+            Primitive::Light { kind, .. } => match kind {
+                LightKind::Point => mesh::POINT_GIZMO_EXTENT,
+                LightKind::Sun => mesh::SUN_GIZMO_EXTENT,
+                LightKind::Spot => mesh::SPOT_GIZMO_LENGTH,
+            },
         }
     }
 
     /// Generate the triangle mesh, flat- or smooth-shaded.
     pub fn generate(&self, smooth: bool) -> MeshData {
+        // light gizmos come with their own normals; the smooth flag is moot
+        if let Primitive::Light { kind, spot_angle_deg, .. } = *self {
+            return mesh::light_gizmo(kind, spot_angle_deg);
+        }
         let m = match *self {
             Primitive::Plane { size } => mesh::plane(size),
             Primitive::Cube { size } => mesh::cube(size),
@@ -217,6 +301,7 @@ impl Primitive {
                 mesh::wall(length, height, thickness, &[])
             }
             Primitive::Empty { size } => mesh::empty_axes(size),
+            Primitive::Light { .. } => unreachable!("handled above"),
         };
         if smooth {
             m
@@ -1192,6 +1277,51 @@ mod tests {
         scene.add_object(empty, Transform::default());
         let data = Scene::from_json(&scene.to_json()).unwrap();
         assert_eq!(data.objects[0].primitive, empty);
+    }
+
+    #[test]
+    fn lights_have_gizmos_and_survive_json() {
+        let mut scene = Scene::new();
+        for light in Primitive::light_catalog() {
+            scene.add_object(light, Transform::default());
+        }
+        let names: Vec<_> = scene.objects().iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Point", "Sun", "Spot"]);
+
+        // gizmos are real, pickable meshes with sane bounds
+        for object in scene.objects() {
+            assert!(object.primitive.is_light());
+            let mesh = object.render_mesh();
+            assert!(!mesh.indices.is_empty());
+            assert_eq!(mesh.positions.len(), mesh.normals.len());
+            let extent = mesh
+                .positions
+                .iter()
+                .map(|p| p.length())
+                .fold(0.0f32, f32::max);
+            assert!(
+                extent <= object.bounding_radius() + 1e-4,
+                "{}: {extent} > {}",
+                object.name,
+                object.bounding_radius()
+            );
+        }
+
+        // the spot cone widens with the angle
+        assert!(mesh::spot_gizmo_radius(90.0) > mesh::spot_gizmo_radius(30.0));
+
+        // parameters survive save/load
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.objects.len(), 3);
+        assert_eq!(data.objects[1].primitive, Primitive::light_catalog()[1]);
+        match data.objects[2].primitive {
+            Primitive::Light { kind, intensity, shadows, .. } => {
+                assert_eq!(kind, LightKind::Spot);
+                assert_eq!(intensity, 5.0);
+                assert!(shadows);
+            }
+            other => panic!("expected a spot light, got {other:?}"),
+        }
     }
 
     #[test]

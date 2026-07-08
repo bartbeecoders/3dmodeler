@@ -115,9 +115,14 @@ impl PhysicsMirror {
                 if !object.visible {
                     continue; // hidden objects are not pickable / simulated
                 }
-                // empties are markers: pickable while editing (static
-                // mirror), but never collide or simulate
-                if simulate && matches!(object.primitive, Primitive::Empty { .. }) {
+                // empties and lights are markers: pickable while editing
+                // (static mirror), but never collide or simulate
+                if simulate
+                    && matches!(
+                        object.primitive,
+                        Primitive::Empty { .. } | Primitive::Light { .. }
+                    )
+                {
                     continue;
                 }
                 let t = scene.world_transform(object.id);

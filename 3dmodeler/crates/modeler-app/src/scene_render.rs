@@ -7,7 +7,7 @@
 
 use crate::selection::Selection;
 use modeler_core::glam;
-use modeler_core::{MeshData, Material, ObjectId, Primitive, Scene, Transform};
+use modeler_core::{LightKind, MeshData, Material, ObjectId, Primitive, Scene, Transform};
 use std::collections::{HashMap, HashSet};
 use three_d::*;
 
@@ -20,6 +20,16 @@ pub enum ShadeMode {
     Solid,
     /// Full materials and lights (the default).
     Shaded,
+}
+
+/// What illuminates the Shaded viewport (Blender's "scene lights" toggle).
+/// Solid mode always uses the studio rig.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LightingMode {
+    /// Built-in studio rig (ambient + key + fill); scene lights ignored.
+    Studio,
+    /// The scene's light objects (with shadows) over a faint ambient.
+    Scene,
 }
 
 // Blender's outline colors: light orange for the active object, darker
@@ -62,27 +72,44 @@ pub fn transform_mat(t: &Transform) -> Mat4 {
         * Mat4::from_nonuniform_scale(t.scale.x, t.scale.y, t.scale.z)
 }
 
+fn srgb(c: [f32; 3], alpha: u8) -> Srgba {
+    Srgba::new(
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+        alpha,
+    )
+}
+
 fn physical_material(
     context: &Context,
     material: &Material,
+    primitive: &Primitive,
     mode: ShadeMode,
     xray: bool,
 ) -> PhysicalMaterial {
-    // Solid ignores the object material for a uniform studio look
-    let ([r, g, b], roughness, metallic) = match mode {
-        ShadeMode::Solid => ([0.72, 0.72, 0.75], 0.85, 0.0),
-        _ => (material.base_color, material.roughness, material.metallic),
-    };
-    let cpu = CpuMaterial {
-        albedo: Srgba::new(
-            (r * 255.0) as u8,
-            (g * 255.0) as u8,
-            (b * 255.0) as u8,
-            if xray { 110 } else { 255 },
-        ),
-        roughness,
-        metallic,
-        ..Default::default()
+    let alpha = if xray { 110 } else { 255 };
+    let cpu = if let Primitive::Light { color, .. } = primitive {
+        // light gizmos glow in their own color, in every shading mode
+        CpuMaterial {
+            albedo: Srgba::new(25, 25, 25, alpha),
+            emissive: srgb(*color, 255),
+            roughness: 1.0,
+            metallic: 0.0,
+            ..Default::default()
+        }
+    } else {
+        // Solid ignores the object material for a uniform studio look
+        let ([r, g, b], roughness, metallic) = match mode {
+            ShadeMode::Solid => ([0.72, 0.72, 0.75], 0.85, 0.0),
+            _ => (material.base_color, material.roughness, material.metallic),
+        };
+        CpuMaterial {
+            albedo: srgb([r, g, b], alpha),
+            roughness,
+            metallic,
+            ..Default::default()
+        }
     };
     if xray {
         // see-through: alpha blend both faces
@@ -146,7 +173,7 @@ impl SceneRender {
                 let cpu_mesh = to_cpu_mesh(&object.render_mesh());
                 let model = Gm::new(
                     Mesh::new(context, &cpu_mesh),
-                    physical_material(context, &object.material, mode, xray),
+                    physical_material(context, &object.material, &object.primitive, mode, xray),
                 );
                 self.cache.insert(
                     object.id,
@@ -168,7 +195,7 @@ impl SceneRender {
                 cached.mode = mode;
                 cached.xray = xray;
                 cached.model.material =
-                    physical_material(context, &object.material, mode, xray);
+                    physical_material(context, &object.material, &object.primitive, mode, xray);
             }
 
             let cached = self.cache.get_mut(&object.id).unwrap();
@@ -221,6 +248,148 @@ impl SceneRender {
         self.order
             .iter()
             .filter_map(|id| self.cache.get(id).and_then(|c| c.outline.as_ref().map(|(_, gm)| gm)))
+    }
+
+    /// Geometry for shadow maps: every visible model EXCEPT light gizmos —
+    /// a light sits inside its own gizmo mesh, which would shadow the whole
+    /// scene.
+    pub fn shadow_casters(&self) -> Vec<&Mesh> {
+        self.order
+            .iter()
+            .filter_map(|id| self.cache.get(id))
+            .filter(|c| !c.primitive.is_light())
+            .map(|c| &c.model.geometry)
+            .collect()
+    }
+}
+
+/// The lights illuminating the viewport: a fixed studio rig, plus three-d
+/// lights derived from the scene's light objects when the lighting mode asks
+/// for them. Scene lights (and their shadow maps) are rebuilt only when the
+/// scene changes.
+pub struct SceneLights {
+    ambient: AmbientLight,
+    key: DirectionalLight,
+    fill: DirectionalLight,
+    /// Faint base light so a scene without lights is not pitch black.
+    scene_ambient: AmbientLight,
+    suns: Vec<DirectionalLight>,
+    points: Vec<PointLight>,
+    spots: Vec<SpotLight>,
+    use_scene: bool,
+    synced: Option<(u64, u64, LightingMode, ShadeMode)>,
+}
+
+/// Distance falloff for point and spot lights (quadratic, gentle enough to
+/// light a room from a few meters away).
+const ATTENUATION: Attenuation = Attenuation { constant: 1.0, linear: 0.0, quadratic: 0.15 };
+const SHADOW_MAP_SIZE: u32 = 1024;
+
+impl SceneLights {
+    pub fn new(context: &Context) -> Self {
+        // Z-up studio rig: key light from above-left, cool fill from the
+        // opposite side.
+        Self {
+            ambient: AmbientLight::new(context, 0.35, Srgba::WHITE),
+            key: DirectionalLight::new(context, 1.4, Srgba::WHITE, vec3(-0.4, 0.35, -0.85)),
+            fill: DirectionalLight::new(
+                context,
+                0.5,
+                Srgba::new(180, 190, 210, 255),
+                vec3(0.6, -0.5, -0.2),
+            ),
+            scene_ambient: AmbientLight::new(context, 0.06, Srgba::WHITE),
+            suns: Vec::new(),
+            points: Vec::new(),
+            spots: Vec::new(),
+            use_scene: false,
+            synced: None,
+        }
+    }
+
+    /// Rebuild the scene lights (and shadow maps) if the scene, shading or
+    /// lighting mode changed. Call AFTER `SceneRender::sync` — shadow maps
+    /// render the current models.
+    pub fn sync(
+        &mut self,
+        context: &Context,
+        scene: &Scene,
+        render: &SceneRender,
+        shade: ShadeMode,
+        mode: LightingMode,
+    ) {
+        self.use_scene = shade == ShadeMode::Shaded && mode == LightingMode::Scene;
+        let key = (scene.instance(), scene.version(), mode, shade);
+        if self.synced == Some(key) {
+            return;
+        }
+        self.synced = Some(key);
+        self.suns.clear();
+        self.points.clear();
+        self.spots.clear();
+        if !self.use_scene {
+            return;
+        }
+
+        let casters = render.shadow_casters();
+        for object in scene.objects() {
+            let Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } =
+                object.primitive
+            else {
+                continue;
+            };
+            if !object.visible {
+                continue;
+            }
+            let world = scene.world_transform(object.id);
+            let position = vec3(world.location.x, world.location.y, world.location.z);
+            let dir = world.rotation * glam::Vec3::NEG_Z;
+            let direction = vec3(dir.x, dir.y, dir.z);
+            let color = srgb(color, 255);
+            match kind {
+                LightKind::Sun => {
+                    let mut light = DirectionalLight::new(context, intensity, color, direction);
+                    if shadows {
+                        let _ = light.generate_shadow_map(SHADOW_MAP_SIZE, casters.clone());
+                    }
+                    self.suns.push(light);
+                }
+                LightKind::Point => {
+                    // three-d point lights cannot cast shadows
+                    self.points.push(PointLight::new(
+                        context, intensity, color, position, ATTENUATION,
+                    ));
+                }
+                LightKind::Spot => {
+                    let mut light = SpotLight::new(
+                        context,
+                        intensity,
+                        color,
+                        position,
+                        direction,
+                        degrees(0.5 * spot_angle_deg.clamp(1.0, 160.0)),
+                        ATTENUATION,
+                    );
+                    if shadows {
+                        let _ = light.generate_shadow_map(SHADOW_MAP_SIZE, casters.clone());
+                    }
+                    self.spots.push(light);
+                }
+            }
+        }
+    }
+
+    /// The lights to pass to the render call this frame.
+    pub fn active(&self) -> Vec<&dyn Light> {
+        if self.use_scene {
+            let mut lights: Vec<&dyn Light> = vec![&self.scene_ambient];
+            lights.extend(self.suns.iter().map(|l| l as &dyn Light));
+            lights.extend(self.points.iter().map(|l| l as &dyn Light));
+            lights.extend(self.spots.iter().map(|l| l as &dyn Light));
+            lights
+        } else {
+            vec![&self.ambient, &self.key, &self.fill]
+        }
     }
 }
 

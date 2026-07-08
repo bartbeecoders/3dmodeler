@@ -114,6 +114,7 @@ pub fn main() {
     let mut snap_to_grid = false;
     let mut snap_to_vertex = false;
     let mut shade_mode = scene_render::ShadeMode::Shaded;
+    let mut lighting_mode = scene_render::LightingMode::Studio;
     let mut xray = false;
     let mut wire_cache = scene_render::WireframeCache::new();
     let mut grid_built =
@@ -130,15 +131,8 @@ pub fn main() {
         settings.grid_major_color,
     );
 
-    // Z-up lighting: key light from above-left, cool fill from the opposite side.
-    let ambient = AmbientLight::new(&context, 0.35, Srgba::WHITE);
-    let key = DirectionalLight::new(&context, 1.4, Srgba::WHITE, vec3(-0.4, 0.35, -0.85));
-    let fill = DirectionalLight::new(
-        &context,
-        0.5,
-        Srgba::new(180, 190, 210, 255),
-        vec3(0.6, -0.5, -0.2),
-    );
+    // studio rig + scene lights, switched by the lighting mode
+    let mut lights = scene_render::SceneLights::new(&context);
 
     let mut gui = three_d::GUI::new(&context);
     let mut egui_kb_last_frame = false;
@@ -198,6 +192,7 @@ pub fn main() {
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
+                    &mut lighting_mode,
                     &mut xray,
                     &modal_status,
                     fps,
@@ -709,7 +704,14 @@ pub fn main() {
         // external control API (MCP): execute queued agent commands
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(control) = control.as_mut() {
-            control.poll(&mut scene, &mut sel, &mut physics, &mut library);
+            control.poll(
+                &mut scene,
+                &mut sel,
+                &mut physics,
+                &mut library,
+                &mut shade_mode,
+                &mut lighting_mode,
+            );
         }
 
         // step the simulation (writes transforms back into the scene)
@@ -839,6 +841,7 @@ pub fn main() {
         }
 
         scene_render.sync(&scene, &sel, &overlaps, &context, shade_mode, xray);
+        lights.sync(&context, &scene, &scene_render, shade_mode, lighting_mode);
         ref_render.sync(&scene, &context);
 
         let cam = camera.camera(frame_input.viewport);
@@ -854,7 +857,7 @@ pub fn main() {
         frame_input
             .screen()
             .clear(ClearState::color_and_depth(bg[0], bg[1], bg[2], 1.0, 1.0))
-            .render(&cam, render_objects, &[&ambient, &key, &fill])
+            .render(&cam, render_objects, &lights.active())
             .write(|| gui.render())
             .unwrap();
 

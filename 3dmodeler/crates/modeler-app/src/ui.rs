@@ -14,7 +14,7 @@ use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
 use crate::ref_image::{self, CalibrateTool};
-use crate::scene_render::ShadeMode;
+use crate::scene_render::{LightingMode, ShadeMode};
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use crate::theme::{self, Theme};
@@ -158,6 +158,7 @@ impl UiState {
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
+        lighting_mode: &mut LightingMode,
         xray: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
@@ -203,12 +204,12 @@ impl UiState {
         }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
-            wall_tool, snap_to_grid, shade_mode, xray,
+            wall_tool, snap_to_grid, shade_mode, lighting_mode, xray,
         );
         let top_offset = menu_offset
             + self.toolbar(
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
-                snap_to_vertex, shade_mode, xray,
+                snap_to_vertex, shade_mode, lighting_mode, xray,
             );
         let bottom_offset = self.status_bar(
             ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
@@ -261,6 +262,7 @@ impl UiState {
         wall_tool: &mut crate::wall_tool::WallTool,
         snap_to_grid: &mut bool,
         shade_mode: &mut ShadeMode,
+        lighting_mode: &mut LightingMode,
         xray: &mut bool,
     ) -> f32 {
         let mut bar_height = 24.0;
@@ -327,7 +329,7 @@ impl UiState {
                                 ),
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
-                                    shade_mode, xray,
+                                    shade_mode, lighting_mode, xray,
                                 ),
                                 Menu::Help => {
                                     let mut close = false;
@@ -368,6 +370,7 @@ impl UiState {
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
+        lighting_mode: &mut LightingMode,
         xray: &mut bool,
     ) -> f32 {
         #[allow(deprecated)]
@@ -481,6 +484,30 @@ impl UiState {
                     "X-ray",
                     "X-ray: see through objects (solid and shaded modes)",
                 );
+                // lighting mode (shaded only): studio rig or scene lights
+                if *shade_mode == ShadeMode::Shaded {
+                    for (mode, label, tip) in [
+                        (
+                            LightingMode::Studio,
+                            "Studio",
+                            "Studio lighting: built-in key + fill rig, scene lights ignored",
+                        ),
+                        (
+                            LightingMode::Scene,
+                            "Lights",
+                            "Scene lights: the scene's light objects illuminate the \
+                             viewport, with shadows (Add ▸ Light)",
+                        ),
+                    ] {
+                        if ui
+                            .selectable_label(*lighting_mode == mode, label)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            *lighting_mode = mode;
+                        }
+                    }
+                }
                 ui.separator();
 
                 // simulation controls
@@ -1462,6 +1489,22 @@ fn add_menu_items(
         return true;
     }
     ui.separator();
+    // lights (Blender's Add ▸ Light)
+    for (light, tip) in Primitive::light_catalog().iter().zip([
+        "Point light: shines in all directions, falls off with distance",
+        "Sun: parallel light from infinitely far away — rotate to aim (-Z)",
+        "Spot: a cone of light along -Z with an adjustable angle",
+    ]) {
+        let label = format!("{} Light", light.base_name());
+        if crate::pie::icon_menu_button(ui, &crate::pie::primitive_icon(light), &label)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            scene.add_object(*light, Transform::default());
+            return true;
+        }
+    }
+    ui.separator();
     if ui
         .button("Reference Image…")
         .on_hover_text("Place a PNG/JPEG on an axis plane as a modeling reference")
@@ -1727,6 +1770,7 @@ fn view_menu(
     settings: &mut Settings,
     snap_to_grid: &mut bool,
     shade_mode: &mut ShadeMode,
+    lighting_mode: &mut LightingMode,
     xray: &mut bool,
 ) -> bool {
     let mut close = false;
@@ -1743,6 +1787,21 @@ fn view_menu(
         }
     });
     ui.checkbox(xray, "X-ray");
+    ui.label(egui::RichText::new("Lighting (shaded)").weak().size(11.0));
+    ui.horizontal(|ui| {
+        for (mode, label) in [
+            (LightingMode::Studio, "Studio"),
+            (LightingMode::Scene, "Scene lights"),
+        ] {
+            if ui
+                .selectable_label(*lighting_mode == mode, label)
+                .clicked()
+            {
+                *lighting_mode = mode;
+                *shade_mode = ShadeMode::Shaded;
+            }
+        }
+    });
     ui.separator();
     ui.label(egui::RichText::new("Color theme").weak().size(11.0));
     ui.horizontal(|ui| {
@@ -2146,11 +2205,14 @@ fn properties(
                     .clicked();
             });
     } else {
-        egui::CollapsingHeader::new("Primitive")
+        let header = if primitive.is_light() { "Light" } else { "Primitive" };
+        egui::CollapsingHeader::new(header)
             .default_open(true)
             .show(ui, |ui| {
                 changed |= primitive_params(ui, &mut primitive);
-                changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+                if !primitive.is_light() {
+                    changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+                }
             });
         // wall openings (doors & windows) — cutout edits regenerate the mesh
         if let Primitive::Wall { length, height, .. } = primitive {
@@ -2190,36 +2252,39 @@ fn properties(
                 .changed();
         });
 
-    egui::CollapsingHeader::new("Physics")
-        .default_open(true)
-        .show(ui, |ui| {
-            let mut dynamic = object.dynamic;
-            let mut density = object.density;
-            if ui
-                .checkbox(&mut dynamic, "Dynamic")
-                .on_hover_text("Falls and collides during simulation (▶)")
-                .changed()
-            {
-                changed = true;
-            }
-            ui.add_enabled_ui(dynamic, |ui| {
-                if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
+    // lights neither simulate nor have a surface material
+    if !primitive.is_light() {
+        egui::CollapsingHeader::new("Physics")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut dynamic = object.dynamic;
+                let mut density = object.density;
+                if ui
+                    .checkbox(&mut dynamic, "Dynamic")
+                    .on_hover_text("Falls and collides during simulation (▶)")
+                    .changed()
+                {
                     changed = true;
                 }
+                ui.add_enabled_ui(dynamic, |ui| {
+                    if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
+                        changed = true;
+                    }
+                });
+                phys = (dynamic, density);
             });
-            phys = (dynamic, density);
-        });
 
-    egui::CollapsingHeader::new("Material")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Base color");
-                changed |= ui.color_edit_button_rgb(&mut material.base_color).changed();
+        egui::CollapsingHeader::new("Material")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Base color");
+                    changed |= ui.color_edit_button_rgb(&mut material.base_color).changed();
+                });
+                changed |= slider_row(ui, "Roughness", &mut material.roughness, 0.0..=1.0);
+                changed |= slider_row(ui, "Metallic", &mut material.metallic, 0.0..=1.0);
             });
-            changed |= slider_row(ui, "Roughness", &mut material.roughness, 0.0..=1.0);
-            changed |= slider_row(ui, "Metallic", &mut material.metallic, 0.0..=1.0);
-        });
+    }
 
     if changed {
         if let Some(object) = scene.object_mut(active_id) {
@@ -2352,6 +2417,45 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive) -> bool {
             ui.label(
                 egui::RichText::new(
                     "A marker / grouping parent — never collides or simulates.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } => {
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                for k in modeler_core::LightKind::ALL {
+                    if ui.selectable_label(*kind == k, k.label()).clicked() && *kind != k {
+                        *kind = k;
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                changed |= ui.color_edit_button_rgb(color).changed();
+            });
+            changed |= slider_row(ui, "Intensity", intensity, 0.0..=20.0);
+            if *kind == modeler_core::LightKind::Spot {
+                changed |= slider_row(ui, "Spot angle °", spot_angle_deg, 5.0..=160.0);
+            }
+            match kind {
+                modeler_core::LightKind::Point => {
+                    ui.label(
+                        egui::RichText::new("Point lights cannot cast shadows.")
+                            .weak()
+                            .size(11.0),
+                    );
+                }
+                _ => {
+                    changed |= ui.checkbox(shadows, "Cast shadows").changed();
+                }
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Sun and Spot shine along the object's -Z axis (rotate to \
+                     aim). Lights show in Shaded mode with Scene lighting.",
                 )
                 .weak()
                 .size(11.0),

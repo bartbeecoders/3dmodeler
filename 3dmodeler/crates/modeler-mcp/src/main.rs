@@ -57,12 +57,26 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
-            "name": "add_object",
-            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts.",
+            "name": "set_view",
+            "description": "Switch the viewport shading and lighting before a screenshot. Shading: wireframe (edges only), solid (neutral gray studio), shaded (full materials — the default). Lighting applies to shaded: studio (built-in rig) or scene (the scene's light objects, with shadows).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "empty"]},
+                    "shading": {"type": "string", "enum": ["wireframe", "solid", "shaded"]},
+                    "lighting": {"type": "string", "enum": ["studio", "scene"]}
+                }
+            }
+        },
+        {
+            "name": "add_object",
+            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (viewport Shaded mode with Scene lighting): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "empty", "light", "sun", "spot"]},
+                    "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
+                    "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
+                    "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
                     "length": {"type": "number", "description": "Wall only: length in meters (default 2)"},
                     "height": {"type": "number", "description": "Wall only: height in meters (default 2.5)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
@@ -109,7 +123,11 @@ fn tool_definitions() -> Value {
                     "location": {"type": "array", "items": {"type": "number"}},
                     "rotation_euler_deg": {"type": "array", "items": {"type": "number"}},
                     "scale": {"type": "array", "items": {"type": "number"}},
-                    "color": {"type": "array", "items": {"type": "number"}},
+                    "color": {"type": "array", "items": {"type": "number"}, "description": "[r, g, b] 0..1; on lights this sets the light color"},
+                    "light_kind": {"type": "string", "enum": ["point", "sun", "spot"], "description": "Lights only: change the light kind"},
+                    "intensity": {"type": "number", "description": "Lights only: brightness multiplier"},
+                    "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees"},
+                    "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows"},
                     "smooth": {"type": "boolean"},
                     "visible": {"type": "boolean"},
                     "dynamic": {"type": "boolean"},
@@ -334,7 +352,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
         "add_object" | "update_object" | "delete_object" | "set_parent" | "attach_object"
-        | "group_objects" | "ungroup_object" | "add_measurement" | "simulate"
+        | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"
         | "add_reference_image" | "update_reference_image" | "delete_reference_image"
         | "calibrate_reference_image" | "create_library_object" | "update_library_object"
         | "delete_library_object" | "place_library_object" => {

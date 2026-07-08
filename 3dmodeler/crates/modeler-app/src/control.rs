@@ -89,12 +89,15 @@ impl ControlServer {
     }
 
     /// Execute queued commands. Call once per frame from the render loop.
+    #[allow(clippy::too_many_arguments)]
     pub fn poll(
         &mut self,
         scene: &mut Scene,
         selection: &mut Selection,
         physics: &mut PhysicsMirror,
         library_doc: &mut Library,
+        shade_mode: &mut crate::scene_render::ShadeMode,
+        lighting_mode: &mut crate::scene_render::LightingMode,
     ) {
         while let Ok((command, reply)) = self.requests.try_recv() {
             self.commands_handled += 1;
@@ -103,10 +106,52 @@ impl ControlServer {
                 self.pending_screenshots.push(reply);
                 continue;
             }
+            // viewport view state lives in the render loop, not the scene
+            if command["cmd"] == "set_view" {
+                let _ = reply.send(set_view(&command, shade_mode, lighting_mode));
+                continue;
+            }
             let response = execute(&command, scene, selection, physics, library_doc);
             let _ = reply.send(response);
         }
     }
+}
+
+/// Switch the viewport shading / lighting mode (poll-only, like screenshot:
+/// the state lives in the render loop). Fields are optional; the response
+/// reports the resulting view.
+fn set_view(
+    command: &Value,
+    shade_mode: &mut crate::scene_render::ShadeMode,
+    lighting_mode: &mut crate::scene_render::LightingMode,
+) -> Value {
+    use crate::scene_render::{LightingMode, ShadeMode};
+    if let Some(s) = command.get("shading").and_then(Value::as_str) {
+        *shade_mode = match s.to_ascii_lowercase().as_str() {
+            "wireframe" => ShadeMode::Wireframe,
+            "solid" => ShadeMode::Solid,
+            "shaded" => ShadeMode::Shaded,
+            other => {
+                return json!({"ok": false,
+                    "error": format!("unknown shading '{other}' (wireframe|solid|shaded)")});
+            }
+        };
+    }
+    if let Some(s) = command.get("lighting").and_then(Value::as_str) {
+        *lighting_mode = match s.to_ascii_lowercase().as_str() {
+            "studio" => LightingMode::Studio,
+            "scene" | "scene_lights" => LightingMode::Scene,
+            other => {
+                return json!({"ok": false,
+                    "error": format!("unknown lighting '{other}' (studio|scene)")});
+            }
+        };
+    }
+    json!({
+        "ok": true,
+        "shading": format!("{shade_mode:?}").to_ascii_lowercase(),
+        "lighting": format!("{lighting_mode:?}").to_ascii_lowercase(),
+    })
 }
 
 /// Resolve an object reference: numeric id or (unique) name.
@@ -170,6 +215,17 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "show_dimensions": object.show_dimensions,
         "dimensions_m": [dims.x, dims.y, dims.z],
     });
+    if let modeler_core::Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } =
+        object.primitive
+    {
+        json["light"] = json!({
+            "kind": kind.label().to_ascii_lowercase(),
+            "color": color,
+            "intensity": intensity,
+            "spot_angle_deg": spot_angle_deg,
+            "shadows": shadows,
+        });
+    }
     if matches!(object.primitive, modeler_core::Primitive::Wall { .. }) {
         json["cutouts"] = object
             .cutouts
@@ -197,6 +253,9 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
         "torus" => Some(catalog[6]),
         "wall" => Some(Primitive::Wall { length: 2.0, height: 2.5, thickness: 0.2 }),
         "empty" => Some(catalog[7]),
+        "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
+        "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
+        "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
         _ => None,
     }
 }
@@ -277,7 +336,40 @@ fn apply_object_params(
     if let Some(anchor) = anchor {
         object.anchor = anchor?;
     }
-    if let Some(color) = color {
+    // light parameters (light objects only; "color" sets the LIGHT color)
+    if let Primitive::Light { kind, color: lcolor, intensity, spot_angle_deg, shadows } =
+        object.primitive
+    {
+        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+        let kind = match params.get("light_kind").and_then(Value::as_str) {
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "point" => modeler_core::LightKind::Point,
+                "sun" => modeler_core::LightKind::Sun,
+                "spot" => modeler_core::LightKind::Spot,
+                other => return Err(format!("unknown light_kind '{other}' (point|sun|spot)")),
+            },
+            None => kind,
+        };
+        let lcolor = match color {
+            Some(c) => {
+                let c = c?;
+                [c.x, c.y, c.z]
+            }
+            None => lcolor,
+        };
+        object.primitive = Primitive::Light {
+            kind,
+            color: lcolor,
+            intensity: get("intensity").unwrap_or(intensity).max(0.0),
+            spot_angle_deg: get("spot_angle_deg")
+                .unwrap_or(spot_angle_deg)
+                .clamp(1.0, 160.0),
+            shadows: params
+                .get("shadows")
+                .and_then(Value::as_bool)
+                .unwrap_or(shadows),
+        };
+    } else if let Some(color) = color {
         let c = color?;
         object.material.base_color = [c.x, c.y, c.z];
     }
@@ -562,7 +654,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|empty|light|sun|spot)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());
@@ -981,6 +1073,68 @@ mod tests {
         assert_eq!(response["ok"], false);
         let response = execute(
             &json!({"cmd": "add_reference_image", "data_base64": "bm90IGFuIGltYWdl"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn lights_via_control_api() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        // add an orange spot light aimed straight down from 3 m up
+        let response = execute(
+            &json!({
+                "cmd": "add_object", "primitive": "spot", "new_name": "Lamp",
+                "location": [0.0, 0.0, 3.0], "color": [1.0, 0.5, 0.2],
+                "intensity": 8.0, "spot_angle_deg": 60.0, "shadows": false
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let lamp = scene.objects().iter().find(|o| o.name == "Lamp").unwrap().id;
+        match scene.object(lamp).unwrap().primitive {
+            Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } => {
+                assert_eq!(kind, modeler_core::LightKind::Spot);
+                assert_eq!(color, [1.0, 0.5, 0.2]);
+                assert_eq!(intensity, 8.0);
+                assert_eq!(spot_angle_deg, 60.0);
+                assert!(!shadows);
+            }
+            other => panic!("expected a light, got {other:?}"),
+        }
+
+        // update: retype as a sun, tune it; the color is kept
+        let response = execute(
+            &json!({"cmd": "update_object", "object": "Lamp",
+                    "light_kind": "sun", "intensity": 2.0, "shadows": true}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["object"]["light"]["kind"], "sun");
+        match scene.object(lamp).unwrap().primitive {
+            Primitive::Light { kind, color, intensity, shadows, .. } => {
+                assert_eq!(kind, modeler_core::LightKind::Sun);
+                assert_eq!(color, [1.0, 0.5, 0.2]);
+                assert_eq!(intensity, 2.0);
+                assert!(shadows);
+            }
+            other => panic!("expected a light, got {other:?}"),
+        }
+
+        // bad kinds are rejected
+        let response = execute(
+            &json!({"cmd": "update_object", "object": "Lamp", "light_kind": "laser"}),
             &mut scene,
             &mut sel,
             &mut physics,

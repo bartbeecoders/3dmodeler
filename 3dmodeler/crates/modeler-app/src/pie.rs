@@ -25,6 +25,9 @@ pub enum PieIcon {
     Plane,
     Wall,
     Empty,
+    LightPoint,
+    LightSun,
+    LightSpot,
     // actions (line-art)
     Duplicate,
     Anchor,
@@ -47,6 +50,11 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Torus { .. } => PieIcon::Torus,
         P::Wall { .. } => PieIcon::Wall,
         P::Empty { .. } => PieIcon::Empty,
+        P::Light { kind, .. } => match kind {
+            modeler_core::LightKind::Point => PieIcon::LightPoint,
+            modeler_core::LightKind::Sun => PieIcon::LightSun,
+            modeler_core::LightKind::Spot => PieIcon::LightSpot,
+        },
     }
 }
 
@@ -342,6 +350,42 @@ fn draw_icon(
             painter.line_segment([p(0.0, -1.0), p(0.0, 1.0)], stroke);
             painter.line_segment([p(-0.65, 0.65), p(0.65, -0.65)], stroke);
             painter.circle_filled(c, 0.14 * s, stroke.color);
+        }
+        // Point light: bulb circle with diagonal rays
+        PieIcon::LightPoint => {
+            painter.circle_stroke(c, 0.45 * s, stroke);
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                painter.line_segment(
+                    [p(0.6 * dx, 0.6 * dy), p(dx, dy)],
+                    stroke,
+                );
+            }
+            for (dx, dy) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                painter.line_segment(
+                    [p(0.45 * dx, 0.45 * dy), p(0.75 * dx, 0.75 * dy)],
+                    stroke,
+                );
+            }
+        }
+        // Sun: circle with a direction arrow downward
+        PieIcon::LightSun => {
+            painter.circle_stroke(p(0.0, -0.25), 0.4 * s, stroke);
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.7, -0.7), (-0.7, -0.7), (0.0, -1.0)] {
+                painter.line_segment(
+                    [p(0.55 * dx, -0.25 + 0.55 * dy), p(0.9 * dx, -0.25 + 0.9 * dy)],
+                    stroke,
+                );
+            }
+            painter.line_segment([p(0.0, 0.25), p(0.0, 1.0)], stroke);
+            painter.line_segment([p(-0.2, 0.75), p(0.0, 1.0)], stroke);
+            painter.line_segment([p(0.2, 0.75), p(0.0, 1.0)], stroke);
+        }
+        // Spot: lamp head with a light cone opening downward
+        PieIcon::LightSpot => {
+            painter.circle_filled(p(0.0, -0.75), 0.18 * s, stroke.color);
+            painter.line_segment([p(0.0, -0.75), p(-0.7, 0.8)], stroke);
+            painter.line_segment([p(0.0, -0.75), p(0.7, 0.8)], stroke);
+            painter.add(ellipse(p(0.0, 0.8), egui::vec2(0.7 * s, 0.22 * s)));
         }
         // Duplicate: two overlapping squares
         PieIcon::Duplicate => {

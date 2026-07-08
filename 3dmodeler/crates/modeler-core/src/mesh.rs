@@ -118,6 +118,101 @@ pub fn empty_axes(size: f32) -> MeshData {
     m
 }
 
+// Light gizmo geometry (viewport markers, meters). Spot cones grow with the
+// angle; the extents feed bounding radii / dimensions in lib.rs.
+pub const POINT_GIZMO_EXTENT: f32 = 0.38;
+pub const SUN_GIZMO_EXTENT: f32 = 0.85; // shaft reach along -Z
+pub const SPOT_GIZMO_LENGTH: f32 = 0.7;
+
+/// Base radius of the spot gizmo cone for a full cone angle in degrees.
+pub fn spot_gizmo_radius(spot_angle_deg: f32) -> f32 {
+    ((0.5 * spot_angle_deg.clamp(1.0, 160.0)).to_radians().tan() * SPOT_GIZMO_LENGTH)
+        .clamp(0.02, 4.0)
+}
+
+/// Light gizmo: an emissive viewport marker (bulb + rays / cone). Like the
+/// empty it is a regular pickable mesh; the renderer draws it emissive and
+/// excludes it from shadow casting. Sun and Spot point along local -Z.
+pub fn light_gizmo(kind: crate::LightKind, spot_angle_deg: f32) -> MeshData {
+    let mut m = MeshData::default();
+    let t = 0.015; // spoke half-thickness
+    match kind {
+        crate::LightKind::Point => {
+            append(&mut m, uv_sphere(16, 8, 0.12));
+            // six short rays leaving the bulb
+            axis_box(&mut m, Vec3::new(0.18, -t, -t), Vec3::new(0.38, t, t));
+            axis_box(&mut m, Vec3::new(-0.38, -t, -t), Vec3::new(-0.18, t, t));
+            axis_box(&mut m, Vec3::new(-t, 0.18, -t), Vec3::new(t, 0.38, t));
+            axis_box(&mut m, Vec3::new(-t, -0.38, -t), Vec3::new(t, -0.18, t));
+            axis_box(&mut m, Vec3::new(-t, -t, 0.18), Vec3::new(t, t, 0.38));
+            axis_box(&mut m, Vec3::new(-t, -t, -0.38), Vec3::new(t, t, -0.18));
+        }
+        crate::LightKind::Sun => {
+            append(&mut m, uv_sphere(16, 8, 0.15));
+            // rays sideways and up; a longer shaft marks the light direction
+            axis_box(&mut m, Vec3::new(0.22, -t, -t), Vec3::new(0.45, t, t));
+            axis_box(&mut m, Vec3::new(-0.45, -t, -t), Vec3::new(-0.22, t, t));
+            axis_box(&mut m, Vec3::new(-t, 0.22, -t), Vec3::new(t, 0.45, t));
+            axis_box(&mut m, Vec3::new(-t, -0.45, -t), Vec3::new(t, -0.22, t));
+            axis_box(&mut m, Vec3::new(-t, -t, 0.22), Vec3::new(t, t, 0.45));
+            let s = 0.025;
+            axis_box(
+                &mut m,
+                Vec3::new(-s, -s, -SUN_GIZMO_EXTENT),
+                Vec3::new(s, s, -0.2),
+            );
+        }
+        crate::LightKind::Spot => {
+            append(&mut m, uv_sphere(16, 8, 0.1));
+            // open cone: apex at the origin, spreading along -Z
+            let segments = 24;
+            let r = spot_gizmo_radius(spot_angle_deg);
+            let l = SPOT_GIZMO_LENGTH;
+            let apex = Vec3::ZERO;
+            let ring: Vec<Vec3> = (0..segments)
+                .map(|i| {
+                    let a = TAU * i as f32 / segments as f32;
+                    Vec3::new(r * a.cos(), r * a.sin(), -l)
+                })
+                .collect();
+            // per-face vertices so the cone stays flat-shaded like the rest
+            for i in 0..segments {
+                let p0 = ring[i];
+                let p1 = ring[(i + 1) % segments];
+                let n = (p0 - apex).cross(p1 - apex).normalize_or_zero();
+                let v = m.positions.len() as u32;
+                m.positions.extend_from_slice(&[apex, p0, p1]);
+                m.normals.extend_from_slice(&[n, n, n]);
+                m.indices.extend_from_slice(&[v, v + 1, v + 2]);
+            }
+            // base cap so the cone reads as a solid lamp head from below
+            let center = Vec3::new(0.0, 0.0, -l);
+            let down = -Vec3::Z;
+            let v0 = m.positions.len() as u32;
+            m.positions.push(center);
+            m.normals.push(down);
+            for p in &ring {
+                m.positions.push(*p);
+                m.normals.push(down);
+            }
+            for i in 0..segments as u32 {
+                let a = v0 + 1 + i;
+                let b = v0 + 1 + (i + 1) % segments as u32;
+                m.indices.extend_from_slice(&[v0, b, a]);
+            }
+        }
+    }
+    m
+}
+
+/// Append `other` onto `m`, remapping its indices.
+fn append(m: &mut MeshData, other: MeshData) {
+    let base = m.positions.len() as u32;
+    m.positions.extend(other.positions);
+    m.normals.extend(other.normals);
+    m.indices.extend(other.indices.iter().map(|i| i + base));
+}
+
 /// Axis-aligned box between `min` and `max` as six faces.
 fn axis_box(m: &mut MeshData, min: Vec3, max: Vec3) {
     let v = Vec3::new;

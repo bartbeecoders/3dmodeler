@@ -174,7 +174,8 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | --- | --- |
 | `get_scene` | Full scene dump: objects (name, id, primitive, local & world transforms, parent, pivot & anchor points, group flag, color, physics flags, dimensions in m), measurements, sim state |
 | `screenshot` | Renders the viewport and returns a PNG **image** — the agent's eyes |
-| `add_object` | Add `plane` / `cube` / `sphere` / `icosphere` / `cylinder` / `cone` / `torus` with optional name, location, rotation (Euler °), scale, color, physics & adornment flags |
+| `set_view` | Switch viewport shading (`wireframe` / `solid` / `shaded`) and lighting (`studio` rig, or `scene` = the scene's light objects with shadows) before a screenshot |
+| `add_object` | Add `plane` / `cube` / `sphere` / `icosphere` / `cylinder` / `cone` / `torus` / `wall` / `empty` — or a light: `light` (point), `sun`, `spot` (`color`, `intensity`, `spot_angle_deg`, `shadows`; sun & spot shine along local -Z, aim with the rotation) — with optional name, location, rotation (Euler °), scale, color, physics & adornment flags |
 | `update_object` | Change any of the above on an existing object (by name or id); `new_name` renames |
 | `delete_object` | Remove an object (children stay in place, unparented) |
 | `set_parent` | Link objects into a hierarchy (world placement preserved; cycles rejected); `parent: null` unparents |
