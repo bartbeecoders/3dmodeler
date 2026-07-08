@@ -136,4 +136,4 @@ By default, keep library objects as 1 group. So when the user drags a library ob
 When the user wants to edit a library object, it should be possible to break it down into its parts.
 
 
-Pressing the end key should place the selected object(s) on the ground (z = 0).
+Pressing the end key should place the selected object(s) on the ground (z = 0) or stack on the objects below it.

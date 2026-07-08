@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            binary: 3dmodeler/target/release/modeler-app
+          - name: windows
+            os: windows-latest
+            binary: 3dmodeler/target/release/modeler-app.exe
+          - name: macos
+            os: macos-latest
+            binary: 3dmodeler/target/release/modeler-app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build box3d (C library)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBOX3D_SAMPLES=OFF -DBOX3D_UNIT_TESTS=OFF -DBOX3D_BENCHMARKS=OFF
+          cmake --build build --config Release --parallel
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 3dmodeler
+
+      # bindgen needs libclang at build time.
+      - name: Point bindgen at libclang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Build modeler-app
+        working-directory: 3dmodeler
+        run: cargo build --release -p modeler-app
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: modeler-app-${{ matrix.name }}
+          path: ${{ matrix.binary }}

@@ -99,15 +99,22 @@ fn main() {
         println!("cargo:rustc-link-lib=static=c");
     } else {
         // Native: link the prebuilt library from the repo's cmake build.
-        let lib_dir = box3d_root.join("build/src");
-        if !lib_dir.join("libbox3d.a").exists() {
-            panic!(
-                "libbox3d.a not found in {}. Build box3d first (./build.sh in the repo root).",
-                lib_dir.display()
-            );
-        }
+        // Single-config generators put it in build/src, multi-config (MSVC)
+        // in build/src/<config>.
+        let base = box3d_root.join("build/src");
+        let lib_dir = [base.clone(), base.join("Release"), base.join("Debug")]
+            .into_iter()
+            .find(|d| d.join("libbox3d.a").exists() || d.join("box3d.lib").exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "libbox3d.a / box3d.lib not found under {}. Build box3d first (./build.sh in the repo root).",
+                    base.display()
+                )
+            });
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib=static=box3d");
-        println!("cargo:rustc-link-lib=m");
+        if !target.contains("msvc") {
+            println!("cargo:rustc-link-lib=m");
+        }
     }
 }

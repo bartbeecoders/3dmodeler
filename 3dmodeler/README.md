@@ -1,7 +1,40 @@
 # 3D Modeler (Rust + WASM + box3d)
 
-Browser-hosted 3D modeler with Blender-style interaction. See [plan.md](plan.md)
-for the roadmap and progress tracking.
+[![Build](https://github.com/bartbeecoders/3dmodeler/actions/workflows/build.yml/badge.svg)](https://github.com/bartbeecoders/3dmodeler/actions/workflows/build.yml)
+
+**Version 0.2.0** — browser-hosted 3D modeler with Blender-style interaction.
+See [plan.md](plan.md) for the roadmap and progress tracking.
+
+## What's new in 0.2.0
+
+Everything shipped across the 0.1.x series, now consolidated:
+
+- **Lights** — point / sun / spot lights with color, intensity and shadows,
+  plus Studio/Scene lighting modes.
+- **Wall tool** — draw walls on the floor with door/window cutouts and drag
+  handles on openings; break a wall into individual physics bricks and
+  rebuild it back into one wall object.
+- **Edit mode** (Tab) — vertex/edge/face editing with move/rotate/scale,
+  vertex snapping, and setting a vertex/edge/face as pivot or anchor point.
+- **Object library** — save selections as reusable assets and drag to place;
+  placed objects behave as one group (Ungroup breaks them apart); full MCP
+  CRUD.
+- **Physics poke** — in physics mode, hold LMB to charge (up to 300%) and
+  release to kick objects.
+- **Pie menus** — Shift+A Add menu and the right-click object menu are
+  pie/wheel menus, with pictograms in the Add menu.
+- **UI themes** — color theme picker (Dark/Light/Ocean and more) with accent
+  colors in the View menu.
+- **Outliner upgrades** — folders (bricks land in their own folder),
+  click-to-select, drag-to-parent.
+- **Reference images** — load onto axis planes, two-point scale calibration,
+  selectable and movable in the viewport.
+- **Viewport shading modes** — wireframe / solid / shaded, plus X-ray.
+- **Empty object** — plain axes helper; **End** drops the selection onto the
+  ground plane.
+- **Preferences** — preferences window, unit system, version shown in the
+  footer.
+- **CI** — GitHub Actions builds the native app for Linux, Windows and macOS.
 
 ## Status
 
