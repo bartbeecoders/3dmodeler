@@ -976,7 +976,7 @@ impl UiState {
                 ui.separator();
                 if !scene.reference_images().is_empty() {
                     theme::section_header(ui, "Reference Images");
-                    reference_image_rows(ui, scene, settings, calibrate);
+                    reference_image_rows(ui, scene, selection, settings, calibrate);
                     ui.separator();
                 }
                 if !scene.measurements().is_empty() {
@@ -2053,10 +2053,13 @@ fn view_menu(
 // --- reference images ---------------------------------------------------------
 
 /// Sidebar rows for every reference image: visibility, plane, placement,
-/// size, opacity, calibration and delete.
+/// size, opacity, calibration and delete. The name row selects the image
+/// (shared `Selection`, so the viewport outline and the row highlight stay
+/// in sync in both directions).
 fn reference_image_rows(
     ui: &mut egui::Ui,
     scene: &mut Scene,
+    selection: &mut Selection,
     settings: &Settings,
     calibrate: &mut CalibrateTool,
 ) {
@@ -2072,10 +2075,24 @@ fn reference_image_rows(
         let mut edited = image.clone();
         let mut changed = false;
 
-        egui::CollapsingHeader::new(&edited.name)
-            .id_salt(("ref-image", id))
-            .default_open(false)
-            .show(ui, |ui| {
+        // custom collapsing row: the triangle toggles the details, the name
+        // itself is a selectable label (like outliner object rows)
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("ref-image", id)),
+            false,
+        )
+        .show_header(ui, |ui| {
+            let is_selected = selection.image() == Some(id);
+            if ui
+                .selectable_label(is_selected, &edited.name)
+                .on_hover_text("Select this reference image (G moves it in the viewport)")
+                .clicked()
+            {
+                selection.select_image(id);
+            }
+        })
+        .body(|ui| {
                 ui.horizontal(|ui| {
                     let eye = if edited.visible { "●" } else { "○" };
                     if ui.small_button(eye).on_hover_text("Show / hide").clicked() {
