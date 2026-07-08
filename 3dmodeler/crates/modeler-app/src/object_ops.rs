@@ -158,6 +158,159 @@ pub fn place_on_ground(scene: &mut Scene, selection: &Selection) {
     }
 }
 
+// --- apply scale (Blender's Ctrl+A ▸ Scale) -----------------------------------
+
+fn approx(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 1e-4 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Bake the scale into the primitive's parameters when the shape can
+/// represent the result (per-axis for boxes/walls/floors, uniform for round
+/// shapes). Returns false when it cannot — the caller bakes the mesh instead.
+fn bake_into_primitive(primitive: &mut Primitive, s: Vec3) -> bool {
+    match primitive {
+        Primitive::Plane { size } if approx(s.x, s.y) => {
+            *size *= s.x;
+            true
+        }
+        Primitive::Cube { size } if approx(s.x, s.y) && approx(s.y, s.z) => {
+            *size *= s.x;
+            true
+        }
+        Primitive::UvSphere { radius, .. } | Primitive::IcoSphere { radius, .. }
+            if approx(s.x, s.y) && approx(s.y, s.z) =>
+        {
+            *radius *= s.x;
+            true
+        }
+        Primitive::Cylinder { radius, depth, .. } if approx(s.x, s.y) => {
+            *radius *= s.x;
+            *depth *= s.z;
+            true
+        }
+        Primitive::Cone { radius_bottom, radius_top, depth, .. } if approx(s.x, s.y) => {
+            *radius_bottom *= s.x;
+            *radius_top *= s.x;
+            *depth *= s.z;
+            true
+        }
+        Primitive::Torus { major_radius, minor_radius, .. }
+            if approx(s.x, s.y) && approx(s.y, s.z) =>
+        {
+            *major_radius *= s.x;
+            *minor_radius *= s.x;
+            true
+        }
+        Primitive::Wall { length, height, thickness } => {
+            *length *= s.x;
+            *thickness *= s.y;
+            *height *= s.z;
+            true
+        }
+        Primitive::Floor { width, depth, thickness } => {
+            *width *= s.x;
+            *depth *= s.y;
+            *thickness *= s.z;
+            true
+        }
+        // an empty is a marker: fold the dominant factor into its draw size
+        Primitive::Empty { size } => {
+            *size *= s.abs().max_element();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Blender's Object ▸ Apply ▸ Scale: bake each selected object's scale into
+/// its geometry and reset the transform scale to 1. Parametric primitives
+/// absorb the scale into their parameters where the shape can represent it;
+/// otherwise (non-uniform scale on a round shape, or an already-edited mesh)
+/// the mesh itself is baked, like Blender writing into mesh data. Pivot,
+/// anchor, wall cutouts and floor outlines scale along, and direct children
+/// keep their world placement.
+pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
+    let mut applied = 0usize;
+    let mut baked_meshes = 0usize;
+    let mut skipped_lights = 0usize;
+
+    for id in selection.selected().to_vec() {
+        let Some(object) = scene.object(id) else { continue };
+        let s = object.transform.scale;
+        if (s - Vec3::ONE).abs().max_element() < 1e-6 {
+            continue;
+        }
+        if matches!(object.primitive, Primitive::Light { .. }) {
+            skipped_lights += 1; // a light's gizmo size is intrinsic
+            continue;
+        }
+        let child_ids: Vec<ObjectId> = scene
+            .objects()
+            .iter()
+            .filter(|o| o.parent == Some(id))
+            .map(|o| o.id)
+            .collect();
+
+        let Some(object) = scene.object_mut(id) else { continue };
+        let scale_mesh = |mesh: &mut modeler_core::MeshData| {
+            for p in &mut mesh.positions {
+                *p *= s;
+            }
+            for n in &mut mesh.normals {
+                *n = (*n / s).normalize_or_zero();
+            }
+        };
+        if let Some(mesh) = &mut object.edited_mesh {
+            scale_mesh(mesh);
+        } else if bake_into_primitive(&mut object.primitive, s) {
+            // parametric bake: openings and outlines live in local meters
+            for cutout in &mut object.cutouts {
+                cutout.offset *= s.x;
+                cutout.width *= s.x;
+                cutout.bottom *= s.z;
+                cutout.height *= s.z;
+            }
+            for point in &mut object.floor_outline {
+                point.x *= s.x;
+                point.y *= s.y;
+            }
+        } else {
+            let mut mesh = object.render_mesh();
+            scale_mesh(&mut mesh);
+            object.edited_mesh = Some(mesh);
+            baked_meshes += 1;
+        }
+        // pivot and anchor are local-space points
+        object.pivot *= s;
+        object.anchor *= s;
+        object.transform.scale = Vec3::ONE;
+        object.mesh_revision += 1;
+
+        // children keep their world placement: fold the parent's old scale
+        // into their local transforms (the same SRT approximation compose
+        // uses for non-uniform scales)
+        for child in child_ids {
+            if let Some(child) = scene.object_mut(child) {
+                child.transform.location *= s;
+                child.transform.scale *= s;
+            }
+        }
+        applied += 1;
+    }
+
+    let mut message = match applied {
+        0 => "nothing to apply: selection has no scale".to_string(),
+        n => format!("applied scale to {n} object{}", if n == 1 { "" } else { "s" }),
+    };
+    if baked_meshes > 0 {
+        message += &format!(" ({baked_meshes} baked into mesh data)");
+    }
+    if skipped_lights > 0 {
+        message += &format!(" — {skipped_lights} light(s) skipped");
+    }
+    message
+}
+
 /// Replace a wall with individual DYNAMIC bricks in a running bond (odd
 /// courses start with a half brick), openings respected. The bricks keep the
 /// wall's material (with a subtle per-brick shade variation) and density;
@@ -917,5 +1070,102 @@ mod tests {
         // the loose cube (below ground before) came UP to rest at z = 0
         let w = scene.world_transform(loose);
         assert!((w.location.z - 1.0).abs() < 1e-4, "{:?}", w.location);
+    }
+
+    #[test]
+    fn apply_scale_bakes_uniform_cube_into_size() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        scene.object_mut(id).unwrap().transform.scale = Vec3::splat(2.0);
+        scene.object_mut(id).unwrap().pivot = Vec3::new(0.5, 0.0, 0.0);
+
+        let mut selection = Selection::default();
+        selection.set(vec![id], Some(id));
+        apply_scale(&mut scene, &selection);
+
+        let object = scene.object(id).unwrap();
+        assert!(matches!(object.primitive, Primitive::Cube { size } if (size - 4.0).abs() < 1e-5));
+        assert_eq!(object.transform.scale, Vec3::ONE);
+        assert!(object.edited_mesh.is_none(), "parametric bake, no mesh");
+        assert!((object.pivot.x - 1.0).abs() < 1e-5, "pivot scales along");
+    }
+
+    #[test]
+    fn apply_scale_bakes_wall_per_axis_with_cutouts() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(
+            Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 },
+            Transform::default(),
+        );
+        {
+            let object = scene.object_mut(id).unwrap();
+            object.cutouts.push(modeler_core::WallCutout {
+                offset: 1.0,
+                width: 0.9,
+                bottom: 0.5,
+                height: 1.0,
+            });
+            object.transform.scale = Vec3::new(2.0, 3.0, 0.5);
+        }
+        let mut selection = Selection::default();
+        selection.set(vec![id], Some(id));
+        apply_scale(&mut scene, &selection);
+
+        let object = scene.object(id).unwrap();
+        let Primitive::Wall { length, height, thickness } = object.primitive else {
+            panic!("still a wall");
+        };
+        assert!((length - 8.0).abs() < 1e-5 && (height - 1.25).abs() < 1e-5);
+        assert!((thickness - 0.6).abs() < 1e-5);
+        let cutout = &object.cutouts[0];
+        assert!((cutout.offset - 2.0).abs() < 1e-5 && (cutout.width - 1.8).abs() < 1e-5);
+        assert!((cutout.bottom - 0.25).abs() < 1e-5 && (cutout.height - 0.5).abs() < 1e-5);
+        assert_eq!(object.transform.scale, Vec3::ONE);
+    }
+
+    #[test]
+    fn apply_scale_bakes_nonuniform_sphere_into_mesh() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(
+            Primitive::UvSphere { segments: 16, rings: 8, radius: 1.0 },
+            Transform::default(),
+        );
+        scene.object_mut(id).unwrap().transform.scale = Vec3::new(1.0, 2.0, 1.0);
+
+        let mut selection = Selection::default();
+        selection.set(vec![id], Some(id));
+        apply_scale(&mut scene, &selection);
+
+        let object = scene.object(id).unwrap();
+        let mesh = object.edited_mesh.as_ref().expect("non-uniform round shape bakes the mesh");
+        let max_y = mesh.positions.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+        assert!((max_y - 2.0).abs() < 0.05, "stretched to the applied scale: {max_y}");
+        assert_eq!(object.transform.scale, Vec3::ONE);
+    }
+
+    #[test]
+    fn apply_scale_keeps_children_in_place() {
+        let mut scene = Scene::new();
+        let parent = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let child = scene.add_object(
+            Primitive::Cube { size: 1.0 },
+            Transform { location: Vec3::new(3.0, 0.0, 0.0), ..Transform::default() },
+        );
+        scene.set_parent(child, Some(parent));
+        scene.object_mut(parent).unwrap().transform.scale = Vec3::splat(2.0);
+        let world_before = scene.world_transform(child);
+
+        let mut selection = Selection::default();
+        selection.set(vec![parent], Some(parent));
+        apply_scale(&mut scene, &selection);
+
+        let world_after = scene.world_transform(child);
+        assert!(
+            (world_after.location - world_before.location).length() < 1e-4,
+            "{:?} vs {:?}",
+            world_after.location,
+            world_before.location
+        );
+        assert!((world_after.scale - world_before.scale).length() < 1e-4);
     }
 }

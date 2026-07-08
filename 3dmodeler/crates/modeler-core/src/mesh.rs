@@ -17,6 +17,20 @@ pub struct MeshData {
 }
 
 impl MeshData {
+    /// Axis-aligned extents (width, depth, height) of the vertices.
+    pub fn extents(&self) -> Vec3 {
+        if self.positions.is_empty() {
+            return Vec3::ZERO;
+        }
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for p in &self.positions {
+            min = min.min(*p);
+            max = max.max(*p);
+        }
+        max - min
+    }
+
     /// Re-expand into per-face vertices with face normals (flat shading).
     pub fn into_flat(self) -> MeshData {
         let mut out = MeshData::default();

@@ -193,7 +193,11 @@ fn vec3_from(value: &Value) -> Option<Vec3> {
 fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
     let (rx, ry, rz) = object.transform.rotation.to_euler(EulerRot::XYZ);
     let world = scene.world_transform(object.id);
-    let dims = object.primitive.dimensions() * world.scale.abs();
+    // edited meshes (edit mode, Apply Scale) replace the primitive's shape
+    let dims = match &object.edited_mesh {
+        Some(mesh) => mesh.extents() * world.scale.abs(),
+        None => object.primitive.dimensions() * world.scale.abs(),
+    };
     let mut json = json!({
         "id": object.id.0,
         "name": object.name,

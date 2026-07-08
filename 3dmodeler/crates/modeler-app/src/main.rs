@@ -230,11 +230,14 @@ pub fn main() {
                     mcp_status,
                 );
 
+                // overlays never draw over the menu bar / sidebar / status bar
+                let overlay_clip = overlay::viewport_clip(gui_context, &layout);
                 overlay::draw(
                     gui_context,
                     &camera,
                     frame_input.viewport,
                     frame_input.device_pixel_ratio,
+                    overlay_clip,
                     &scene,
                     &sel,
                     &measure,
@@ -263,6 +266,7 @@ pub fn main() {
                         &camera,
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
+                        overlay_clip,
                         guides,
                     );
                 }
@@ -272,6 +276,7 @@ pub fn main() {
                         &camera,
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
+                        overlay_clip,
                         segments,
                     );
                 }
@@ -281,6 +286,7 @@ pub fn main() {
                         &camera,
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
+                        overlay_clip,
                         edit,
                     );
                 }

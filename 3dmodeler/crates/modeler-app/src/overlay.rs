@@ -94,9 +94,10 @@ pub fn draw_modal_guides(
     camera: &BlenderCamera,
     viewport: Viewport,
     device_pixel_ratio: f32,
+    clip: egui::Rect,
     guides: &Guides,
 ) {
-    let painter = ctx.layer_painter(egui::LayerId::background());
+    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
     // three-d mouse position (physical px, bottom-left) -> egui coords
     let mouse = |(x, y): (f32, f32)| {
@@ -202,6 +203,7 @@ pub fn draw_wireframe(
     camera: &BlenderCamera,
     viewport: Viewport,
     device_pixel_ratio: f32,
+    clip: egui::Rect,
     segments: &[crate::scene_render::WireSegment],
 ) {
     const TIERS: [egui::Color32; 3] = [
@@ -209,7 +211,7 @@ pub fn draw_wireframe(
         egui::Color32::from_rgb(230, 110, 20),
         egui::Color32::from_rgb(255, 170, 64),
     ];
-    let painter = ctx.layer_painter(egui::LayerId::background());
+    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
     for &(a, b, tier) in segments {
         if let (Some(a), Some(b)) = (project(a), project(b)) {
@@ -228,6 +230,7 @@ pub fn draw_edit_mode(
     camera: &BlenderCamera,
     viewport: Viewport,
     device_pixel_ratio: f32,
+    clip: egui::Rect,
     overlay: &crate::edit_mode::EditOverlay,
 ) {
     use crate::edit_mode::SelectedShape;
@@ -235,7 +238,7 @@ pub fn draw_edit_mode(
     const VERT: egui::Color32 = egui::Color32::from_rgb(210, 215, 225);
     const SELECTED: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
 
-    let painter = ctx.layer_painter(egui::LayerId::background());
+    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
 
     for &(a, b) in &overlay.edges {
@@ -288,18 +291,33 @@ pub fn draw_edit_mode(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Clip rectangle for viewport overlays: the window minus the UI chrome,
+/// so overlay drawings never spill over the menu bar, sidebar or status bar.
+pub fn viewport_clip(ctx: &egui::Context, layout: &crate::ui::UiLayout) -> egui::Rect {
+    let screen = ctx.content_rect();
+    egui::Rect::from_min_max(
+        egui::pos2(screen.left(), screen.top() + layout.top_offset),
+        egui::pos2(
+            screen.right() - layout.right_offset,
+            screen.bottom() - layout.bottom_offset,
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ctx: &egui::Context,
     camera: &BlenderCamera,
     viewport: Viewport,
     device_pixel_ratio: f32,
+    clip: egui::Rect,
     scene: &Scene,
     selection: &Selection,
     measure: &MeasureTool,
     calibrate: &CalibrateTool,
     unit: Unit,
 ) {
-    let painter = ctx.layer_painter(egui::LayerId::background());
+    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
 
     // --- calibration picks (scale-from-2-points) ---------------------------

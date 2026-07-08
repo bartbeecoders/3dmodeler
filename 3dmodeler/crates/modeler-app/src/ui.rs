@@ -1747,6 +1747,17 @@ fn object_menu(
         object_ops::place_on_ground(scene, selection);
         close = true;
     }
+    if ui
+        .add_enabled(has_selection, egui::Button::new("Apply Scale"))
+        .on_hover_text(
+            "Bake the selection's scale into its geometry and reset the scale \
+             to 1 (Blender's Ctrl+A ▸ Scale); children keep their placement",
+        )
+        .clicked()
+    {
+        *status = Some(object_ops::apply_scale(scene, selection));
+        close = true;
+    }
     ui.separator();
     if ui
         .add_enabled(has_selection, egui::Button::new("Shade Smooth"))

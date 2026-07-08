@@ -18,7 +18,7 @@ use three_d::{Event, MouseButton, Viewport};
 const MIN_SPEED: f32 = 2.0;
 const MAX_SPEED: f32 = 15.0;
 /// Seconds of holding to reach 100%.
-const CHARGE_TIME: f32 = 1.2;
+const CHARGE_TIME: f32 = 0.6;
 /// Keep charging past 100%, up to 300% (three times the 100% strength).
 const MAX_CHARGE: f32 = 3.0;
 
