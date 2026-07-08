@@ -1,0 +1,1 @@
+When in front view (1), show the main zero grid lines

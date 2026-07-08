@@ -9,6 +9,14 @@ pub const FOV_DEG: f32 = 45.0;
 const ORBIT_SENSITIVITY: f32 = 0.008; // radians per logical pixel
 const WHEEL_ZOOM_FACTOR: f32 = 0.86; // per wheel notch (24 delta units)
 
+/// The vertical plane a side-on orthographic axis view looks at:
+/// front/back (1) face the XZ plane, left/right (3) the YZ plane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerticalPlane {
+    Xz,
+    Yz,
+}
+
 pub struct BlenderCamera {
     pub pivot: Vec3,
     /// Radians around world Z. 0 = front view (camera on -Y).
@@ -199,6 +207,30 @@ impl BlenderCamera {
     pub fn frame(&mut self, center: Vec3, radius: f32) {
         self.pivot = center;
         self.distance = (radius.max(0.1) / (0.5 * FOV_DEG.to_radians()).tan()) * 1.15;
+    }
+
+    /// Which vertical zero plane the camera faces in an orthographic axis
+    /// view — the floor grid is edge-on there, so the viewport shows the
+    /// zero axis lines of this plane instead. None in perspective, tilted
+    /// views, and top/bottom (the floor grid covers those).
+    pub fn vertical_axis_plane(&self) -> Option<VerticalPlane> {
+        if !self.ortho {
+            return None;
+        }
+        let eps = 0.5;
+        if self.pitch.to_degrees().abs() >= eps {
+            return None;
+        }
+        let yaw = self.yaw.to_degrees().rem_euclid(360.0);
+        match yaw {
+            y if y < eps || y > 360.0 - eps || (y - 180.0).abs() < eps => {
+                Some(VerticalPlane::Xz) // front / back
+            }
+            y if (y - 90.0).abs() < eps || (y - 270.0).abs() < eps => {
+                Some(VerticalPlane::Yz) // right / left
+            }
+            _ => None,
+        }
     }
 
     pub fn view_name(&self) -> String {

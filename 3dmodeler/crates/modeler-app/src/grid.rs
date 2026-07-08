@@ -10,6 +10,8 @@ const MAJOR_EVERY: i32 = 10;
 
 const X_AXIS_COLOR: Srgba = Srgba::new(174, 66, 55, 255); // Blender-ish red
 const Y_AXIS_COLOR: Srgba = Srgba::new(96, 148, 58, 255); // Blender-ish green
+const Z_AXIS_COLOR: Srgba = Srgba::new(58, 98, 170, 255); // Blender-ish blue
+const AXIS_HALF_WIDTH: f32 = 0.022;
 
 struct GridBuilder {
     positions: Vec<Vec3>,
@@ -82,8 +84,76 @@ pub fn build_grid(
         builder.line_x(offset, half_width, color);
         builder.line_y(offset, half_width, color);
     }
-    builder.line_x(0.0, 0.022, X_AXIS_COLOR); // X axis
-    builder.line_y(0.0, 0.022, Y_AXIS_COLOR); // Y axis
+    builder.line_x(0.0, AXIS_HALF_WIDTH, X_AXIS_COLOR); // X axis
+    builder.line_y(0.0, AXIS_HALF_WIDTH, Y_AXIS_COLOR); // Y axis
+
+    let cpu_mesh = CpuMesh {
+        positions: Positions::F32(builder.positions),
+        colors: Some(builder.colors),
+        indices: Indices::U32(builder.indices),
+        ..Default::default()
+    };
+
+    Gm::new(Mesh::new(context, &cpu_mesh), ColorMaterial::default())
+}
+
+/// Zero axis lines for side-on orthographic views (front/back, left/right),
+/// where the floor grid is edge-on and invisible: the ground-level axis of
+/// the faced plane plus the vertical Z axis, as thin quads in that plane.
+pub fn build_zero_lines(
+    context: &Context,
+    plane: crate::camera::VerticalPlane,
+) -> Gm<Mesh, ColorMaterial> {
+    let mut builder = GridBuilder {
+        positions: Vec::new(),
+        colors: Vec::new(),
+        indices: Vec::new(),
+    };
+    let hw = AXIS_HALF_WIDTH;
+    match plane {
+        crate::camera::VerticalPlane::Xz => {
+            // X axis (red) + Z axis (blue) in the y = 0 plane
+            builder.quad(
+                [
+                    vec3(-EXTENT, 0.0, -hw),
+                    vec3(EXTENT, 0.0, -hw),
+                    vec3(EXTENT, 0.0, hw),
+                    vec3(-EXTENT, 0.0, hw),
+                ],
+                X_AXIS_COLOR,
+            );
+            builder.quad(
+                [
+                    vec3(-hw, 0.0, -EXTENT),
+                    vec3(hw, 0.0, -EXTENT),
+                    vec3(hw, 0.0, EXTENT),
+                    vec3(-hw, 0.0, EXTENT),
+                ],
+                Z_AXIS_COLOR,
+            );
+        }
+        crate::camera::VerticalPlane::Yz => {
+            // Y axis (green) + Z axis (blue) in the x = 0 plane
+            builder.quad(
+                [
+                    vec3(0.0, -EXTENT, -hw),
+                    vec3(0.0, EXTENT, -hw),
+                    vec3(0.0, EXTENT, hw),
+                    vec3(0.0, -EXTENT, hw),
+                ],
+                Y_AXIS_COLOR,
+            );
+            builder.quad(
+                [
+                    vec3(0.0, -hw, -EXTENT),
+                    vec3(0.0, hw, -EXTENT),
+                    vec3(0.0, hw, EXTENT),
+                    vec3(0.0, -hw, EXTENT),
+                ],
+                Z_AXIS_COLOR,
+            );
+        }
+    }
 
     let cpu_mesh = CpuMesh {
         positions: Positions::F32(builder.positions),

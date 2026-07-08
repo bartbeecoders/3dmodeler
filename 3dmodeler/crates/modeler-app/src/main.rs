@@ -125,6 +125,10 @@ pub fn main() {
 
     info("box3d physics mirror created");
 
+    // zero axis lines for side-on ortho views (front/back, left/right),
+    // where the floor grid is edge-on and shows nothing
+    let zero_lines_xz = grid::build_zero_lines(&context, camera::VerticalPlane::Xz);
+    let zero_lines_yz = grid::build_zero_lines(&context, camera::VerticalPlane::Yz);
     let mut grid = grid::build_grid(
         &context,
         settings.grid_spacing,
@@ -864,6 +868,11 @@ pub fn main() {
             scene_render.models().map(|m| m as &dyn Object).collect();
         render_objects.extend(scene_render.outlines().map(|m| m as &dyn Object));
         render_objects.push(&grid);
+        match camera.vertical_axis_plane() {
+            Some(camera::VerticalPlane::Xz) => render_objects.push(&zero_lines_xz),
+            Some(camera::VerticalPlane::Yz) => render_objects.push(&zero_lines_yz),
+            None => {}
+        }
         // reference images last: they blend over the grid and the meshes
         render_objects.extend(ref_render.models().map(|m| m as &dyn Object));
 
