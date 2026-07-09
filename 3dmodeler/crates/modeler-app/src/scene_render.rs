@@ -1,19 +1,23 @@
 //! Derives three-d GPU models from the `modeler-core` scene document, plus
 //! Blender-style selection outlines and overlap warnings.
 //!
-//! Models are cached per object: transform-only changes (modal drags, physics
-//! playback) just update the transformation matrix; meshes are regenerated
-//! only when primitive parameters, shading or material change.
+//! Objects that share a mesh and material (brick piles, duplicated
+//! furniture) are grouped into a single instanced draw call with their
+//! base color riding per instance; everything else keeps a per-object
+//! cached model where transform-only changes (modal drags, physics
+//! playback) just update the transformation matrix and meshes are
+//! regenerated only when primitive parameters, shading or material change.
 
 use crate::selection::Selection;
 use modeler_core::glam;
 use modeler_core::{LightKind, MeshData, Material, ObjectId, Primitive, Scene, Transform};
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use three_d::*;
 
 /// Viewport shading mode (Blender's Z pie, reduced).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ShadeMode {
     /// Only the objects' sharp edges, drawn by the overlay.
     Wireframe,
@@ -52,9 +56,132 @@ struct CachedModel {
     outline: Option<(Srgba, Gm<Mesh, ColorMaterial>)>,
 }
 
+/// Selection tier of an object. Part of the instancing group key: outlines
+/// are drawn per group, so members of one group must share a tier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum OutlineTier {
+    None,
+    Selected,
+    Active,
+    Overlap,
+}
+
+impl OutlineTier {
+    fn of(id: ObjectId, selection: &Selection, overlaps: &HashSet<ObjectId>) -> Self {
+        if !selection.is_selected(id) {
+            Self::None
+        } else if overlaps.contains(&id) {
+            Self::Overlap
+        } else if selection.active() == Some(id) {
+            Self::Active
+        } else {
+            Self::Selected
+        }
+    }
+
+    // outline: overlap warning > active > selected
+    fn color(self) -> Option<Srgba> {
+        match self {
+            Self::None => None,
+            Self::Selected => Some(SELECTED_OUTLINE),
+            Self::Active => Some(ACTIVE_OUTLINE),
+            Self::Overlap => Some(OVERLAP_OUTLINE),
+        }
+    }
+}
+
+/// Everything two objects must share to be drawn by one instanced call.
+/// The base color is NOT here — it rides per instance, so a brick pile
+/// with per-brick shade variation is still a single draw.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct GroupKey {
+    primitive: Primitive,
+    smooth: bool,
+    subdivision: u8,
+    /// Material minus base color; zeroed in Solid mode, which ignores
+    /// object materials entirely (so any-material duplicates group there).
+    roughness: f32,
+    metallic: f32,
+    mode: ShadeMode,
+    xray: bool,
+    tier: OutlineTier,
+}
+
+fn group_hash(key: &GroupKey) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_primitive(&mut h, &key.primitive);
+    key.smooth.hash(&mut h);
+    key.subdivision.hash(&mut h);
+    hash_f32(&mut h, key.roughness);
+    hash_f32(&mut h, key.metallic);
+    key.mode.hash(&mut h);
+    key.xray.hash(&mut h);
+    key.tier.hash(&mut h);
+    h.finish()
+}
+
+/// Mesh identity within a group key (what `display_mesh` depends on for
+/// instanceable objects) — the shared CpuMesh cache is keyed on this so
+/// selection changes move a group between tiers without re-meshing.
+fn group_mesh_hash(key: &GroupKey) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_primitive(&mut h, &key.primitive);
+    key.smooth.hash(&mut h);
+    key.subdivision.hash(&mut h);
+    h.finish()
+}
+
+/// The instancing group an object belongs to, or None when its mesh is
+/// unique (edited meshes, walls with cutouts, shaped floors) or it is a
+/// light gizmo (colored by its primitive; excluded from shadow casters).
+fn instance_key(
+    object: &modeler_core::Object,
+    tier: OutlineTier,
+    mode: ShadeMode,
+    xray: bool,
+) -> Option<(u64, GroupKey)> {
+    if object.edited_mesh.is_some() || object.primitive.is_light() {
+        return None;
+    }
+    if matches!(object.primitive, Primitive::Wall { .. }) && !object.cutouts.is_empty() {
+        return None;
+    }
+    if matches!(object.primitive, Primitive::Floor { .. }) && !object.floor_outline.is_empty() {
+        return None;
+    }
+    let (roughness, metallic) = match mode {
+        ShadeMode::Solid => (0.0, 0.0),
+        _ => (object.material.roughness, object.material.metallic),
+    };
+    let key = GroupKey {
+        primitive: object.primitive,
+        smooth: object.smooth,
+        subdivision: object.subdivision,
+        roughness,
+        metallic,
+        mode,
+        xray,
+        tier,
+    };
+    Some((group_hash(&key), key))
+}
+
+struct InstancedGroup {
+    key: GroupKey,
+    model: Gm<InstancedMesh, PhysicalMaterial>,
+    outline: Option<Gm<InstancedMesh, ColorMaterial>>,
+    /// Hash of member ids + transforms + colors; instance buffers are
+    /// re-uploaded only when it changes.
+    instances_sig: u64,
+}
+
 pub struct SceneRender {
     cache: HashMap<ObjectId, CachedModel>,
     order: Vec<ObjectId>,
+    groups: HashMap<u64, InstancedGroup>,
+    group_order: Vec<u64>,
+    /// Shared meshes of the instanced groups, keyed by mesh identity.
+    mesh_cache: HashMap<u64, CpuMesh>,
 }
 
 /// The mesh the viewport shows: the base mesh with the object's
@@ -133,11 +260,24 @@ fn physical_material(
     }
 }
 
+/// Per-instance color: the object's base color in Shaded mode (multiplied
+/// onto the group's white albedo); white in Solid, whose gray albedo lives
+/// on the material.
+fn instance_color(object: &modeler_core::Object, mode: ShadeMode) -> Srgba {
+    match mode {
+        ShadeMode::Shaded => srgb(object.material.base_color, 255),
+        _ => Srgba::WHITE,
+    }
+}
+
 impl SceneRender {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
             order: Vec::new(),
+            groups: HashMap::new(),
+            group_order: Vec::new(),
+            mesh_cache: HashMap::new(),
         }
     }
 
@@ -151,128 +291,156 @@ impl SceneRender {
         xray: bool,
     ) {
         self.order.clear();
+        self.group_order.clear();
         if mode == ShadeMode::Wireframe {
-            return; // edges are drawn by the overlay; keep the cache warm
+            return; // edges are drawn by WireRender; keep the caches warm
         }
-        let mut seen: HashSet<ObjectId> = HashSet::new();
         let worlds = scene.world_transforms(); // one O(N) pass for the frame
 
+        // Pass 1: partition visible objects into instancing buckets and
+        // per-object "singles" (unique meshes and light gizmos).
+        struct Bucket {
+            key: GroupKey,
+            members: Vec<(ObjectId, Mat4, Srgba)>,
+        }
+        let mut buckets: HashMap<u64, Bucket> = HashMap::new();
+        let mut bucket_order: Vec<u64> = Vec::new();
+        let mut singles: Vec<(ObjectId, Mat4, OutlineTier)> = Vec::new();
         for object in scene.objects() {
             if !object.visible {
                 continue;
             }
-            seen.insert(object.id);
-            self.order.push(object.id);
             let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
             let transformation = transform_mat(&world);
-
-            let rebuild_mesh = match self.cache.get(&object.id) {
-                Some(cached) => {
-                    cached.primitive != object.primitive
-                        || cached.smooth != object.smooth
-                        || cached.mesh_revision != object.mesh_revision
-                }
-                None => true,
-            };
-            let rebuild_material = match self.cache.get(&object.id) {
-                Some(cached) => {
-                    cached.material != object.material
-                        || cached.mode != mode
-                        || cached.xray != xray
-                }
-                None => true,
-            };
-
-            if rebuild_mesh {
-                let new_mesh = display_mesh(object);
-                // Edit-mode vertex drags bump mesh_revision every frame but
-                // keep the topology: update the existing vertex buffers in
-                // place instead of recreating mesh + material + outline.
-                let updated_in_place = (|| {
-                    let cached = self.cache.get_mut(&object.id)?;
-                    if cached.primitive != object.primitive || cached.smooth != object.smooth {
-                        return None;
+            let tier = OutlineTier::of(object.id, selection, overlaps);
+            match instance_key(object, tier, mode, xray) {
+                Some((hash, key)) => match buckets.entry(hash) {
+                    Entry::Occupied(mut e) if e.get().key == key => {
+                        e.get_mut()
+                            .members
+                            .push((object.id, transformation, instance_color(object, mode)));
                     }
-                    let same_topology = match (&cached.cpu_mesh.positions, &cached.cpu_mesh.indices)
-                    {
-                        (Positions::F32(old_pos), Indices::U32(old_idx)) => {
-                            old_pos.len() == new_mesh.positions.len()
-                                && old_idx.as_slice() == new_mesh.indices.as_slice()
-                        }
-                        _ => false,
-                    };
-                    if !same_topology {
-                        return None;
+                    // different key hashed to the same bucket: draw solo
+                    Entry::Occupied(_) => singles.push((object.id, transformation, tier)),
+                    Entry::Vacant(v) => {
+                        bucket_order.push(hash);
+                        v.insert(Bucket {
+                            key,
+                            members: vec![(
+                                object.id,
+                                transformation,
+                                instance_color(object, mode),
+                            )],
+                        });
                     }
-                    let positions: Vec<Vec3> =
-                        new_mesh.positions.iter().map(|p| vec3(p.x, p.y, p.z)).collect();
-                    let normals: Vec<Vec3> =
-                        new_mesh.normals.iter().map(|n| vec3(n.x, n.y, n.z)).collect();
-                    cached.model.geometry.set_positions(&positions).ok()?;
-                    cached.model.geometry.set_normals(&normals).ok()?;
-                    if let Some((_, outline)) = &mut cached.outline {
-                        outline.geometry.set_positions(&positions).ok()?;
-                        outline.geometry.set_normals(&normals).ok()?;
-                    }
-                    cached.cpu_mesh.positions = Positions::F32(positions);
-                    cached.cpu_mesh.normals = Some(normals);
-                    cached.mesh_revision = object.mesh_revision;
-                    Some(())
-                })()
-                .is_some();
-
-                if !updated_in_place {
-                    let cpu_mesh = to_cpu_mesh(&new_mesh);
-                    let model = Gm::new(
-                        Mesh::new(context, &cpu_mesh),
-                        physical_material(context, &object.material, &object.primitive, mode, xray),
-                    );
-                    self.cache.insert(
-                        object.id,
-                        CachedModel {
-                            primitive: object.primitive,
-                            smooth: object.smooth,
-                            mesh_revision: object.mesh_revision,
-                            mode,
-                            xray,
-                            material: object.material,
-                            cpu_mesh,
-                            model,
-                            outline: None,
-                        },
-                    );
-                }
-            } else if rebuild_material {
-                let cached = self.cache.get_mut(&object.id).unwrap();
-                cached.material = object.material;
-                cached.mode = mode;
-                cached.xray = xray;
-                cached.model.material =
-                    physical_material(context, &object.material, &object.primitive, mode, xray);
+                },
+                None => singles.push((object.id, transformation, tier)),
             }
+        }
 
-            let cached = self.cache.get_mut(&object.id).unwrap();
-            cached.model.set_transformation(transformation);
+        // Pass 2: sync the instanced groups; lone bucket members fall back
+        // to the per-object path (no instancing overhead, warm caches).
+        for hash in bucket_order {
+            let bucket = buckets.remove(&hash).expect("bucket from this frame");
+            if let [(id, transformation, _)] = bucket.members[..] {
+                singles.push((id, transformation, bucket.key.tier));
+                continue;
+            }
+            self.group_order.push(hash);
+            self.sync_group(scene, context, hash, bucket.key, &bucket.members, mode, xray);
+        }
 
-            // outline: overlap warning > active > selected
-            let desired_color = if selection.is_selected(object.id) {
-                Some(if overlaps.contains(&object.id) {
-                    OVERLAP_OUTLINE
-                } else if selection.active() == Some(object.id) {
-                    ACTIVE_OUTLINE
-                } else {
-                    SELECTED_OUTLINE
-                })
-            } else {
-                None
-            };
+        // Pass 3: per-object models for the singles, in scene order.
+        for &(id, transformation, tier) in &singles {
+            let Some(object) = scene.object(id) else { continue };
+            self.order.push(id);
+            self.sync_single(object, transformation, tier, context, mode, xray);
+        }
 
-            match (desired_color, &mut cached.outline) {
-                (None, outline) => *outline = None,
-                (Some(color), Some((current, gm))) if *current == color => {
-                    gm.set_transformation(transformation * Mat4::from_scale(OUTLINE_SCALE));
+        let single_ids: HashSet<ObjectId> = singles.iter().map(|&(id, _, _)| id).collect();
+        self.cache.retain(|id, _| single_ids.contains(id));
+        let group_ids: HashSet<u64> = self.group_order.iter().copied().collect();
+        self.groups.retain(|hash, _| group_ids.contains(hash));
+        let mesh_ids: HashSet<u64> =
+            self.groups.values().map(|g| group_mesh_hash(&g.key)).collect();
+        self.mesh_cache.retain(|hash, _| mesh_ids.contains(hash));
+    }
+
+    /// Create or update one instanced group (model + optional outline).
+    fn sync_group(
+        &mut self,
+        scene: &Scene,
+        context: &Context,
+        hash: u64,
+        key: GroupKey,
+        members: &[(ObjectId, Mat4, Srgba)],
+        mode: ShadeMode,
+        xray: bool,
+    ) {
+        let mut h = DefaultHasher::new();
+        for (id, m, c) in members {
+            id.0.hash(&mut h);
+            let cells: &[f32; 16] = m.as_ref();
+            for f in cells {
+                hash_f32(&mut h, *f);
+            }
+            (c.r, c.g, c.b, c.a).hash(&mut h);
+        }
+        let sig = h.finish();
+
+        let up_to_date = match self.groups.get(&hash) {
+            Some(g) => g.key == key && g.instances_sig == sig,
+            None => false,
+        };
+        if up_to_date {
+            return;
+        }
+
+        let instances = Instances {
+            transformations: members.iter().map(|&(_, m, _)| m).collect(),
+            colors: (mode == ShadeMode::Shaded)
+                .then(|| members.iter().map(|&(_, _, c)| c).collect()),
+            ..Default::default()
+        };
+        let outline_instances = key.tier.color().map(|_| Instances {
+            transformations: members
+                .iter()
+                .map(|&(_, m, _)| m * Mat4::from_scale(OUTLINE_SCALE))
+                .collect(),
+            ..Default::default()
+        });
+
+        match self.groups.get_mut(&hash) {
+            Some(group) if group.key == key => {
+                group.model.geometry.set_instances(&instances);
+                if let (Some(outline), Some(instances)) =
+                    (&mut group.outline, &outline_instances)
+                {
+                    outline.geometry.set_instances(instances);
                 }
-                (Some(color), outline) => {
+                group.instances_sig = sig;
+            }
+            _ => {
+                let mesh_hash = group_mesh_hash(&key);
+                if !self.mesh_cache.contains_key(&mesh_hash) {
+                    let exemplar = scene.object(members[0].0).expect("member from this frame");
+                    self.mesh_cache.insert(mesh_hash, to_cpu_mesh(&display_mesh(exemplar)));
+                }
+                let cpu_mesh = &self.mesh_cache[&mesh_hash];
+                // white albedo: the per-instance colors carry the base color
+                let material = physical_material(
+                    context,
+                    &Material {
+                        base_color: [1.0, 1.0, 1.0],
+                        roughness: key.roughness,
+                        metallic: key.metallic,
+                    },
+                    &key.primitive,
+                    mode,
+                    xray,
+                );
+                let model = Gm::new(InstancedMesh::new(context, &instances, cpu_mesh), material);
+                let outline = key.tier.color().map(|color| {
                     let material = ColorMaterial {
                         color,
                         render_states: RenderStates {
@@ -281,37 +449,183 @@ impl SceneRender {
                         },
                         ..Default::default()
                     };
-                    let mut gm = Gm::new(Mesh::new(context, &cached.cpu_mesh), material);
-                    gm.set_transformation(transformation * Mat4::from_scale(OUTLINE_SCALE));
-                    *outline = Some((color, gm));
-                }
+                    Gm::new(
+                        InstancedMesh::new(
+                            context,
+                            outline_instances.as_ref().expect("tier has a color"),
+                            cpu_mesh,
+                        ),
+                        material,
+                    )
+                });
+                self.groups
+                    .insert(hash, InstancedGroup { key, model, outline, instances_sig: sig });
             }
         }
-
-        self.cache.retain(|id, _| seen.contains(id));
     }
 
-    pub fn models(&self) -> impl Iterator<Item = &Gm<Mesh, PhysicalMaterial>> {
-        self.order
-            .iter()
-            .filter_map(|id| self.cache.get(id).map(|c| &c.model))
+    /// Sync one per-object cached model (the pre-instancing path).
+    fn sync_single(
+        &mut self,
+        object: &modeler_core::Object,
+        transformation: Mat4,
+        tier: OutlineTier,
+        context: &Context,
+        mode: ShadeMode,
+        xray: bool,
+    ) {
+        let rebuild_mesh = match self.cache.get(&object.id) {
+            Some(cached) => {
+                cached.primitive != object.primitive
+                    || cached.smooth != object.smooth
+                    || cached.mesh_revision != object.mesh_revision
+            }
+            None => true,
+        };
+        let rebuild_material = match self.cache.get(&object.id) {
+            Some(cached) => {
+                cached.material != object.material
+                    || cached.mode != mode
+                    || cached.xray != xray
+            }
+            None => true,
+        };
+
+        if rebuild_mesh {
+            let new_mesh = display_mesh(object);
+            // Edit-mode vertex drags bump mesh_revision every frame but
+            // keep the topology: update the existing vertex buffers in
+            // place instead of recreating mesh + material + outline.
+            let updated_in_place = (|| {
+                let cached = self.cache.get_mut(&object.id)?;
+                if cached.primitive != object.primitive || cached.smooth != object.smooth {
+                    return None;
+                }
+                let same_topology = match (&cached.cpu_mesh.positions, &cached.cpu_mesh.indices)
+                {
+                    (Positions::F32(old_pos), Indices::U32(old_idx)) => {
+                        old_pos.len() == new_mesh.positions.len()
+                            && old_idx.as_slice() == new_mesh.indices.as_slice()
+                    }
+                    _ => false,
+                };
+                if !same_topology {
+                    return None;
+                }
+                let positions: Vec<Vec3> =
+                    new_mesh.positions.iter().map(|p| vec3(p.x, p.y, p.z)).collect();
+                let normals: Vec<Vec3> =
+                    new_mesh.normals.iter().map(|n| vec3(n.x, n.y, n.z)).collect();
+                cached.model.geometry.set_positions(&positions).ok()?;
+                cached.model.geometry.set_normals(&normals).ok()?;
+                if let Some((_, outline)) = &mut cached.outline {
+                    outline.geometry.set_positions(&positions).ok()?;
+                    outline.geometry.set_normals(&normals).ok()?;
+                }
+                cached.cpu_mesh.positions = Positions::F32(positions);
+                cached.cpu_mesh.normals = Some(normals);
+                cached.mesh_revision = object.mesh_revision;
+                Some(())
+            })()
+            .is_some();
+
+            if !updated_in_place {
+                let cpu_mesh = to_cpu_mesh(&new_mesh);
+                let model = Gm::new(
+                    Mesh::new(context, &cpu_mesh),
+                    physical_material(context, &object.material, &object.primitive, mode, xray),
+                );
+                self.cache.insert(
+                    object.id,
+                    CachedModel {
+                        primitive: object.primitive,
+                        smooth: object.smooth,
+                        mesh_revision: object.mesh_revision,
+                        mode,
+                        xray,
+                        material: object.material,
+                        cpu_mesh,
+                        model,
+                        outline: None,
+                    },
+                );
+            }
+        } else if rebuild_material {
+            let cached = self.cache.get_mut(&object.id).unwrap();
+            cached.material = object.material;
+            cached.mode = mode;
+            cached.xray = xray;
+            cached.model.material =
+                physical_material(context, &object.material, &object.primitive, mode, xray);
+        }
+
+        let cached = self.cache.get_mut(&object.id).unwrap();
+        cached.model.set_transformation(transformation);
+
+        let desired_color = tier.color();
+
+        match (desired_color, &mut cached.outline) {
+            (None, outline) => *outline = None,
+            (Some(color), Some((current, gm))) if *current == color => {
+                gm.set_transformation(transformation * Mat4::from_scale(OUTLINE_SCALE));
+            }
+            (Some(color), outline) => {
+                let material = ColorMaterial {
+                    color,
+                    render_states: RenderStates {
+                        cull: Cull::Front,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut gm = Gm::new(Mesh::new(context, &cached.cpu_mesh), material);
+                gm.set_transformation(transformation * Mat4::from_scale(OUTLINE_SCALE));
+                *outline = Some((color, gm));
+            }
+        }
     }
 
-    pub fn outlines(&self) -> impl Iterator<Item = &Gm<Mesh, ColorMaterial>> {
+    pub fn models(&self) -> impl Iterator<Item = &dyn Object> {
         self.order
             .iter()
-            .filter_map(|id| self.cache.get(id).and_then(|c| c.outline.as_ref().map(|(_, gm)| gm)))
+            .filter_map(|id| self.cache.get(id).map(|c| &c.model as &dyn Object))
+            .chain(
+                self.group_order
+                    .iter()
+                    .filter_map(|hash| self.groups.get(hash).map(|g| &g.model as &dyn Object)),
+            )
+    }
+
+    pub fn outlines(&self) -> impl Iterator<Item = &dyn Object> {
+        self.order
+            .iter()
+            .filter_map(|id| {
+                self.cache
+                    .get(id)
+                    .and_then(|c| c.outline.as_ref().map(|(_, gm)| gm as &dyn Object))
+            })
+            .chain(self.group_order.iter().filter_map(|hash| {
+                self.groups
+                    .get(hash)
+                    .and_then(|g| g.outline.as_ref().map(|gm| gm as &dyn Object))
+            }))
     }
 
     /// Geometry for shadow maps: every visible model EXCEPT light gizmos —
     /// a light sits inside its own gizmo mesh, which would shadow the whole
-    /// scene.
-    pub fn shadow_casters(&self) -> Vec<&Mesh> {
+    /// scene. (Instanced groups never contain lights.)
+    pub fn shadow_casters(&self) -> Vec<&dyn Geometry> {
         self.order
             .iter()
             .filter_map(|id| self.cache.get(id))
             .filter(|c| !c.primitive.is_light())
-            .map(|c| &c.model.geometry)
+            .map(|c| &c.model.geometry as &dyn Geometry)
+            .chain(
+                self.group_order
+                    .iter()
+                    .filter_map(|hash| self.groups.get(hash))
+                    .map(|g| &g.model.geometry as &dyn Geometry),
+            )
             .collect()
     }
 }
@@ -343,7 +657,7 @@ fn hash_f32<H: Hasher>(h: &mut H, f: f32) {
 }
 
 /// Hash a primitive's identity (variant + parameters) by float bit patterns.
-fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
+pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
     match *p {
         Primitive::Plane { size } => {
             0u8.hash(h);
@@ -618,5 +932,108 @@ impl WireframeCache {
         }
         self.cache.retain(|id, _| seen.contains(id));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modeler_core::WallCutout;
+
+    fn scene_with_cube() -> (Scene, ObjectId) {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        (scene, id)
+    }
+
+    fn key_of(
+        scene: &Scene,
+        id: ObjectId,
+        tier: OutlineTier,
+        mode: ShadeMode,
+    ) -> Option<(u64, GroupKey)> {
+        instance_key(scene.object(id).unwrap(), tier, mode, false)
+    }
+
+    #[test]
+    fn identical_cubes_share_a_group_regardless_of_base_color() {
+        let (mut scene, a) = scene_with_cube();
+        let b = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        scene.object_mut(b).unwrap().material.base_color = [0.2, 0.4, 0.6];
+
+        let ka = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        let kb = key_of(&scene, b, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        assert_eq!(ka.0, kb.0, "base color must ride per instance, not split groups");
+        assert_eq!(ka.1, kb.1);
+    }
+
+    #[test]
+    fn roughness_splits_groups_in_shaded_but_not_in_solid() {
+        let (mut scene, a) = scene_with_cube();
+        let b = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        scene.object_mut(b).unwrap().material.roughness = 0.1;
+
+        let shaded_a = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        let shaded_b = key_of(&scene, b, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        assert_ne!(shaded_a.1, shaded_b.1);
+
+        let solid_a = key_of(&scene, a, OutlineTier::None, ShadeMode::Solid).unwrap();
+        let solid_b = key_of(&scene, b, OutlineTier::None, ShadeMode::Solid).unwrap();
+        assert_eq!(solid_a.1, solid_b.1, "Solid ignores materials entirely");
+    }
+
+    #[test]
+    fn selection_tier_and_mesh_identity_split_groups() {
+        let (mut scene, a) = scene_with_cube();
+
+        let unselected = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        let selected = key_of(&scene, a, OutlineTier::Selected, ShadeMode::Shaded).unwrap();
+        assert_ne!(unselected.1, selected.1, "outlines are per group");
+
+        scene.object_mut(a).unwrap().subdivision = 2;
+        let subdivided = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        assert_ne!(unselected.1, subdivided.1);
+
+        scene.object_mut(a).unwrap().subdivision = 0;
+        scene.object_mut(a).unwrap().smooth = true;
+        let smooth = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
+        assert_ne!(unselected.1, smooth.1);
+    }
+
+    #[test]
+    fn unique_meshes_and_lights_never_instance() {
+        let mut scene = Scene::new();
+        let edited = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        {
+            let object = scene.object_mut(edited).unwrap();
+            object.edited_mesh = Some(object.render_mesh());
+        }
+        assert!(key_of(&scene, edited, OutlineTier::None, ShadeMode::Shaded).is_none());
+
+        let wall = scene.add_object(
+            Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 },
+            Transform::default(),
+        );
+        assert!(
+            key_of(&scene, wall, OutlineTier::None, ShadeMode::Shaded).is_some(),
+            "pristine walls may instance"
+        );
+        scene.object_mut(wall).unwrap().cutouts.push(WallCutout::door(1.0, 2.0, 2.1));
+        assert!(
+            key_of(&scene, wall, OutlineTier::None, ShadeMode::Shaded).is_none(),
+            "cutouts make the mesh unique"
+        );
+
+        let light = scene.add_object(
+            Primitive::Light {
+                kind: LightKind::Point,
+                color: [1.0, 1.0, 1.0],
+                intensity: 1.0,
+                spot_angle_deg: 45.0,
+                shadows: false,
+            },
+            Transform::default(),
+        );
+        assert!(key_of(&scene, light, OutlineTier::None, ShadeMode::Shaded).is_none());
     }
 }

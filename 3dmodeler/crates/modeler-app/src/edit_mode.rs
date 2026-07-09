@@ -163,8 +163,11 @@ pub fn build_topology(mesh: &MeshData) -> Topology {
                 *edge_use.entry(edge_key(t[k], t[(k + 1) % 3])).or_default() += 1;
             }
         }
-        let outline: Vec<(usize, usize)> =
+        let mut outline: Vec<(usize, usize)> =
             edge_use.iter().filter(|(_, &n)| n == 1).map(|(&e, _)| e).collect();
+        // sorted so downstream consumers (face_loop's start pick, subsurf
+        // vertex order) don't inherit HashMap iteration order
+        outline.sort_unstable();
         let mut group_verts: Vec<usize> = members.iter().flat_map(|&ti| tris[ti]).collect();
         group_verts.sort_unstable();
         group_verts.dedup();

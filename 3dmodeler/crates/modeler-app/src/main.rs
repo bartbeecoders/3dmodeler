@@ -32,6 +32,7 @@ mod theme;
 mod ui;
 mod undo;
 mod wall_tool;
+mod wire_render;
 
 use camera::BlenderCamera;
 use modeler_core::glam;
@@ -142,7 +143,7 @@ pub fn main() {
     let mut shade_mode = scene_render::ShadeMode::Shaded;
     let mut lighting_mode = scene_render::LightingMode::Studio;
     let mut xray = false;
-    let mut wire_cache = scene_render::WireframeCache::new();
+    let mut wire_render = wire_render::WireRender::new(&context);
     let mut grid_built =
         (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
     #[cfg(not(target_arch = "wasm32"))]
@@ -193,8 +194,9 @@ pub fn main() {
         let edit_overlay = edit_mode.overlay(&scene);
         // edit-mode element selection, for "set pivot/anchor to selection"
         let edit_point = edit_mode.active_object().zip(edit_mode.selected_point());
-        let wire_segments = (shade_mode == scene_render::ShadeMode::Wireframe)
-            .then(|| wire_cache.segments(&scene, &sel));
+        if shade_mode == scene_render::ShadeMode::Wireframe {
+            wire_render.sync(&scene, &sel);
+        }
         let fps = 1000.0 / frame_input.elapsed_time.max(0.001) as f32;
         #[cfg(not(target_arch = "wasm32"))]
         let mcp_status = Some(control.as_ref().map(|c| c.status()));
@@ -270,16 +272,6 @@ pub fn main() {
                         frame_input.device_pixel_ratio,
                         overlay_clip,
                         guides,
-                    );
-                }
-                if let Some(segments) = &wire_segments {
-                    overlay::draw_wireframe(
-                        gui_context,
-                        &camera,
-                        frame_input.viewport,
-                        frame_input.device_pixel_ratio,
-                        overlay_clip,
-                        segments,
                     );
                 }
                 if let Some(edit) = &edit_overlay {
@@ -899,9 +891,8 @@ pub fn main() {
 
         let cam = camera.camera(frame_input.viewport);
 
-        let mut render_objects: Vec<&dyn Object> =
-            scene_render.models().map(|m| m as &dyn Object).collect();
-        render_objects.extend(scene_render.outlines().map(|m| m as &dyn Object));
+        let mut render_objects: Vec<&dyn Object> = scene_render.models().collect();
+        render_objects.extend(scene_render.outlines());
         render_objects.push(&grid);
         match camera.vertical_axis_plane() {
             Some(camera::VerticalPlane::Xz) => render_objects.push(&zero_lines_xz),
@@ -916,7 +907,12 @@ pub fn main() {
             .screen()
             .clear(ClearState::color_and_depth(bg[0], bg[1], bg[2], 1.0, 1.0))
             .render(&cam, render_objects, &lights.active())
-            .write(|| gui.render())
+            .write(|| {
+                if shade_mode == scene_render::ShadeMode::Wireframe {
+                    wire_render.render(frame_input.viewport, &cam);
+                }
+                gui.render()
+            })
             .unwrap();
 
         // deliver any pending screenshot requests from the control API

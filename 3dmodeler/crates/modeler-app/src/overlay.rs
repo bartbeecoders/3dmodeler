@@ -196,33 +196,6 @@ pub fn draw_modal_guides(
     }
 }
 
-/// Wireframe shading mode: every visible object as its sharp edges.
-/// Selection tiers echo the outline colors (orange = selected/active).
-pub fn draw_wireframe(
-    ctx: &egui::Context,
-    camera: &BlenderCamera,
-    viewport: Viewport,
-    device_pixel_ratio: f32,
-    clip: egui::Rect,
-    segments: &[crate::scene_render::WireSegment],
-) {
-    const TIERS: [egui::Color32; 3] = [
-        egui::Color32::from_rgb(150, 160, 175),
-        egui::Color32::from_rgb(230, 110, 20),
-        egui::Color32::from_rgb(255, 170, 64),
-    ];
-    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
-    let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
-    for &(a, b, tier) in segments {
-        if let (Some(a), Some(b)) = (project(a), project(b)) {
-            painter.line_segment(
-                [a, b],
-                egui::Stroke::new(1.2, TIERS[usize::from(tier).min(2)]),
-            );
-        }
-    }
-}
-
 /// Edit-mode visuals: the object's wireframe (sharp edges), its vertices in
 /// vertex mode, and the selected element highlighted in orange.
 pub fn draw_edit_mode(
@@ -457,14 +430,20 @@ pub fn draw(
     }
 
     // --- object adornments --------------------------------------------------
+    let worlds = scene.world_transforms(); // one O(N) pass for the frame
     for object in scene.objects() {
         if !object.visible || (!object.show_label && !object.show_dimensions) {
             continue;
         }
-        let world = scene.world_transform(object.id);
+        let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
         let top = world.location
             + Vec3::Z * (object.bounding_radius() * world.scale.z.abs() + 0.15);
         let Some(anchor) = project(top) else { continue };
+        // off-screen labels: skip the text layout and tessellation entirely
+        // (the margin generously covers a label's own extent)
+        if !clip.expand(120.0).contains(anchor) {
+            continue;
+        }
 
         let mut y = anchor.y;
         if object.show_label {
