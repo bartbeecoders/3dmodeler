@@ -774,7 +774,14 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 	taskContext->hasHitEvents = hasHitEvents;
 }
 
-#if defined( B3_SIMD_NEON )
+#if defined( B3_SIMD_AVX2 )
+
+#include <immintrin.h>
+
+// wide float holds 8 numbers
+typedef __m256 b3FloatW;
+
+#elif defined( B3_SIMD_NEON )
 
 #include <arm_neon.h>
 
@@ -787,6 +794,13 @@ typedef float32x4_t b3FloatW;
 
 // wide float holds 4 numbers
 typedef __m128 b3FloatW;
+
+#elif defined( B3_SIMD_W128 )
+
+#include <wasm_simd128.h>
+
+// wide float holds 4 numbers
+typedef v128_t b3FloatW;
 
 #else
 
@@ -829,7 +843,107 @@ typedef struct b3SymMatrix3W
 	b3FloatW cxx, cxy, cxz, cyy, cyz, czz;
 } b3SymMatrix3W;
 
-#if defined( B3_SIMD_NEON )
+#if defined( B3_SIMD_AVX2 )
+
+static inline b3FloatW b3ZeroW( void )
+{
+	return _mm256_setzero_ps();
+}
+
+static inline b3FloatW b3SplatW( float scalar )
+{
+	return _mm256_set1_ps( scalar );
+}
+
+static inline b3FloatW b3NegW( b3FloatW a )
+{
+	// Create a mask with the sign bit set for each element
+	__m256 mask = _mm256_set1_ps( -0.0f );
+
+	// XOR the input with the mask to negate each element
+	return _mm256_xor_ps( a, mask );
+}
+
+static inline b3FloatW b3AddW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_add_ps( a, b );
+}
+
+static inline b3FloatW b3SubW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_sub_ps( a, b );
+}
+
+static inline b3FloatW b3MulW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_mul_ps( a, b );
+}
+
+static inline b3FloatW b3DivW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_div_ps( a, b );
+}
+
+static inline b3FloatW b3SqrtW( b3FloatW a )
+{
+	return _mm256_sqrt_ps( a );
+}
+
+// Cannot use real FMA because it doesn't match the non-SIMD path
+static inline b3FloatW b3MulAddW( b3FloatW a, b3FloatW b, b3FloatW c )
+{
+	return _mm256_add_ps( a, _mm256_mul_ps( b, c ) );
+}
+
+static inline b3FloatW b3MinW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_min_ps( a, b );
+}
+
+static inline b3FloatW b3MaxW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_max_ps( a, b );
+}
+
+// clamp a to [-b, b]
+static inline b3FloatW b3SymClampW( b3FloatW a, b3FloatW b )
+{
+	b3FloatW nb = b3NegW( b );
+	b3FloatW c = b3MaxW( nb, a );
+	return b3MinW( c, b );
+}
+
+static inline b3FloatW b3OrW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_or_ps( a, b );
+}
+
+static inline b3FloatW b3GreaterThanW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_cmp_ps( a, b, _CMP_GT_OQ );
+}
+
+static inline b3FloatW b3EqualsW( b3FloatW a, b3FloatW b )
+{
+	return _mm256_cmp_ps( a, b, _CMP_EQ_OQ );
+}
+
+static inline bool b3AllZeroW( b3FloatW a )
+{
+	// Compare each element with zero
+	b3FloatW cmp = _mm256_cmp_ps( a, _mm256_setzero_ps(), _CMP_EQ_OQ );
+
+	// If all elements are zero, the mask will be 0xFF (11111111 in binary)
+	return _mm256_movemask_ps( cmp ) == 0xFF;
+}
+
+// component-wise returns mask ? b : a
+static inline b3FloatW b3BlendW( b3FloatW a, b3FloatW b, b3FloatW mask )
+{
+	return _mm256_or_ps( _mm256_and_ps( mask, b ), _mm256_andnot_ps( mask, a ) );
+}
+
+#elif defined( B3_SIMD_NEON )
 
 static inline b3FloatW b3ZeroW( void )
 {
@@ -1058,6 +1172,107 @@ static inline bool b3AllZeroW( b3FloatW a )
 static inline b3FloatW b3BlendW( b3FloatW a, b3FloatW b, b3FloatW mask )
 {
 	return _mm_or_ps( _mm_and_ps( mask, b ), _mm_andnot_ps( mask, a ) );
+}
+
+#elif defined( B3_SIMD_W128 )
+
+static inline b3FloatW b3ZeroW( void )
+{
+	return wasm_f32x4_splat( 0.0f );
+}
+
+static inline b3FloatW b3SplatW( float scalar )
+{
+	return wasm_f32x4_splat( scalar );
+}
+
+static inline b3FloatW b3NegW( b3FloatW a )
+{
+	return wasm_f32x4_neg( a );
+}
+
+static inline b3FloatW b3SetW( float a, float b, float c, float d )
+{
+	return wasm_f32x4_make( a, b, c, d );
+}
+
+static inline b3FloatW b3AddW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_add( a, b );
+}
+
+static inline b3FloatW b3SubW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_sub( a, b );
+}
+
+static inline b3FloatW b3MulW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_mul( a, b );
+}
+
+static inline b3FloatW b3DivW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_div( a, b );
+}
+
+static inline b3FloatW b3SqrtW( b3FloatW a )
+{
+	return wasm_f32x4_sqrt( a );
+}
+
+// Cannot use real FMA because it doesn't match the non-SIMD path
+static inline b3FloatW b3MulAddW( b3FloatW a, b3FloatW b, b3FloatW c )
+{
+	return wasm_f32x4_add( a, wasm_f32x4_mul( b, c ) );
+}
+
+// pmin/pmax match the SSE2 semantics (b < a ? b : a), unlike the
+// IEEE-754 NaN-propagating wasm_f32x4_min/max
+static inline b3FloatW b3MinW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_pmin( a, b );
+}
+
+static inline b3FloatW b3MaxW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_pmax( a, b );
+}
+
+// clamp a to [-b, b]
+static inline b3FloatW b3SymClampW( b3FloatW a, b3FloatW b )
+{
+	b3FloatW nb = b3NegW( b );
+	b3FloatW c = b3MaxW( nb, a );
+	return b3MinW( c, b );
+}
+
+static inline b3FloatW b3OrW( b3FloatW a, b3FloatW b )
+{
+	return wasm_v128_or( a, b );
+}
+
+static inline b3FloatW b3GreaterThanW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_gt( a, b );
+}
+
+static inline b3FloatW b3EqualsW( b3FloatW a, b3FloatW b )
+{
+	return wasm_f32x4_eq( a, b );
+}
+
+static inline bool b3AllZeroW( b3FloatW a )
+{
+	b3FloatW cmp = wasm_f32x4_eq( a, wasm_f32x4_splat( 0.0f ) );
+	return wasm_i32x4_bitmask( cmp ) == 0xF;
+}
+
+// component-wise returns mask ? b : a
+static inline b3FloatW b3BlendW( b3FloatW a, b3FloatW b, b3FloatW mask )
+{
+	// bitselect(v1, v2, c): bits from v1 where c is set, else v2
+	return wasm_v128_bitselect( b, a, mask );
 }
 
 #else
@@ -1392,7 +1607,94 @@ typedef struct b3BodyStateW
 	b3QuatW dq;
 } b3BodyStateW;
 
-#if defined( B3_SIMD_SSE2 ) || defined( B3_SIMD_NEON )
+#if defined( B3_SIMD_AVX2 )
+
+// Width-generic lane loops: with 8 lanes the hand-unrolled 4-lane versions
+// below no longer apply. The compiler unrolls these fully.
+static b3BodyStateW b3GatherBodies( const b3BodyState* states, int* indices )
+{
+	b3BodyState dummy = { 0 };
+	dummy.deltaRotation.s = 1.0f;
+
+	b3BodyStateW s;
+	float* vx = (float*)&s.v.X;
+	float* vy = (float*)&s.v.Y;
+	float* vz = (float*)&s.v.Z;
+	float* wx = (float*)&s.w.X;
+	float* wy = (float*)&s.w.Y;
+	float* wz = (float*)&s.w.Z;
+	float* dpx = (float*)&s.dp.X;
+	float* dpy = (float*)&s.dp.Y;
+	float* dpz = (float*)&s.dp.Z;
+	float* dqx = (float*)&s.dq.V.X;
+	float* dqy = (float*)&s.dq.V.Y;
+	float* dqz = (float*)&s.dq.V.Z;
+	float* dqs = (float*)&s.dq.S;
+
+	for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+	{
+		// Indices are 0 for null
+		const b3BodyState* b = indices[lane] == 0 ? &dummy : states + ( indices[lane] - 1 );
+		vx[lane] = b->linearVelocity.x;
+		vy[lane] = b->linearVelocity.y;
+		vz[lane] = b->linearVelocity.z;
+		wx[lane] = b->angularVelocity.x;
+		wy[lane] = b->angularVelocity.y;
+		wz[lane] = b->angularVelocity.z;
+		dpx[lane] = b->deltaPosition.x;
+		dpy[lane] = b->deltaPosition.y;
+		dpz[lane] = b->deltaPosition.z;
+		dqx[lane] = b->deltaRotation.v.x;
+		dqy[lane] = b->deltaRotation.v.y;
+		dqz[lane] = b->deltaRotation.v.z;
+		dqs[lane] = b->deltaRotation.s;
+	}
+	return s;
+}
+
+// This writes only the velocities back to the solver bodies
+static void b3ScatterBodies( b3BodyState* states, int* indices, const b3BodyStateW* simdBody )
+{
+	const float* vx = (const float*)&simdBody->v.X;
+	const float* vy = (const float*)&simdBody->v.Y;
+	const float* vz = (const float*)&simdBody->v.Z;
+	const float* wx = (const float*)&simdBody->w.X;
+	const float* wy = (const float*)&simdBody->w.Y;
+	const float* wz = (const float*)&simdBody->w.Z;
+
+	// I don't use any dummy body in the body array because this will lead to multithreaded sharing and the
+	// associated cache flushing.
+
+	// Warning: indices start at 1 with 0 indicating null
+	for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+	{
+		if ( indices[lane] == 0 || ( states[indices[lane] - 1].flags & b3_dynamicFlag ) == 0 )
+		{
+			continue;
+		}
+
+		b3BodyState* s = states + ( indices[lane] - 1 );
+
+		b3Vec3 v = { vx[lane], vy[lane], vz[lane] };
+		b3Vec3 w = { wx[lane], wy[lane], wz[lane] };
+
+		uint32_t flags = s->flags;
+		if ( flags & b3_allLocks )
+		{
+			v.x = ( flags & b3_lockLinearX ) ? 0.0f : v.x;
+			v.y = ( flags & b3_lockLinearY ) ? 0.0f : v.y;
+			v.z = ( flags & b3_lockLinearZ ) ? 0.0f : v.z;
+			w.x = ( flags & b3_lockAngularX ) ? 0.0f : w.x;
+			w.y = ( flags & b3_lockAngularY ) ? 0.0f : w.y;
+			w.z = ( flags & b3_lockAngularZ ) ? 0.0f : w.z;
+		}
+
+		s->linearVelocity = v;
+		s->angularVelocity = w;
+	}
+}
+
+#elif defined( B3_SIMD_SSE2 ) || defined( B3_SIMD_NEON ) || defined( B3_SIMD_W128 )
 
 static b3BodyStateW b3GatherBodies( const b3BodyState* states, int* indices )
 {

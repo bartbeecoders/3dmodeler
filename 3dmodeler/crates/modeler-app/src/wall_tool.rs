@@ -69,9 +69,10 @@ impl WallTool {
             return None;
         }
         Some(match self.pending {
-            None => "Wall: click the floor to start a wall".to_string(),
+            None => "Wall: click the floor to start a wall   |   RMB/Esc cancel".to_string(),
             Some(_) => format!(
-                "Wall: {} · click to plant the corner and continue",
+                "Wall: {} · click to plant the corner and continue   |   \
+                 Enter finish · RMB/Esc cancel",
                 unit.format(self.current_length)
             ),
         })

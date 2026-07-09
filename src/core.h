@@ -40,7 +40,7 @@
 	#define B3_CPU_X86_X64
 #elif defined( __aarch64__ ) || defined( _M_ARM64 ) || defined( __arm__ ) || defined( _M_ARM )
 	#define B3_CPU_ARM
-#elif defined( __EMSCRIPTEN__ )
+#elif defined( __EMSCRIPTEN__ ) || defined( __wasm__ )
 	#define B3_CPU_WASM
 #else
 	#define B3_CPU_UNKNOWN
@@ -52,7 +52,15 @@
 	#define B3_SIMD_WIDTH 4
 	//#pragma message("B3_SIMD_NONE")
 #else
-	#if defined( B3_CPU_X86_X64 )
+	#if defined( B3_CPU_X86_X64 ) && defined( BOX3D_AVX2 )
+		// 8-wide contact solver (opt-in, needs -mavx2 / /arch:AVX2).
+		// B3_SIMD_SSE2 stays defined: the 3-lane b3V32 collision layer and
+		// anything else 128-bit keep using the SSE2 intrinsics.
+		#define B3_SIMD_AVX2
+		#define B3_SIMD_SSE2
+		#define B3_SIMD_WIDTH 8
+		//#pragma message("B3_SIMD_AVX2")
+	#elif defined( B3_CPU_X86_X64 )
 		#define B3_SIMD_SSE2
 		#define B3_SIMD_WIDTH 4
 		//#pragma message("B3_SIMD_SSE2")
@@ -61,10 +69,24 @@
 		#define B3_SIMD_WIDTH 4
 		//#pragma message("B3_SIMD_NEON")
 	#elif defined( B3_CPU_WASM )
-		#define B3_CPU_WASM
-		#define B3_SIMD_SSE2
-		#define B3_SIMD_WIDTH 4
-		//#pragma message("B3_SIMD_SSE2")
+		#if defined( __EMSCRIPTEN__ )
+			// Emscripten maps the SSE2 intrinsics onto wasm simd128
+			// (compiled with -msimd128 -msse2, see src/CMakeLists.txt)
+			#define B3_SIMD_SSE2
+			#define B3_SIMD_WIDTH 4
+			//#pragma message("B3_SIMD_SSE2")
+		#elif defined( __wasm_simd128__ )
+			// Bare clang (wasi and friends): native wasm simd128 for the
+			// wide contact solver. The 3-lane b3V32 collision layer stays
+			// scalar on this path for now.
+			#define B3_SIMD_W128
+			#define B3_SIMD_WIDTH 4
+			//#pragma message("B3_SIMD_W128")
+		#else
+			#define B3_SIMD_NONE
+			#define B3_SIMD_WIDTH 4
+			//#pragma message("B3_SIMD_NONE")
+		#endif
 	#else
 		#define B3_SIMD_NONE
 		#define B3_SIMD_WIDTH 4

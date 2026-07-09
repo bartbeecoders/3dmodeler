@@ -69,6 +69,9 @@ fn main() {
             .archiver("llvm-ar")
             .flag(format!("--sysroot={}", sysroot.display()))
             .flag("-fno-stack-protector")
+            // wasm simd128 has shipped in every major browser since 2021;
+            // box3d's core.h picks its B3_SIMD_W128 contact solver from this
+            .flag("-msimd128")
             .define("NDEBUG", None)
             .opt_level(2)
             .include(&include_dir)

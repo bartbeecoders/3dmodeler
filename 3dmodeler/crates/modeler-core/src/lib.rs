@@ -12,6 +12,7 @@ pub use glam;
 pub use library::{Library, LibraryAsset};
 pub use mesh::{MeshData, WallCutout};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Stable identifier for an object in the scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -404,6 +405,12 @@ pub struct Object {
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
     pub edited_mesh: Option<MeshData>,
+    /// Subdivision-surface levels (Blender's subsurf modifier, 0 = off):
+    /// the viewport applies this many Catmull-Clark rounds on top of the
+    /// base mesh at render time. The base mesh stays the editing cage and
+    /// the collision shape.
+    #[serde(default)]
+    pub subdivision: u8,
     /// Bumped on every mesh edit so caches (renderer, physics) resync.
     /// Not saved: a fresh session starts with fresh caches anyway.
     #[serde(skip)]
@@ -616,6 +623,9 @@ pub struct Folder {
 #[derive(Debug)]
 pub struct Scene {
     objects: Vec<Object>,
+    /// id → position in `objects`, kept in step with every membership change
+    /// so `object()` / `object_mut()` are O(1) instead of a linear scan.
+    index: HashMap<ObjectId, usize>,
     measurements: Vec<Measurement>,
     reference_images: Vec<ReferenceImage>,
     folders: Vec<Folder>,
@@ -633,6 +643,7 @@ impl Default for Scene {
             std::sync::atomic::AtomicU64::new(1);
         Self {
             objects: Vec::new(),
+            index: HashMap::new(),
             measurements: Vec::new(),
             reference_images: Vec::new(),
             folders: Vec::new(),
@@ -692,8 +703,10 @@ impl Scene {
             cutouts: Vec::new(),
             floor_outline: Vec::new(),
             edited_mesh: None,
+            subdivision: 0,
             mesh_revision: 0,
         });
+        self.index.insert(id, self.objects.len() - 1);
         id
     }
 
@@ -708,7 +721,18 @@ impl Scene {
         object.name = self.unique_name(&object.name);
         object.mesh_revision = 0;
         self.objects.push(object);
+        self.index.insert(ObjectId(self.next_id), self.objects.len() - 1);
         ObjectId(self.next_id)
+    }
+
+    /// Recompute the id → position map after anything that shifts `objects`.
+    fn rebuild_index(&mut self) {
+        self.index = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.id, i))
+            .collect();
     }
 
     fn unique_name(&self, base: &str) -> String {
@@ -729,14 +753,14 @@ impl Scene {
     }
 
     pub fn object(&self, id: ObjectId) -> Option<&Object> {
-        self.objects.iter().find(|o| o.id == id)
+        self.index.get(&id).map(|&i| &self.objects[i])
     }
 
     /// Mutable access; bumps the version (callers are expected to change
     /// something).
     pub fn object_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
         self.version += 1;
-        self.objects.iter_mut().find(|o| o.id == id)
+        self.index.get(&id).map(|&i| &mut self.objects[i])
     }
 
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Object> {
@@ -756,7 +780,9 @@ impl Scene {
                 object.transform = world;
             }
         }
-        Some(self.objects.remove(index))
+        let removed = self.objects.remove(index);
+        self.rebuild_index();
+        Some(removed)
     }
 
     // --- outliner folders ---------------------------------------------------
@@ -847,6 +873,49 @@ impl Scene {
             }
             _ => object.transform,
         }
+    }
+
+    /// World transforms of ALL objects in one memoized pass — O(N) total.
+    /// Per-frame consumers (renderer, physics mirror, wireframe) use this
+    /// instead of calling `world_transform` once per object, which walks the
+    /// parent chain per call.
+    pub fn world_transforms(&self) -> HashMap<ObjectId, Transform> {
+        let mut memo: HashMap<ObjectId, Transform> =
+            HashMap::with_capacity(self.objects.len());
+        let mut chain: Vec<ObjectId> = Vec::new();
+        for object in &self.objects {
+            if memo.contains_key(&object.id) {
+                continue;
+            }
+            // walk up to a memoized ancestor or a root…
+            chain.clear();
+            let mut parent_world: Option<Transform> = None;
+            let mut cur = Some(object.id);
+            while let Some(c) = cur {
+                if let Some(&t) = memo.get(&c) {
+                    parent_world = Some(t);
+                    break;
+                }
+                let Some(o) = self.object(c) else { break };
+                chain.push(c);
+                cur = o.parent.filter(|p| self.object(*p).is_some());
+                if chain.len() > 1000 {
+                    break; // corrupted-cycle guard, mirrors world_transform
+                }
+            }
+            // …then compose back down, memoizing every link.
+            let mut world = parent_world;
+            for &c in chain.iter().rev() {
+                let o = self.object(c).expect("chained ids exist");
+                let w = match world {
+                    Some(pw) => Transform::compose(&pw, &o.transform),
+                    None => o.transform,
+                };
+                memo.insert(c, w);
+                world = Some(w);
+            }
+        }
+        memo
     }
 
     /// Set an object's local transform so that its WORLD transform matches.
@@ -1098,6 +1167,7 @@ impl Scene {
         self.folders = data.folders.clone();
         self.next_id = data.next_id;
         self.version += 1;
+        self.rebuild_index();
     }
 
     pub fn to_json(&self) -> String {
@@ -1247,6 +1317,48 @@ mod tests {
         let object = scene.object(child).unwrap();
         assert_eq!(object.parent, None);
         assert!((object.transform.location - world_before.location).length() < 1e-4);
+    }
+
+    #[test]
+    fn world_transforms_pass_matches_per_object_recursion() {
+        let mut scene = Scene::new();
+        // three-deep chain plus a sibling and a loose root
+        let root = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut t = Transform::default();
+        t.location = Vec3::new(3.0, 0.0, 0.0);
+        t.rotation = Quat::from_rotation_z(0.7);
+        t.scale = Vec3::new(2.0, 1.0, 0.5);
+        let child = scene.add_object(Primitive::Cube { size: 1.0 }, t);
+        let grandchild = scene.add_object(Primitive::Plane { size: 1.0 }, t);
+        let sibling = scene.add_object(Primitive::Cube { size: 1.0 }, t);
+        let loose = scene.add_object(Primitive::Empty { size: 1.0 }, t);
+        scene.set_parent(child, Some(root));
+        scene.set_parent(grandchild, Some(child));
+        scene.set_parent(sibling, Some(root));
+        scene.object_mut(root).unwrap().transform.rotation = Quat::from_rotation_x(0.3);
+
+        let worlds = scene.world_transforms();
+        assert_eq!(worlds.len(), scene.objects().len());
+        for id in [root, child, grandchild, sibling, loose] {
+            let expected = scene.world_transform(id);
+            let got = worlds[&id];
+            assert!((got.location - expected.location).length() < 1e-6, "{id:?}");
+            assert!(
+                got.rotation.dot(expected.rotation).abs() > 1.0 - 1e-6,
+                "{id:?}"
+            );
+            assert!((got.scale - expected.scale).length() < 1e-6, "{id:?}");
+        }
+
+        // index stays correct through removal and restore
+        scene.remove_object(child);
+        assert!(scene.object(child).is_none());
+        assert!(scene.object(grandchild).is_some());
+        let data = scene.snapshot();
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        assert_eq!(restored.object(grandchild).unwrap().id, grandchild);
+        assert_eq!(restored.world_transforms().len(), restored.objects().len());
     }
 
     #[test]

@@ -311,12 +311,26 @@ pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
     message
 }
 
+/// Break-into-bricks target count bounds: the UI slider range and the MCP
+/// clamp. 5,000 bricks step comfortably at 60 Hz (see
+/// Vibecoding/performance-plan.md — the old hard cap of 600 predates the
+/// incremental physics mirror and threaded stepping).
+pub const MIN_BRICKS: usize = 100;
+pub const MAX_BRICKS: usize = 5000;
+pub const DEFAULT_BRICKS: usize = 1000;
+
 /// Replace a wall with individual DYNAMIC bricks in a running bond (odd
 /// courses start with a half brick), openings respected. The bricks keep the
 /// wall's material (with a subtle per-brick shade variation) and density;
-/// they collide and can tumble once the simulation plays. Returns the new
+/// they collide and can tumble once the simulation plays. `target_bricks`
+/// sizes the brick module so the wall yields roughly that many bricks
+/// (openings and course rounding change the exact count). Returns the new
 /// brick ids — None when the object is not a pristine wall.
-pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<ObjectId>> {
+pub fn break_wall_into_bricks(
+    scene: &mut Scene,
+    id: ObjectId,
+    target_bricks: usize,
+) -> Option<Vec<ObjectId>> {
     let object = scene.object(id)?;
     let Primitive::Wall { length, height, thickness } = object.primitive else {
         return None;
@@ -327,17 +341,15 @@ pub fn break_wall_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<Obj
     let wall = scene.world_transform(id);
     let cutouts = object.cutouts.clone();
 
-    // brick module ≈ 0.42 × 0.21 m, enlarged for big walls to cap the count
-    // (physics with thousands of bodies would crawl)
+    // brick module ≈ 0.42 × 0.21 m, scaled (keeping its aspect) so the wall
+    // yields roughly the requested count; bricks never get thinner than 2 cm
     let mut cell_x = 0.42_f32;
     let mut cell_z = 0.21_f32;
     let estimate = (length / cell_x).max(1.0) * (height / cell_z).max(1.0);
-    const MAX_BRICKS: f32 = 600.0;
-    if estimate > MAX_BRICKS {
-        let grow = (estimate / MAX_BRICKS).sqrt();
-        cell_x *= grow;
-        cell_z *= grow;
-    }
+    let target = target_bricks.max(1) as f32;
+    let scale = (estimate / target).sqrt();
+    cell_x = (cell_x * scale).max(0.02);
+    cell_z = (cell_z * scale).max(0.02);
     let rows = ((height / cell_z).round().max(1.0)) as usize;
     let cell_z = height / rows as f32;
     const GAP: f32 = 0.006; // mortar joint, keeps stacked bricks collision-free
@@ -433,11 +445,17 @@ fn replace_with_bricks(
 /// everything else is filled with a running-bond brick grid in its local
 /// frame, dropping bricks whose center falls outside the mesh — spheres,
 /// cones, tori and shaped floors break into their stepped brick
-/// approximation. Lights and empties have no volume: None.
-pub fn break_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<ObjectId>> {
+/// approximation. `target_bricks` sizes the brick module for roughly that
+/// many bricks (curved shapes land under it: bounding-box cells outside the
+/// mesh are dropped). Lights and empties have no volume: None.
+pub fn break_into_bricks(
+    scene: &mut Scene,
+    id: ObjectId,
+    target_bricks: usize,
+) -> Option<Vec<ObjectId>> {
     let object = scene.object(id)?;
     if matches!(object.primitive, Primitive::Wall { .. }) && object.edited_mesh.is_none() {
-        return break_wall_into_bricks(scene, id);
+        return break_wall_into_bricks(scene, id, target_bricks);
     }
     if object.primitive.is_light() || matches!(object.primitive, Primitive::Empty { .. }) {
         return None;
@@ -455,16 +473,19 @@ pub fn break_into_bricks(scene: &mut Scene, id: ObjectId) -> Option<Vec<ObjectId
     }
     let extent = max - min;
 
-    // brick module as in walls, enlarged to cap the body count (physics
-    // with thousands of bodies would crawl)
+    // brick module as in walls, scaled (keeping its aspect) toward the
+    // requested count; bricks never get thinner than 2 cm
     let mut cell = Vec3::new(0.42, 0.21, 0.21);
     let estimate = (extent.x / cell.x).max(1.0)
         * (extent.y / cell.y).max(1.0)
         * (extent.z / cell.z).max(1.0);
-    const MAX_BRICKS: f32 = 600.0;
-    if estimate > MAX_BRICKS {
-        cell *= (estimate / MAX_BRICKS).cbrt();
-    }
+    let target = target_bricks.max(1) as f32;
+    let scale = (estimate / target).cbrt();
+    cell = Vec3::new(
+        (cell.x * scale).max(0.02),
+        (cell.y * scale).max(0.02),
+        (cell.z * scale).max(0.02),
+    );
     const GAP: f32 = 0.006; // mortar joint, keeps stacked bricks collision-free
     // fit whole cells into the bounding box
     let cells = |e: f32, c: f32| ((e / c).round().max(1.0)) as i32;
@@ -778,7 +799,7 @@ mod tests {
             height: 2.1,
         });
 
-        let bricks = break_wall_into_bricks(&mut scene, wall).unwrap();
+        let bricks = break_wall_into_bricks(&mut scene, wall, 200).unwrap();
         assert!(scene.object(wall).is_none(), "the wall is replaced");
         assert!(bricks.len() > 40, "got {} bricks", bricks.len());
 
@@ -831,7 +852,7 @@ mod tests {
         );
         scene.object_mut(sphere).unwrap().name = "Ball".to_string();
 
-        let bricks = break_into_bricks(&mut scene, sphere).expect("sphere breaks");
+        let bricks = break_into_bricks(&mut scene, sphere, DEFAULT_BRICKS).expect("sphere breaks");
         assert!(scene.object(sphere).is_none(), "the sphere is replaced");
         // a decent fill, but corner cells of the bounding box are rejected:
         // strictly fewer bricks than the full 2×2×2 grid would hold
@@ -862,9 +883,33 @@ mod tests {
         let empty = scene.add_object(Primitive::Empty { size: 1.0 }, Transform::default());
         let light =
             scene.add_object(Primitive::light_catalog()[0], Transform::default());
-        assert!(break_into_bricks(&mut scene, empty).is_none());
-        assert!(break_into_bricks(&mut scene, light).is_none());
+        assert!(break_into_bricks(&mut scene, empty, DEFAULT_BRICKS).is_none());
+        assert!(break_into_bricks(&mut scene, light, DEFAULT_BRICKS).is_none());
         assert_eq!(scene.objects().len(), 2, "nothing was consumed");
+    }
+
+    #[test]
+    fn brick_target_count_scales_the_bond() {
+        let make_wall = |scene: &mut Scene| {
+            scene.add_object(
+                Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 },
+                Transform::default(),
+            )
+        };
+
+        let mut scene_few = Scene::new();
+        let wall = make_wall(&mut scene_few);
+        let few = break_wall_into_bricks(&mut scene_few, wall, 200).unwrap().len();
+
+        let mut scene_many = Scene::new();
+        let wall = make_wall(&mut scene_many);
+        let many = break_wall_into_bricks(&mut scene_many, wall, 2000).unwrap().len();
+
+        assert!(few < many, "target must scale the count: {few} !< {many}");
+        // the target is approximate (course rounding, half bricks), but the
+        // result must land in its ballpark
+        assert!((100..=400).contains(&few), "target 200 gave {few}");
+        assert!((1200..=3000).contains(&many), "target 2000 gave {many}");
     }
 
     #[test]

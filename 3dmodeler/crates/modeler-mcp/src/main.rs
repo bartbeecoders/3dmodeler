@@ -121,7 +121,8 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "object": {"type": "string", "description": "Object name (or id as string)"}
+                    "object": {"type": "string", "description": "Object name (or id as string)"},
+                    "bricks": {"type": "integer", "description": "Approximate target brick count, 100..5000 (default 1000); the brick size scales to hit it"}
                 },
                 "required": ["object"]
             }
@@ -152,6 +153,7 @@ fn tool_definitions() -> Value {
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows"},
                     "smooth": {"type": "boolean"},
+                    "subdivision": {"type": "integer", "description": "Subdivision-surface levels 0-4 (Catmull-Clark, applied at render time; 0 = off)"},
                     "visible": {"type": "boolean"},
                     "dynamic": {"type": "boolean"},
                     "density": {"type": "number"},

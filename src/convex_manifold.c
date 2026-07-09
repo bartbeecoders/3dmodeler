@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "algorithm.h"
+#include "core.h"
+#include "ctz.h"
 #include "manifold.h"
 #include "shape.h"
 
@@ -11,6 +13,10 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+
+#if defined( B3_SIMD_SSE2 )
+#include <emmintrin.h>
+#endif
 
 static inline bool b3IsMinkowskiFaceIsolated( b3Vec3 a, b3Vec3 b, b3Vec3 n )
 {
@@ -230,8 +236,174 @@ static b3EdgeQuery b3QueryEdgeDirectionHullAndCapsule( const b3HullData* hull, c
 	};
 }
 
+#if defined( B3_SIMD_SSE2 )
+
+// Max edge PAIRS of hull A staged on the stack for the SIMD edge query;
+// larger hulls (>512 half-edges) take the scalar path.
+#define B3_EDGE_QUERY_LANES_CAP 256
+
+// SIMD version of the hull-hull edge query: the Gauss-map filter tests four
+// edge pairs of A per iteration. All arithmetic uses the same expression
+// trees as the scalar path (b3Dot order, exact sign-flip negation, strict
+// inequalities), so the selected axis and separation are bit-identical.
+static b3EdgeQuery b3QueryEdgeDirectionsSimd( const b3HullData* hullA, const b3HullData* hullB,
+											  b3Transform transformBtoA )
+{
+	float maxSeparation = -FLT_MAX;
+	int maxIndexA = B3_NULL_INDEX;
+	int maxIndexB = B3_NULL_INDEX;
+
+	const b3HullHalfEdge* edgesA = b3GetHullEdges( hullA );
+	const b3Vec3* pointsA = b3GetHullPoints( hullA );
+	const b3Plane* planesA = b3GetHullPlanes( hullA );
+	const b3HullHalfEdge* edgesB = b3GetHullEdges( hullB );
+	const b3Vec3* pointsB = b3GetHullPoints( hullB );
+	const b3Plane* planesB = b3GetHullPlanes( hullB );
+
+	// Work in frame A
+	b3Matrix3 matrix = b3MakeMatrixFromQuat( transformBtoA.q );
+
+	// Stage hull A's edge-pair data as SoA once; every B pair then streams
+	// through it four A pairs at a time. Padding lanes are zero: they always
+	// fail the strict inequalities of the Gauss-map filter.
+	int pairCountA = hullA->edgeCount / 2;
+	int paddedCountA = ( pairCountA + 3 ) & ~3;
+	B3_ASSERT( paddedCountA <= B3_EDGE_QUERY_LANES_CAP + 4 );
+
+	float eAx[B3_EDGE_QUERY_LANES_CAP + 4], eAy[B3_EDGE_QUERY_LANES_CAP + 4], eAz[B3_EDGE_QUERY_LANES_CAP + 4];
+	float uAx[B3_EDGE_QUERY_LANES_CAP + 4], uAy[B3_EDGE_QUERY_LANES_CAP + 4], uAz[B3_EDGE_QUERY_LANES_CAP + 4];
+	float vAx[B3_EDGE_QUERY_LANES_CAP + 4], vAy[B3_EDGE_QUERY_LANES_CAP + 4], vAz[B3_EDGE_QUERY_LANES_CAP + 4];
+
+	for ( int a = 0; a < pairCountA; ++a )
+	{
+		const b3HullHalfEdge* edgeA = edgesA + 2 * a;
+		const b3HullHalfEdge* twinA = edgesA + 2 * a + 1;
+		B3_ASSERT( edgeA->twin == 2 * a + 1 && twinA->twin == 2 * a );
+
+		b3Vec3 pA = pointsA[edgeA->origin];
+		b3Vec3 qA = pointsA[twinA->origin];
+		eAx[a] = qA.x - pA.x;
+		eAy[a] = qA.y - pA.y;
+		eAz[a] = qA.z - pA.z;
+
+		b3Vec3 uA = planesA[edgeA->face].normal;
+		uAx[a] = uA.x;
+		uAy[a] = uA.y;
+		uAz[a] = uA.z;
+
+		b3Vec3 vA = planesA[twinA->face].normal;
+		vAx[a] = vA.x;
+		vAy[a] = vA.y;
+		vAz[a] = vA.z;
+	}
+	for ( int a = pairCountA; a < paddedCountA; ++a )
+	{
+		eAx[a] = eAy[a] = eAz[a] = 0.0f;
+		uAx[a] = uAy[a] = uAz[a] = 0.0f;
+		vAx[a] = vAy[a] = vAz[a] = 0.0f;
+	}
+
+	// Loop invariants the scalar path recomputes per surviving pair — the
+	// expressions are identical, so hoisting cannot change the values.
+	b3Vec3 centerA = hullA->center;
+	b3Vec3 centerB = b3TransformPoint( transformBtoA, hullB->center );
+
+	const __m128 zeroW = _mm_setzero_ps();
+	const __m128 signW = _mm_set1_ps( -0.0f );
+
+	for ( int indexB = 0; indexB < hullB->edgeCount; indexB += 2 )
+	{
+		const b3HullHalfEdge* edgeB = edgesB + indexB;
+		const b3HullHalfEdge* twinB = edgesB + indexB + 1;
+		B3_ASSERT( edgeB->twin == indexB + 1 && twinB->twin == indexB );
+
+		b3Vec3 qB = pointsB[twinB->origin];
+		b3Vec3 eB = b3MulMV( matrix, b3Sub( qB, pointsB[edgeB->origin] ) );
+		qB = b3Add( b3MulMV( matrix, qB ), transformBtoA.p );
+
+		b3Vec3 uB = b3MulMV( matrix, planesB[edgeB->face].normal );
+		b3Vec3 vB = b3MulMV( matrix, planesB[twinB->face].normal );
+
+		__m128 uBx = _mm_set1_ps( uB.x ), uBy = _mm_set1_ps( uB.y ), uBz = _mm_set1_ps( uB.z );
+		__m128 vBx = _mm_set1_ps( vB.x ), vBy = _mm_set1_ps( vB.y ), vBz = _mm_set1_ps( vB.z );
+		__m128 eBx = _mm_set1_ps( eB.x ), eBy = _mm_set1_ps( eB.y ), eBz = _mm_set1_ps( eB.z );
+
+		for ( int a = 0; a < paddedCountA; a += 4 )
+		{
+			__m128 ex = _mm_loadu_ps( eAx + a );
+			__m128 ey = _mm_loadu_ps( eAy + a );
+			__m128 ez = _mm_loadu_ps( eAz + a );
+
+			// cba = dot(uB, eA); dba = dot(vB, eA)
+			__m128 cba = _mm_add_ps( _mm_add_ps( _mm_mul_ps( uBx, ex ), _mm_mul_ps( uBy, ey ) ),
+									 _mm_mul_ps( uBz, ez ) );
+			__m128 dba = _mm_add_ps( _mm_add_ps( _mm_mul_ps( vBx, ex ), _mm_mul_ps( vBy, ey ) ),
+									 _mm_mul_ps( vBz, ez ) );
+
+			__m128 ux = _mm_loadu_ps( uAx + a );
+			__m128 uy = _mm_loadu_ps( uAy + a );
+			__m128 uz = _mm_loadu_ps( uAz + a );
+			__m128 vx = _mm_loadu_ps( vAx + a );
+			__m128 vy = _mm_loadu_ps( vAy + a );
+			__m128 vz = _mm_loadu_ps( vAz + a );
+
+			// adc = -dot(uA, eB); bdc = -dot(vA, eB) — sign-bit flip is the
+			// exact negation the scalar path performs
+			__m128 adc = _mm_xor_ps( _mm_add_ps( _mm_add_ps( _mm_mul_ps( ux, eBx ), _mm_mul_ps( uy, eBy ) ),
+												 _mm_mul_ps( uz, eBz ) ),
+									 signW );
+			__m128 bdc = _mm_xor_ps( _mm_add_ps( _mm_add_ps( _mm_mul_ps( vx, eBx ), _mm_mul_ps( vy, eBy ) ),
+												 _mm_mul_ps( vz, eBz ) ),
+									 signW );
+
+			// isMinkowski = cba*dba < 0 && adc*bdc < 0 && cba*bdc > 0
+			__m128 m1 = _mm_cmplt_ps( _mm_mul_ps( cba, dba ), zeroW );
+			__m128 m2 = _mm_cmplt_ps( _mm_mul_ps( adc, bdc ), zeroW );
+			__m128 m3 = _mm_cmpgt_ps( _mm_mul_ps( cba, bdc ), zeroW );
+			int mask = _mm_movemask_ps( _mm_and_ps( _mm_and_ps( m1, m2 ), m3 ) );
+
+			// surviving lanes in ascending order keep the scalar loop's
+			// first-strictly-greater max semantics
+			while ( mask != 0 )
+			{
+				int lane = (int)b3CTZ32( (uint32_t)mask );
+				mask &= mask - 1;
+
+				int indexA = 2 * ( a + lane );
+				const b3HullHalfEdge* edgeA = edgesA + indexA;
+				const b3HullHalfEdge* twinA = edgesA + indexA + 1;
+				b3Vec3 qA = pointsA[twinA->origin];
+				b3Vec3 eA = b3Sub( qA, pointsA[edgeA->origin] );
+
+				float separation = b3EdgeEdgeSeparation( qA, eA, centerA, qB, eB, centerB );
+				if ( separation > maxSeparation )
+				{
+					maxSeparation = separation;
+					maxIndexA = indexA;
+					maxIndexB = indexB;
+				}
+			}
+		}
+	}
+
+	return (b3EdgeQuery){
+		.separation = maxSeparation,
+		.indexA = maxIndexA,
+		.indexB = maxIndexB,
+	};
+}
+
+#endif
+
 static b3EdgeQuery b3QueryEdgeDirections( const b3HullData* hullA, const b3HullData* hullB, b3Transform transformBtoA )
 {
+#if defined( B3_SIMD_SSE2 )
+	if ( hullA->edgeCount <= 2 * B3_EDGE_QUERY_LANES_CAP )
+	{
+		return b3QueryEdgeDirectionsSimd( hullA, hullB, transformBtoA );
+	}
+#endif
+
 	// Find axis of minimum penetration
 	float maxSeparation = -FLT_MAX;
 	int maxIndexA = B3_NULL_INDEX;

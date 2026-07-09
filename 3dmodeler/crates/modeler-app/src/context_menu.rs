@@ -116,6 +116,7 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
+        brick_dialog: &mut Option<i32>,
     ) -> Option<String> {
         let Some((pos, target)) = self.state else { return None };
         let mut status = None;
@@ -183,7 +184,7 @@ impl ContextMenu {
             self.pending_click = false;
             if let Some(slot) = hovered {
                 status = self.execute(
-                    slot, kind, target, scene, selection, modal, library_panel,
+                    slot, kind, target, scene, selection, modal, library_panel, brick_dialog,
                 );
             }
             self.state = None;
@@ -202,6 +203,7 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
+        brick_dialog: &mut Option<i32>,
     ) -> Option<String> {
         match (kind, target) {
             (WheelKind::Object { wall, rebuild }, Target::Object { id, hit_local }) => {
@@ -303,12 +305,11 @@ impl ContextMenu {
                             None
                         }
                     },
-                    8 => crate::object_ops::break_into_bricks(scene, id).map(|bricks| {
-                        let count = bricks.len();
-                        let active = bricks.first().copied();
-                        selection.set(bricks, active);
-                        format!("broken into {count} bricks — Space simulates")
-                    }),
+                    8 => {
+                        // opens the brick-count dialog; the break happens there
+                        *brick_dialog = Some(crate::object_ops::DEFAULT_BRICKS as i32);
+                        None
+                    }
                     _ => None,
                 }
             }

@@ -1415,7 +1415,9 @@ static void b3BulletBodyTask( int startIndex, int endIndex, int workerIndex, voi
 	b3TracyCZoneEnd( bullet_body_task );
 }
 
-#if B3_SIMD_WIDTH == 4
+#if B3_SIMD_WIDTH == 8
+#define B3_SIMD_SHIFT 3
+#elif B3_SIMD_WIDTH == 4
 #define B3_SIMD_SHIFT 2
 #else
 #define B3_SIMD_SHIFT 0
@@ -1452,18 +1454,43 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 
 		// count contacts, joints, and colors
 		int activeColorCount = 0;
+		int graphConvexCount = 0;
+		int graphMeshCount = 0;
+		int graphJointCount = 0;
 		for ( int i = 0; i < B3_GRAPH_COLOR_COUNT - 1; ++i )
 		{
 			int perColorContactCount = colors[i].convexContacts.count + colors[i].contacts.count;
 			int perColorJointCount = colors[i].jointSims.count;
 			int occupancyCount = perColorContactCount + perColorJointCount;
 			activeColorCount += occupancyCount > 0 ? 1 : 0;
+			graphConvexCount += colors[i].convexContacts.count;
+			graphMeshCount += colors[i].contacts.count;
+			graphJointCount += perColorJointCount;
 		}
 
 		// prepare for move events
 		b3Array_Resize( world->bodyMoveEvents, awakeBodyCount );
 
 		int workerCount = world->workerCount;
+
+		// Clamp the fork-join width to the work the step actually has.
+		// Every solver worker spins through every stage sync point (substeps
+		// x colors x phases = dozens per step), so on a nearly-asleep world
+		// the spinning dwarfs the tiny stages and extra workers make the step
+		// SLOWER than single-threaded (benchmark/large_world: one million
+		// static bodies, ~100 awake spheres, negative thread scaling). The
+		// weights reflect per-constraint solve cost: mesh contacts run the
+		// scalar multi-manifold path and are far heavier than packed convex
+		// contacts (benchmark/trees100: only ~50 bodies but big compound-vs-
+		// mesh manifolds — it must keep its workers). One extra worker per
+		// ~2048 work units keeps busy scenes fully parallel and sparse steps
+		// serial. The stage machine already tolerates fewer running workers
+		// than world->workerCount (see b3SolverTask); per-worker bit sets
+		// are still cleared for ALL workers below so the merge loops never
+		// see stale bits.
+		int workEstimate = awakeBodyCount + 4 * graphConvexCount + 8 * graphJointCount + 256 * graphMeshCount;
+		int maxUsefulWorkers = 1 + workEstimate / 2048;
+		workerCount = maxUsefulWorkers < workerCount ? maxUsefulWorkers : workerCount;
 
 		// Target 4 blocks per worker to allow work stealing
 		const int maxBlockCount = 4 * workerCount;
@@ -1799,13 +1826,20 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 
 		int jointIdCapacity = b3GetIdCapacity( &world->jointIdPool );
 		int contactIdCapacity = b3GetIdCapacity( &world->contactIdPool );
-		for ( int i = 0; i < workerCount; ++i )
+
+		// Clear per-worker scratch for EVERY worker, not just the ones the
+		// work clamp spawns this step: the merge loops after the solve walk
+		// world->workerCount contexts and must not see a previous step's bits.
+		for ( int i = 0; i < world->workerCount; ++i )
 		{
 			b3TaskContext* taskContext = b3Array_Get( world->taskContexts, i );
 			b3SetBitCountAndClear( &taskContext->jointStateBitSet, jointIdCapacity );
 			b3SetBitCountAndClear( &taskContext->hitEventBitSet, contactIdCapacity );
 			taskContext->hasHitEvents = false;
+		}
 
+		for ( int i = 0; i < workerCount; ++i )
+		{
 			workerContext[i].context = stepContext;
 			workerContext[i].workerIndex = i;
 

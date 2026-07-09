@@ -14,6 +14,7 @@ mod cutout_handles;
 mod edit_mode;
 mod grid;
 mod library;
+mod mesh_edit;
 mod modal;
 mod object_ops;
 mod io;
@@ -219,6 +220,7 @@ pub fn main() {
                     &mut settings,
                     &mut library,
                     edit_point,
+                    edit_mode.active().then_some(&mut edit_mode),
                     &mut wall_tool,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
@@ -640,6 +642,7 @@ pub fn main() {
             &mut scene,
             &sel,
             egui_owns_keyboard,
+            pointer_over_ui,
             tab_pressed,
             physics.is_stopped(),
             settings.unit,

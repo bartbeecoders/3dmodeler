@@ -4,6 +4,7 @@
 // Dirk Gregorius contributed portions of this code
 
 #include "algorithm.h"
+#include "core.h"
 #include "hull_map.h"
 #include "math_internal.h"
 #include "shape.h"
@@ -11,6 +12,10 @@
 #include "box3d/collision.h"
 #include "box3d/constants.h"
 #include "box3d/math_functions.h"
+
+#if defined( B3_SIMD_SSE2 )
+#include <emmintrin.h>
+#endif
 
 #include <float.h>
 #include <stdbool.h>
@@ -1615,7 +1620,63 @@ int b3FindHullSupportVertex( const b3HullData* hull, b3Vec3 direction )
 	int vertexCount = hull->vertexCount;
 	const b3Vec3* points = b3GetHullPoints( hull );
 
-	for ( int index = 0; index < vertexCount; ++index )
+	int index = 0;
+
+#if defined( B3_SIMD_SSE2 )
+	// Four dot products per iteration. The per-lane arithmetic matches the
+	// scalar b3Dot exactly ((x*x + y*y) + z*z, no FMA), and the reduction
+	// picks the smallest index among equal maxima — the same vertex the
+	// scalar first-strictly-greater scan selects — so the result is
+	// bit-identical to the scalar loop below. Small hulls (boxes, low-poly
+	// cylinders) stay on the scalar loop: the gather + reduction overhead
+	// only amortizes on bigger vertex clouds.
+	if ( vertexCount >= 16 )
+	{
+		__m128 dirX = _mm_set1_ps( direction.x );
+		__m128 dirY = _mm_set1_ps( direction.y );
+		__m128 dirZ = _mm_set1_ps( direction.z );
+
+		__m128 bestDotW = _mm_set1_ps( -FLT_MAX );
+		__m128i bestIndexW = _mm_set1_epi32( -1 );
+		__m128i indexW = _mm_setr_epi32( 0, 1, 2, 3 );
+		const __m128i stepW = _mm_set1_epi32( 4 );
+
+		int blockEnd = vertexCount & ~3;
+		for ( ; index < blockEnd; index += 4 )
+		{
+			const b3Vec3* p = points + index;
+			__m128 px = _mm_setr_ps( p[0].x, p[1].x, p[2].x, p[3].x );
+			__m128 py = _mm_setr_ps( p[0].y, p[1].y, p[2].y, p[3].y );
+			__m128 pz = _mm_setr_ps( p[0].z, p[1].z, p[2].z, p[3].z );
+
+			__m128 dot = _mm_add_ps( _mm_add_ps( _mm_mul_ps( dirX, px ), _mm_mul_ps( dirY, py ) ),
+									 _mm_mul_ps( dirZ, pz ) );
+
+			__m128 greater = _mm_cmpgt_ps( dot, bestDotW );
+			bestDotW = _mm_or_ps( _mm_and_ps( greater, dot ), _mm_andnot_ps( greater, bestDotW ) );
+			__m128i greaterI = _mm_castps_si128( greater );
+			bestIndexW =
+				_mm_or_si128( _mm_and_si128( greaterI, indexW ), _mm_andnot_si128( greaterI, bestIndexW ) );
+			indexW = _mm_add_epi32( indexW, stepW );
+		}
+
+		float laneDots[4];
+		int32_t laneIndices[4];
+		_mm_storeu_ps( laneDots, bestDotW );
+		_mm_storeu_si128( (__m128i*)laneIndices, bestIndexW );
+		for ( int lane = 0; lane < 4; ++lane )
+		{
+			// equal dots take the smaller vertex index, matching the scalar scan
+			if ( laneDots[lane] > bestDot || ( laneDots[lane] == bestDot && laneIndices[lane] < bestIndex ) )
+			{
+				bestDot = laneDots[lane];
+				bestIndex = laneIndices[lane];
+			}
+		}
+	}
+#endif
+
+	for ( ; index < vertexCount; ++index )
 	{
 		float dot = b3Dot( direction, points[index] );
 		if ( dot > bestDot )

@@ -161,6 +161,18 @@ if (BOX3D_DISABLE_SIMD)
 	target_compile_definitions(box3d PRIVATE BOX3D_DISABLE_SIMD)
 endif()
 
+if (BOX3D_AVX2)
+	message(STATUS "Box3D AVX2 ON (8-wide contact solver)")
+	target_compile_definitions(box3d PRIVATE BOX3D_AVX2)
+	if (MSVC)
+		target_compile_options(box3d PRIVATE /arch:AVX2)
+	else()
+		# Deliberately NOT -mfma: the solver avoids fused ops so SIMD and
+		# scalar paths stay bit-identical (see b3MulAddW).
+		target_compile_options(box3d PRIVATE -mavx2)
+	endif()
+endif()
+
 if (BOX3D_DOUBLE_PRECISION)
 	message(STATUS "Box3D double precision ON")
 	# PUBLIC: consumers must see the same precision mode in the headers or they cannot match the ABI

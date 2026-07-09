@@ -14,6 +14,12 @@ pub struct MeshData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     pub indices: Vec<u32>,
+    /// Edges cut by the user (loop cut), as position-index pairs. Purely
+    /// topological: the welded edit-mode view keeps coplanar faces separated
+    /// across these edges, which would otherwise merge back into one face
+    /// group and make the cut unselectable. Renderers ignore them.
+    #[serde(default)]
+    pub seams: Vec<(u32, u32)>,
 }
 
 impl MeshData {
@@ -416,7 +422,7 @@ pub fn floor_polygon(outline: &[Vec2], thickness: f32) -> MeshData {
 /// Ear-clipping triangulation of a simple CCW polygon; returns index triples
 /// into `points`. Degenerate input yields a partial (possibly empty) result
 /// rather than looping forever.
-fn triangulate(points: &[Vec2]) -> Vec<[u32; 3]> {
+pub fn triangulate(points: &[Vec2]) -> Vec<[u32; 3]> {
     let mut idx: Vec<u32> = (0..points.len() as u32).collect();
     let mut tris = Vec::new();
     let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
@@ -581,6 +587,7 @@ pub fn ico_sphere(subdivisions: u32, radius: f32) -> MeshData {
         normals: positions.clone(),
         positions: positions.into_iter().map(|p| p * radius).collect(),
         indices: faces.into_flattened(),
+        seams: Vec::new(),
     }
 }
 

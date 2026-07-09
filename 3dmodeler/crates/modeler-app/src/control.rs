@@ -212,6 +212,7 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "group": object.group,
         "visible": object.visible,
         "smooth": object.smooth,
+        "subdivision": object.subdivision,
         "dynamic": object.dynamic,
         "density": object.density,
         "color": object.material.base_color,
@@ -380,6 +381,10 @@ fn apply_object_params(
     }
     if let Some(v) = params.get("smooth").and_then(Value::as_bool) {
         object.smooth = v;
+    }
+    if let Some(v) = params.get("subdivision").and_then(Value::as_u64) {
+        object.subdivision = v.min(4) as u8;
+        object.mesh_revision += 1; // the viewport mesh cache keys on it
     }
     if let Some(v) = params.get("visible").and_then(Value::as_bool) {
         object.visible = v;
@@ -694,7 +699,15 @@ fn execute_inner(
         }
         "break_into_bricks" => {
             let id = resolve(scene, &command["object"])?;
-            let bricks = crate::object_ops::break_into_bricks(scene, id)
+            // optional target count, clamped to the UI slider range
+            let target = command["bricks"]
+                .as_u64()
+                .map(|n| {
+                    (n as usize)
+                        .clamp(crate::object_ops::MIN_BRICKS, crate::object_ops::MAX_BRICKS)
+                })
+                .unwrap_or(crate::object_ops::DEFAULT_BRICKS);
+            let bricks = crate::object_ops::break_into_bricks(scene, id, target)
                 .ok_or("this object cannot break into bricks (no volume)")?;
             selection.retain_existing(|i| scene.object(i).is_some());
             Ok(json!({"count": bricks.len()}))

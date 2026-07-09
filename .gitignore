@@ -1,4 +1,5 @@
 build/
+build-*/
 imgui.ini
 settings.ini
 .vscode/
@@ -9,6 +10,7 @@ CMakeUserPresets.json
 .cache/
 .idea/
 .claude/
+.grok/
 .tmp/
 .fetchcontent-cache/
 *.b3rec

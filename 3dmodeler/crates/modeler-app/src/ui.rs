@@ -6,6 +6,7 @@
 
 use crate::camera::BlenderCamera;
 use crate::context_menu::ContextMenu;
+use crate::edit_mode::{EditMode, SelectMode};
 use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
@@ -80,6 +81,10 @@ pub struct UiState {
     about_texture: Option<egui::TextureHandle>,
     import_open: bool,
     import_buffer: String,
+    /// Break-into-Bricks dialog: Some(target count) while open. Set by the
+    /// Object menu, the properties panel and the context wheel; the window
+    /// itself lives in `brick_dialog_window`.
+    brick_dialog: Option<i32>,
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
     settings_window: SettingsWindow,
@@ -126,6 +131,7 @@ impl UiState {
             about_texture: None,
             import_open: false,
             import_buffer: String::new(),
+            brick_dialog: None,
             status_message: None,
             current_file: None,
             settings_window: SettingsWindow::new(),
@@ -174,6 +180,7 @@ impl UiState {
         settings: &mut Settings,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
+        edit: Option<&mut EditMode>,
         wall_tool: &mut crate::wall_tool::WallTool,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
@@ -229,7 +236,7 @@ impl UiState {
         let top_offset = menu_offset
             + self.toolbar(
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
-                snap_to_vertex, shade_mode, lighting_mode, xray,
+                snap_to_vertex, shade_mode, lighting_mode, xray, edit,
             );
         let bottom_offset = self.status_bar(
             ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
@@ -244,6 +251,7 @@ impl UiState {
         self.about_window(ctx);
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
+        self.brick_dialog_window(ctx, scene, selection);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
         if let Some(message) = self.ref_setup.window(ctx, scene, settings) {
@@ -258,6 +266,7 @@ impl UiState {
             selection,
             modal,
             &mut self.library_panel,
+            &mut self.brick_dialog,
         ) {
             self.status_message = Some(message);
         }
@@ -351,6 +360,7 @@ impl UiState {
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
                                     &mut self.library_panel, &mut self.status_message,
+                                    &mut self.brick_dialog,
                                 ),
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
@@ -401,6 +411,7 @@ impl UiState {
         shade_mode: &mut ShadeMode,
         lighting_mode: &mut LightingMode,
         xray: &mut bool,
+        edit: Option<&mut EditMode>,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::top("toolbar").show(ctx, |ui| {
@@ -477,6 +488,23 @@ impl UiState {
                     modal.begin_scale(scene, selection);
                 }
                 ui.separator();
+
+                // edit mode: vertex / edge / face element select (1/2/3)
+                if let Some(edit) = edit {
+                    for (mode, tip) in [
+                        (SelectMode::Vertex, "Vertex select (1)"),
+                        (SelectMode::Edge, "Edge select (2)"),
+                        (SelectMode::Face, "Face select (3)"),
+                    ] {
+                        if select_mode_button(ui, edit.mode == mode, mode)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            edit.set_mode(mode);
+                        }
+                    }
+                    ui.separator();
+                }
 
                 // snapping toggles
                 toggle(
@@ -722,6 +750,77 @@ impl UiState {
     #[cfg(not(target_arch = "wasm32"))]
     fn save_as_window(&mut self, _ctx: &egui::Context, _scene: &Scene, _settings: &Settings) {}
 
+    /// Break-into-Bricks dialog: slider for the target brick count (100 to
+    /// 5000 — 100 floor, then steps of 200 — default 1000), then break the
+    /// active object on confirm.
+    fn brick_dialog_window(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+    ) {
+        let Some(mut value) = self.brick_dialog else { return };
+        let mut open = true;
+        let mut do_break = false;
+        let mut cancel = false;
+        egui::Window::new("Break into Bricks")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let name = selection
+                    .active()
+                    .and_then(|id| scene.object(id))
+                    .map(|o| o.name.clone())
+                    .unwrap_or_default();
+                ui.label(format!("Break '{name}' into approximately:"));
+                ui.add(
+                    egui::Slider::new(
+                        &mut value,
+                        object_ops::MIN_BRICKS as i32..=object_ops::MAX_BRICKS as i32,
+                    )
+                    .text("bricks"),
+                );
+                // snap: 100 at the floor, multiples of 200 above it
+                value = if value < 150 { 100 } else { ( value + 100 ) / 200 * 200 };
+                ui.small("Openings, curvature and course rounding vary the exact count.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Break").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        do_break = true;
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if do_break {
+            if let Some(id) = selection.active() {
+                if let Some(bricks) =
+                    object_ops::break_into_bricks(scene, id, value.max(1) as usize)
+                {
+                    self.status_message = Some(format!(
+                        "broken into {} bricks — Space simulates",
+                        bricks.len()
+                    ));
+                    let active = bricks.first().copied();
+                    selection.set(bricks, active);
+                }
+            }
+            self.brick_dialog = None;
+        } else if cancel || !open {
+            self.brick_dialog = None;
+        } else {
+            self.brick_dialog = Some(value);
+        }
+    }
+
     fn import_window(&mut self, ctx: &egui::Context, scene: &mut Scene, undo: &mut UndoStack) {
         if !self.import_open {
             return;
@@ -836,7 +935,8 @@ impl UiState {
                     }
                     SimState::Paused => "PAUSED · Space resume · Esc stop".to_string(),
                     SimState::Stopped => match modal_status {
-                        Some(status) => format!("{status}   |   LMB/Enter confirm · RMB/Esc cancel"),
+                        // every modal status carries its own confirm/cancel hint
+                        Some(status) => status.clone(),
                         None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Sidebar"
                             .to_string(),
                     },
@@ -995,7 +1095,9 @@ impl UiState {
                     }
                     ui.separator();
                 }
-                if let Some(message) = properties(ui, scene, selection, settings, edit_point) {
+                if let Some(message) =
+                    properties(ui, scene, selection, settings, edit_point, &mut self.brick_dialog)
+                {
                     self.status_message = Some(message);
                 }
             });
@@ -1630,7 +1732,8 @@ fn add_menu_items(
     status: &mut Option<String>,
 ) -> bool {
     if let Some(primitive) = crate::add_menu::mesh_menu_buttons(ui) {
-        scene.add_object(primitive, Transform::default());
+        let id = scene.add_object(primitive, Transform::default());
+        selection.set(vec![id], Some(id));
         return true;
     }
     ui.separator();
@@ -1666,7 +1769,8 @@ fn add_menu_items(
             .on_hover_text(tip)
             .clicked()
         {
-            scene.add_object(*light, Transform::default());
+            let id = scene.add_object(*light, Transform::default());
+            selection.set(vec![id], Some(id));
             return true;
         }
     }
@@ -1712,6 +1816,7 @@ fn object_menu(
     physics: &mut PhysicsMirror,
     library_panel: &mut LibraryPanel,
     status: &mut Option<String>,
+    brick_dialog: &mut Option<i32>,
 ) -> bool {
     let has_selection = !selection.is_empty();
     let mut close = false;
@@ -1781,25 +1886,16 @@ fn object_menu(
             !o.primitive.is_light() && !matches!(o.primitive, Primitive::Empty { .. })
         });
     if ui
-        .add_enabled(breakable_active, egui::Button::new("Break into Bricks"))
+        .add_enabled(breakable_active, egui::Button::new("Break into Bricks…"))
         .on_hover_text(
             "Replace the active object with individual dynamic bricks \
              (running bond; walls keep their openings, curved shapes get a \
              stepped approximation) that collide and tumble when the \
-             simulation plays (Space)",
+             simulation plays (Space). Opens a dialog to pick the brick count",
         )
         .clicked()
     {
-        if let Some(id) = selection.active() {
-            if let Some(bricks) = object_ops::break_into_bricks(scene, id) {
-                *status = Some(format!(
-                    "broken into {} bricks — Space simulates",
-                    bricks.len()
-                ));
-                let active = bricks.first().copied();
-                selection.set(bricks, active);
-            }
-        }
+        *brick_dialog = Some(object_ops::DEFAULT_BRICKS as i32);
         close = true;
     }
     let rebuild_folder = selection
@@ -2279,6 +2375,7 @@ fn properties(
     selection: &mut Selection,
     settings: &Settings,
     edit_point: Option<(ObjectId, Vec3)>,
+    brick_dialog: &mut Option<i32>,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
         ui.weak("No active object");
@@ -2435,6 +2532,7 @@ fn properties(
                     changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
                 }
             });
+
         // wall openings (doors & windows) — cutout edits regenerate the mesh
         if let Primitive::Wall { length, height, .. } = primitive {
             let mut cutouts = object.cutouts.clone();
@@ -2449,6 +2547,31 @@ fn properties(
             }
         }
     }
+
+    // subdivision surface (Blender's subsurf modifier): render-time
+    // Catmull-Clark on the base mesh; edit mode keeps editing the cage
+    let mut subdivision_change = None;
+    if !primitive.is_light() && !matches!(primitive, Primitive::Empty { .. }) {
+        egui::CollapsingHeader::new("Subdivision Surface")
+            .default_open(object.subdivision > 0)
+            .show(ui, |ui| {
+                let mut levels = object.subdivision as u32;
+                if int_row(ui, "Levels", &mut levels, 0..=4) {
+                    subdivision_change = Some(levels as u8);
+                }
+                if object.subdivision > 0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "smooths the viewport mesh; editing and physics \
+                             use the base shape",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                }
+            });
+    }
+
     // any solid object can shatter; lights and empties have no volume
     let breakable = !object.primitive.is_light()
         && !matches!(object.primitive, Primitive::Empty { .. });
@@ -2532,6 +2655,12 @@ fn properties(
             object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
+    if let Some(levels) = subdivision_change {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.subdivision = levels;
+            object.mesh_revision += 1;
+        }
+    }
     if revert_mesh {
         if let Some(object) = scene.object_mut(active_id) {
             object.edited_mesh = None;
@@ -2539,14 +2668,47 @@ fn properties(
         }
     }
     if break_bricks {
-        if let Some(bricks) = object_ops::break_into_bricks(scene, active_id) {
-            let count = bricks.len();
-            let active = bricks.first().copied();
-            selection.set(bricks, active);
-            return Some(format!("broken into {count} bricks — Space simulates"));
-        }
+        *brick_dialog = Some(object_ops::DEFAULT_BRICKS as i32);
     }
     None
+}
+
+/// Toolbar toggle for the edit-mode element select, with a painted
+/// vertex / edge / face pictogram (text glyphs don't cover these shapes).
+fn select_mode_button(ui: &mut egui::Ui, active: bool, mode: SelectMode) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(26.0, 20.0), egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, active);
+    if active || response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let color = visuals.fg_stroke.color;
+    let r = rect.shrink2(egui::vec2(8.0, 5.5));
+    let painter = ui.painter();
+    let corners = [r.left_bottom(), r.center_top(), r.right_bottom()];
+    match mode {
+        SelectMode::Vertex => {
+            for c in corners {
+                painter.circle_filled(c, 2.0, color);
+            }
+        }
+        SelectMode::Edge => {
+            painter.line_segment(
+                [corners[0], corners[1]],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.circle_filled(corners[0], 2.0, color);
+            painter.circle_filled(corners[1], 2.0, color);
+        }
+        SelectMode::Face => {
+            painter.add(egui::Shape::convex_polygon(
+                corners.to_vec(),
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    response
 }
 
 fn vec3_row(

@@ -183,7 +183,8 @@ impl AddMenu {
             if let Some(slot) = hovered {
                 match items[slot].0 {
                     PieItem::Primitive(primitive) => {
-                        scene.add_object(primitive, Transform::default());
+                        let id = scene.add_object(primitive, Transform::default());
+                        selection.set(vec![id], Some(id));
                     }
                     PieItem::Wall => wall_tool.start(settings),
                     PieItem::Floor => {

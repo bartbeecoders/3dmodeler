@@ -106,6 +106,20 @@ void b3ParallelFor( b3World* world, b3ParallelForCallback* callback, int itemCou
 	shared.context = context;
 	b3AtomicStoreInt( &shared.nextBlock, 0 );
 
+	// A single block (itemCount <= minRange) has no parallelism to exploit:
+	// run it on the calling thread (worker 0 by convention, like the
+	// solver's caller context) and skip the scheduler round-trip — a
+	// semaphore wake costs more than one minRange chunk of work. Anything
+	// larger keeps its workers: per-item cost varies too much between
+	// callers (a broad-phase pair item is a whole tree query) to cap by
+	// item count safely.
+	if ( taskCount == 1 )
+	{
+		b3ParallelForTask task = { &shared, 0 };
+		b3ParallelForTrampoline( &task );
+		return;
+	}
+
 	b3ParallelForTask tasks[B3_MAX_WORKERS];
 	void* handles[B3_MAX_WORKERS];
 	for ( int i = 0; i < taskCount; ++i )

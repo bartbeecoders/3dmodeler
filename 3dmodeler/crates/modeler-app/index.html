@@ -23,7 +23,8 @@
 <body>
   <!-- three-d attaches to the first canvas element in the DOM -->
   <canvas id="canvas"></canvas>
-  <link data-trunk rel="rust" data-bin="modeler-app" />
+  <!-- wasm-opt runs on release builds only (trunk fetches binaryen itself) -->
+  <link data-trunk rel="rust" data-bin="modeler-app" data-wasm-opt="4" />
   <script>
     // Keyboard shortcuts should work immediately, without a first click.
     const focusCanvas = () => {

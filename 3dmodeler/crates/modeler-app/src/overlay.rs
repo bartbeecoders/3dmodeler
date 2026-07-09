@@ -237,6 +237,8 @@ pub fn draw_edit_mode(
     const WIRE: egui::Color32 = egui::Color32::from_rgba_premultiplied(150, 160, 175, 200);
     const VERT: egui::Color32 = egui::Color32::from_rgb(210, 215, 225);
     const SELECTED: egui::Color32 = egui::Color32::from_rgb(255, 170, 64);
+    /// Pending loop-cut / bevel geometry (Blender-style preview yellow).
+    const PREVIEW: egui::Color32 = egui::Color32::from_rgb(255, 230, 80);
 
     let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
     let project = |p: Vec3| to_egui(camera, viewport, device_pixel_ratio, p);
@@ -244,6 +246,12 @@ pub fn draw_edit_mode(
     for &(a, b) in &overlay.edges {
         if let (Some(a), Some(b)) = (project(a), project(b)) {
             painter.line_segment([a, b], egui::Stroke::new(1.0, WIRE));
+        }
+    }
+    // pending loop-cut / bevel preview edges
+    for &(a, b) in &overlay.highlight {
+        if let (Some(a), Some(b)) = (project(a), project(b)) {
+            painter.line_segment([a, b], egui::Stroke::new(2.5, PREVIEW));
         }
     }
     for &v in &overlay.verts {

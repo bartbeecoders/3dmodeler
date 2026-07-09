@@ -51,3 +51,12 @@ In the add object menu, or shift-A menu, add a small icon, pictogram of the obje
 
 
 Add an empty point as a new object. (3 lines, x,y,z)
+
+
+
+Add loop cut:
+- in object edit mode, select an edge and press Ctrl + R to add a loop cut
+- middle mouse wheel to increase/decrease the number of cuts
+Add bevel tool:
+- in object edit mode, select an edge and press Ctrl + B to add a bevel
+- middle mouse wheel to increase/decrease the bevel amount

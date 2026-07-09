@@ -9,6 +9,7 @@ use crate::selection::Selection;
 use modeler_core::glam;
 use modeler_core::{LightKind, MeshData, Material, ObjectId, Primitive, Scene, Transform};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use three_d::*;
 
 /// Viewport shading mode (Blender's Z pie, reduced).
@@ -54,6 +55,17 @@ struct CachedModel {
 pub struct SceneRender {
     cache: HashMap<ObjectId, CachedModel>,
     order: Vec<ObjectId>,
+}
+
+/// The mesh the viewport shows: the base mesh with the object's
+/// subdivision-surface levels applied. Editing and collision keep using
+/// the base mesh (the cage), like Blender's subsurf modifier.
+fn display_mesh(object: &modeler_core::Object) -> MeshData {
+    let base = object.render_mesh();
+    if object.subdivision == 0 {
+        return base;
+    }
+    crate::mesh_edit::subdivide(&base, object.subdivision, object.smooth)
 }
 
 fn to_cpu_mesh(data: &MeshData) -> CpuMesh {
@@ -143,6 +155,7 @@ impl SceneRender {
             return; // edges are drawn by the overlay; keep the cache warm
         }
         let mut seen: HashSet<ObjectId> = HashSet::new();
+        let worlds = scene.world_transforms(); // one O(N) pass for the frame
 
         for object in scene.objects() {
             if !object.visible {
@@ -150,7 +163,8 @@ impl SceneRender {
             }
             seen.insert(object.id);
             self.order.push(object.id);
-            let transformation = transform_mat(&scene.world_transform(object.id));
+            let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
+            let transformation = transform_mat(&world);
 
             let rebuild_mesh = match self.cache.get(&object.id) {
                 Some(cached) => {
@@ -170,25 +184,64 @@ impl SceneRender {
             };
 
             if rebuild_mesh {
-                let cpu_mesh = to_cpu_mesh(&object.render_mesh());
-                let model = Gm::new(
-                    Mesh::new(context, &cpu_mesh),
-                    physical_material(context, &object.material, &object.primitive, mode, xray),
-                );
-                self.cache.insert(
-                    object.id,
-                    CachedModel {
-                        primitive: object.primitive,
-                        smooth: object.smooth,
-                        mesh_revision: object.mesh_revision,
-                        mode,
-                        xray,
-                        material: object.material,
-                        cpu_mesh,
-                        model,
-                        outline: None,
-                    },
-                );
+                let new_mesh = display_mesh(object);
+                // Edit-mode vertex drags bump mesh_revision every frame but
+                // keep the topology: update the existing vertex buffers in
+                // place instead of recreating mesh + material + outline.
+                let updated_in_place = (|| {
+                    let cached = self.cache.get_mut(&object.id)?;
+                    if cached.primitive != object.primitive || cached.smooth != object.smooth {
+                        return None;
+                    }
+                    let same_topology = match (&cached.cpu_mesh.positions, &cached.cpu_mesh.indices)
+                    {
+                        (Positions::F32(old_pos), Indices::U32(old_idx)) => {
+                            old_pos.len() == new_mesh.positions.len()
+                                && old_idx.as_slice() == new_mesh.indices.as_slice()
+                        }
+                        _ => false,
+                    };
+                    if !same_topology {
+                        return None;
+                    }
+                    let positions: Vec<Vec3> =
+                        new_mesh.positions.iter().map(|p| vec3(p.x, p.y, p.z)).collect();
+                    let normals: Vec<Vec3> =
+                        new_mesh.normals.iter().map(|n| vec3(n.x, n.y, n.z)).collect();
+                    cached.model.geometry.set_positions(&positions).ok()?;
+                    cached.model.geometry.set_normals(&normals).ok()?;
+                    if let Some((_, outline)) = &mut cached.outline {
+                        outline.geometry.set_positions(&positions).ok()?;
+                        outline.geometry.set_normals(&normals).ok()?;
+                    }
+                    cached.cpu_mesh.positions = Positions::F32(positions);
+                    cached.cpu_mesh.normals = Some(normals);
+                    cached.mesh_revision = object.mesh_revision;
+                    Some(())
+                })()
+                .is_some();
+
+                if !updated_in_place {
+                    let cpu_mesh = to_cpu_mesh(&new_mesh);
+                    let model = Gm::new(
+                        Mesh::new(context, &cpu_mesh),
+                        physical_material(context, &object.material, &object.primitive, mode, xray),
+                    );
+                    self.cache.insert(
+                        object.id,
+                        CachedModel {
+                            primitive: object.primitive,
+                            smooth: object.smooth,
+                            mesh_revision: object.mesh_revision,
+                            mode,
+                            xray,
+                            material: object.material,
+                            cpu_mesh,
+                            model,
+                            outline: None,
+                        },
+                    );
+                }
             } else if rebuild_material {
                 let cached = self.cache.get_mut(&object.id).unwrap();
                 cached.material = object.material;
@@ -285,6 +338,120 @@ pub struct SceneLights {
 const ATTENUATION: Attenuation = Attenuation { constant: 1.0, linear: 0.0, quadratic: 0.15 };
 const SHADOW_MAP_SIZE: u32 = 1024;
 
+fn hash_f32<H: Hasher>(h: &mut H, f: f32) {
+    f.to_bits().hash(h);
+}
+
+/// Hash a primitive's identity (variant + parameters) by float bit patterns.
+fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
+    match *p {
+        Primitive::Plane { size } => {
+            0u8.hash(h);
+            hash_f32(h, size);
+        }
+        Primitive::Cube { size } => {
+            1u8.hash(h);
+            hash_f32(h, size);
+        }
+        Primitive::UvSphere { segments, rings, radius } => {
+            2u8.hash(h);
+            (segments, rings).hash(h);
+            hash_f32(h, radius);
+        }
+        Primitive::IcoSphere { subdivisions, radius } => {
+            3u8.hash(h);
+            subdivisions.hash(h);
+            hash_f32(h, radius);
+        }
+        Primitive::Cylinder { vertices, radius, depth } => {
+            4u8.hash(h);
+            vertices.hash(h);
+            hash_f32(h, radius);
+            hash_f32(h, depth);
+        }
+        Primitive::Cone { vertices, radius_bottom, radius_top, depth } => {
+            5u8.hash(h);
+            vertices.hash(h);
+            hash_f32(h, radius_bottom);
+            hash_f32(h, radius_top);
+            hash_f32(h, depth);
+        }
+        Primitive::Torus { major_segments, minor_segments, major_radius, minor_radius } => {
+            6u8.hash(h);
+            (major_segments, minor_segments).hash(h);
+            hash_f32(h, major_radius);
+            hash_f32(h, minor_radius);
+        }
+        Primitive::Wall { length, height, thickness } => {
+            7u8.hash(h);
+            hash_f32(h, length);
+            hash_f32(h, height);
+            hash_f32(h, thickness);
+        }
+        Primitive::Floor { width, depth, thickness } => {
+            8u8.hash(h);
+            hash_f32(h, width);
+            hash_f32(h, depth);
+            hash_f32(h, thickness);
+        }
+        Primitive::Empty { size } => {
+            9u8.hash(h);
+            hash_f32(h, size);
+        }
+        Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } => {
+            10u8.hash(h);
+            match kind {
+                LightKind::Point => 0u8.hash(h),
+                LightKind::Sun => 1u8.hash(h),
+                LightKind::Spot => 2u8.hash(h),
+            }
+            for c in color {
+                hash_f32(h, c);
+            }
+            hash_f32(h, intensity);
+            hash_f32(h, spot_angle_deg);
+            shadows.hash(h);
+        }
+    }
+}
+
+/// Content signature of everything that affects scene lights and their
+/// shadow maps: light objects (parameters + placement) and shadow casters
+/// (geometry identity + placement + visibility). Replaces keying on the
+/// global scene version, which regenerated EVERY shadow map on ANY edit —
+/// a drag bumps the version every frame.
+fn lighting_signature(scene: &Scene) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let worlds = scene.world_transforms();
+    for object in scene.objects() {
+        if !object.visible {
+            continue;
+        }
+        let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
+        object.id.0.hash(&mut h);
+        for f in [
+            world.location.x,
+            world.location.y,
+            world.location.z,
+            world.rotation.x,
+            world.rotation.y,
+            world.rotation.z,
+            world.rotation.w,
+            world.scale.x,
+            world.scale.y,
+            world.scale.z,
+        ] {
+            hash_f32(&mut h, f);
+        }
+        hash_primitive(&mut h, &object.primitive);
+        // casters: mesh identity (edits bump the revision; smooth changes
+        // re-upload the mesh the shadow map renders)
+        object.mesh_revision.hash(&mut h);
+        object.smooth.hash(&mut h);
+    }
+    h.finish()
+}
+
 impl SceneLights {
     pub fn new(context: &Context) -> Self {
         // Z-up studio rig: key light from above-left, cool fill from the
@@ -307,9 +474,10 @@ impl SceneLights {
         }
     }
 
-    /// Rebuild the scene lights (and shadow maps) if the scene, shading or
-    /// lighting mode changed. Call AFTER `SceneRender::sync` — shadow maps
-    /// render the current models.
+    /// Rebuild the scene lights (and shadow maps) if the LIGHTING-RELEVANT
+    /// content changed (lights or casters — not arbitrary scene edits, and
+    /// not the global version, which bumps every frame of a drag). Call
+    /// AFTER `SceneRender::sync` — shadow maps render the current models.
     pub fn sync(
         &mut self,
         context: &Context,
@@ -319,7 +487,8 @@ impl SceneLights {
         mode: LightingMode,
     ) {
         self.use_scene = shade == ShadeMode::Shaded && mode == LightingMode::Scene;
-        let key = (scene.instance(), scene.version(), mode, shade);
+        let signature = if self.use_scene { lighting_signature(scene) } else { 0 };
+        let key = (scene.instance(), signature, mode, shade);
         if self.synced == Some(key) {
             return;
         }
@@ -411,6 +580,7 @@ impl WireframeCache {
     pub fn segments(&mut self, scene: &Scene, selection: &Selection) -> Vec<WireSegment> {
         let mut out = Vec::new();
         let mut seen: HashSet<ObjectId> = HashSet::new();
+        let worlds = scene.world_transforms(); // one O(N) pass for the frame
         for object in scene.objects() {
             if !object.visible {
                 continue;
@@ -423,7 +593,7 @@ impl WireframeCache {
                 None => true,
             };
             if stale {
-                let topo = crate::edit_mode::build_topology(&object.render_mesh());
+                let topo = crate::edit_mode::build_topology(&display_mesh(object));
                 let edges: Vec<(glam::Vec3, glam::Vec3)> = topo
                     .edges
                     .iter()
@@ -434,7 +604,7 @@ impl WireframeCache {
                     (object.primitive, object.smooth, object.mesh_revision, edges),
                 );
             }
-            let world = scene.world_transform(object.id);
+            let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
             let tier = if selection.active() == Some(object.id) {
                 2
             } else if selection.is_selected(object.id) {

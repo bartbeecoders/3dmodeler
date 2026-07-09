@@ -1,0 +1,5 @@
+# wasm simd128 has shipped in every major browser since 2021 (Safari 16.4).
+# The box3d C build gets it via -msimd128 in box3d-sys/build.rs; this enables
+# it for the Rust side (glam and friends) too.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

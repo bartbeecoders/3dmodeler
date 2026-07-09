@@ -525,7 +525,8 @@ impl ModalTransform {
                 }
                 let shown = delta * unit.per_meter();
                 state.status = format!(
-                    "Move: ({:.p$}, {:.p$}, {:.p$}) {}{}{}{}",
+                    "Move: ({:.p$}, {:.p$}, {:.p$}) {}{}{}{}   |   \
+                     LMB/Enter confirm · RMB/Esc cancel",
                     shown.x,
                     shown.y,
                     shown.z,
@@ -581,7 +582,7 @@ impl ModalTransform {
                 // the world axis back into screen space; sign*sign = 1)
                 state.screen_sweep = sign * angle;
                 state.status = format!(
-                    "Rotate: {:.1}°{}{}",
+                    "Rotate: {:.1}°{}{}   |   LMB/Enter confirm · RMB/Esc cancel",
                     angle.to_degrees(),
                     constraint_tag,
                     numeric_tag
@@ -623,7 +624,10 @@ impl ModalTransform {
                         f
                     }
                 };
-                state.status = format!("Scale: {:.3}{}{}", factor, constraint_tag, numeric_tag);
+                state.status = format!(
+                    "Scale: {:.3}{}{}   |   LMB/Enter confirm · RMB/Esc cancel",
+                    factor, constraint_tag, numeric_tag
+                );
                 for entry in &state.originals {
                     let mut world = entry.world;
                     world.location = state.pivot + (entry.world.location - state.pivot) * factors;
@@ -674,6 +678,13 @@ fn write_targets(
         writes.push((f.id, new_world(scene, p).to_local(&f.world)));
     }
     for (id, local) in writes {
+        // Skip no-op writes: an idle modal (mouse not moving) recomputes
+        // bit-identical transforms every frame, and object_mut bumps the
+        // scene version even when nothing changes — which used to rebuild
+        // the physics mirror and shadow maps once per idle frame.
+        if scene.object(id).is_some_and(|o| o.transform == local) {
+            continue;
+        }
         if let Some(object) = scene.object_mut(id) {
             object.transform = local;
         }

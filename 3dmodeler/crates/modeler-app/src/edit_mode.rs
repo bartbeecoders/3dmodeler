@@ -10,8 +10,11 @@
 //! Topology is a welded view of the triangle mesh: coincident vertices are
 //! merged, faces are connected coplanar triangle groups (a cube shows 6
 //! faces, not 12 triangles) and edges are the boundaries between groups.
+//! User-cut seams (loop cut) also split face groups — without them a cut
+//! across a flat face would melt back into one group and be unselectable.
 
 use crate::camera::BlenderCamera;
+use crate::mesh_edit;
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
@@ -60,8 +63,14 @@ pub struct FaceGroup {
 pub struct Topology {
     /// Unique positions (local space).
     pub verts: Vec<Vec3>,
-    /// Welded index per mesh-position index.
+    /// Welded index per mesh-position index (inverse of `verts_of_weld`;
+    /// hot paths use the inverse — this direction serves the loop-cut /
+    /// bevel surgery and occasional lookups).
     pub weld_of: Vec<usize>,
+    /// Inverse of `weld_of`: mesh-position indices per welded vertex, so a
+    /// vertex drag writes only its own duplicates instead of scanning the
+    /// whole mesh per moved weld.
+    pub verts_of_weld: Vec<Vec<usize>>,
     /// Welded corner ids per triangle.
     pub tris: Vec<[usize; 3]>,
     pub faces: Vec<FaceGroup>,
@@ -109,6 +118,14 @@ pub fn build_topology(mesh: &MeshData) -> Topology {
         }
     }
 
+    // user-cut seams, as welded pairs: face groups must not span them
+    let seams: std::collections::HashSet<(usize, usize)> = mesh
+        .seams
+        .iter()
+        .filter(|&&(a, b)| (a as usize) < weld_of.len() && (b as usize) < weld_of.len())
+        .map(|&(a, b)| edge_key(weld_of[a as usize], weld_of[b as usize]))
+        .collect();
+
     // faces: flood-fill connected triangles with matching normals
     let mut face_of = vec![usize::MAX; tris.len()];
     let mut faces: Vec<FaceGroup> = Vec::new();
@@ -124,7 +141,11 @@ pub fn build_topology(mesh: &MeshData) -> Topology {
             members.push(ti);
             let t = tris[ti];
             for k in 0..3 {
-                for &other in &edge_tris[&edge_key(t[k], t[(k + 1) % 3])] {
+                let key = edge_key(t[k], t[(k + 1) % 3]);
+                if seams.contains(&key) {
+                    continue;
+                }
+                for &other in &edge_tris[&key] {
                     if face_of[other] == usize::MAX
                         && normals[other].dot(normals[seed]) > 0.9995
                     {
@@ -155,7 +176,12 @@ pub fn build_topology(mesh: &MeshData) -> Topology {
     edges.sort_unstable();
     edges.dedup();
 
-    Topology { verts, weld_of, tris, faces, edges }
+    let mut verts_of_weld: Vec<Vec<usize>> = vec![Vec::new(); verts.len()];
+    for (i, &w) in weld_of.iter().enumerate() {
+        verts_of_weld[w].push(i);
+    }
+
+    Topology { verts, weld_of, verts_of_weld, tris, faces, edges }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -179,6 +205,38 @@ struct Grab {
     status: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ToolKind {
+    LoopCut { cuts: usize },
+    Bevel { width: f32, limit: f32, segments: usize },
+}
+
+/// Modal loop-cut / bevel session (Ctrl+R / Ctrl+B on a selected edge). The
+/// operator re-runs from the pre-tool mesh on every parameter change (wheel
+/// notch, bevel drag), so scrubbing stays non-destructive; LMB/Enter keeps
+/// the preview, RMB/Esc restores the base mesh.
+struct EdgeTool {
+    kind: ToolKind,
+    /// Selected edge, in `base_topo` welded ids.
+    edge: (usize, usize),
+    base_mesh: MeshData,
+    base_topo: Topology,
+    /// The object had no edited mesh before the tool (pristine primitive) —
+    /// cancel then removes the bake instead of restoring `base_mesh`.
+    was_pristine: bool,
+    /// Newly created edges of the preview (local space), highlighted in the
+    /// overlay so the pending cut/chamfer reads at a glance.
+    highlight: Vec<(Vec3, Vec3)>,
+    status: String,
+    /// Bevel drag mapping, frozen at tool start (loop cut leaves it unused):
+    /// the edge midpoint on screen, the mouse distance to it and the width
+    /// at that moment, and world meters per pixel at the edge's depth.
+    mid_screen: (f32, f32),
+    start_dist: f32,
+    start_width: f32,
+    world_per_px: f32,
+}
+
 pub struct EditMode {
     active: Option<ObjectId>,
     pub mode: SelectMode,
@@ -190,6 +248,7 @@ pub struct EditMode {
     /// silently rebind to an unrelated object.
     scene_instance: u64,
     grab: Option<Grab>,
+    tool: Option<EdgeTool>,
     last_mouse: (f32, f32),
 }
 
@@ -250,6 +309,7 @@ impl EditMode {
             topo_revision: 0,
             scene_instance: 0,
             grab: None,
+            tool: None,
             last_mouse: (0.0, 0.0),
         }
     }
@@ -258,8 +318,10 @@ impl EditMode {
         self.active.is_some()
     }
 
+    /// A modal interaction (vertex grab or loop-cut/bevel) owns the input:
+    /// suppresses the context menu and batches undo checkpoints.
     pub fn grabbing(&self) -> bool {
-        self.grab.is_some()
+        self.grab.is_some() || self.tool.is_some()
     }
 
     /// The object being edited, if edit mode is on.
@@ -319,11 +381,12 @@ impl EditMode {
     /// Status-bar line while edit mode is on.
     pub fn status_line(&self) -> Option<String> {
         let _ = self.active?;
-        Some(match &self.grab {
-            Some(grab) => grab.status.clone(),
-            None => format!(
-                "EDIT MODE ({}) · click select · G/R/S transform · P/A set pivot/anchor · \
-                 1/2/3 vertex/edge/face · Tab exit",
+        Some(match (&self.grab, &self.tool) {
+            (Some(grab), _) => grab.status.clone(),
+            (None, Some(tool)) => tool.status.clone(),
+            (None, None) => format!(
+                "EDIT MODE ({}) · click select · G/R/S transform · Ctrl+R loop cut · \
+                 Ctrl+B bevel · P/A pivot/anchor · 1/2/3 vertex/edge/face · Tab exit",
                 self.mode.label()
             ),
         })
@@ -334,6 +397,7 @@ impl EditMode {
         if let Some(grab) = self.grab.take() {
             self.cancel_grab_inner(scene, grab);
         }
+        self.cancel_tool(scene);
         self.active = None;
         self.selected = None;
         self.topo = None;
@@ -343,6 +407,7 @@ impl EditMode {
         self.active = Some(id);
         self.selected = None;
         self.grab = None;
+        self.tool = None;
         self.scene_instance = scene.instance();
         self.rebuild_topology(scene);
     }
@@ -368,7 +433,7 @@ impl EditMode {
             None => self.exit(scene),
             Some(object) => {
                 if object.mesh_revision != self.topo_revision || self.topo.is_none() {
-                    if self.grab.is_none() {
+                    if self.grab.is_none() && self.tool.is_none() {
                         let sel = self.selected;
                         self.rebuild_topology(scene);
                         // keep the selection if it still exists
@@ -397,6 +462,7 @@ impl EditMode {
         scene: &mut Scene,
         selection: &Selection,
         egui_owns_keyboard: bool,
+        pointer_over_ui: bool,
         tab_pressed: bool,
         sim_stopped: bool,
         unit: Unit,
@@ -425,12 +491,18 @@ impl EditMode {
                         grab.cur_mouse = self.last_mouse;
                         *handled = true;
                     }
+                    if self.tool.is_some() {
+                        *handled = true;
+                    }
                 }
+                // pointer_over_ui uses this frame's egui state — the `handled`
+                // flag alone lags a frame, so a click that lands on a UI
+                // panel could also confirm a running grab/tool here
                 Event::MousePress { button, position, handled, .. }
-                    if !*handled && *button != MouseButton::Middle =>
+                    if !*handled && !pointer_over_ui && *button != MouseButton::Middle =>
                 {
                     self.last_mouse = (position.x, position.y);
-                    if self.grab.is_some() {
+                    if self.grab.is_some() || self.tool.is_some() {
                         match button {
                             MouseButton::Left => confirm = true,
                             MouseButton::Right => cancel = true,
@@ -442,28 +514,48 @@ impl EditMode {
                     *handled = true;
                 }
                 Event::MouseRelease { button, handled, .. }
-                    if self.grab.is_some() && *button != MouseButton::Middle =>
+                    if (self.grab.is_some() || self.tool.is_some())
+                        && *button != MouseButton::Middle =>
                 {
                     *handled = true;
                 }
-                Event::KeyPress { kind, handled, .. } if !*handled && !egui_owns_keyboard => {
+                // loop cut / bevel: the wheel scrubs the parameter (zoom is
+                // suspended for the duration of the tool)
+                Event::MouseWheel { delta, handled, .. }
+                    if !*handled && self.tool.is_some() =>
+                {
+                    if delta.1 != 0.0 {
+                        let notches = if delta.1 > 0.0 { 1 } else { -1 };
+                        self.adjust_tool(notches, scene, unit);
+                    }
+                    *handled = true;
+                }
+                Event::KeyPress { kind, modifiers, handled } if !*handled && !egui_owns_keyboard => {
                     match kind {
-                        Key::Enter if self.grab.is_some() => {
+                        Key::Enter if self.grab.is_some() || self.tool.is_some() => {
                             confirm = true;
                             *handled = true;
                         }
-                        Key::Escape if self.grab.is_some() => {
+                        Key::Escape if self.grab.is_some() || self.tool.is_some() => {
                             cancel = true;
+                            *handled = true;
+                        }
+                        Key::R if modifiers.ctrl && self.grab.is_none() && self.tool.is_none() => {
+                            self.start_edge_tool(false, scene, camera, viewport, unit);
+                            *handled = true;
+                        }
+                        Key::B if modifiers.ctrl && self.grab.is_none() && self.tool.is_none() => {
+                            self.start_edge_tool(true, scene, camera, viewport, unit);
                             *handled = true;
                         }
                         // the tool owns the keyboard while grabbing (digits
                         // are camera views otherwise)
-                        _ if self.grab.is_some() => *handled = true,
+                        _ if self.grab.is_some() || self.tool.is_some() => *handled = true,
                         _ => {}
                     }
                 }
                 Event::Text(text) if !egui_owns_keyboard && !text.is_empty() => {
-                    let consumed = self.text_input(text.as_str(), scene);
+                    let consumed = self.tool.is_some() || self.text_input(text.as_str(), scene);
                     if consumed {
                         text.clear();
                     }
@@ -476,13 +568,19 @@ impl EditMode {
             if let Some(grab) = self.grab.take() {
                 self.cancel_grab_inner(scene, grab);
             }
+            self.cancel_tool(scene);
         }
         if let Some((x, y)) = click {
             self.pick(scene, camera, viewport, x, y);
         }
         self.apply_grab(scene, camera, viewport, unit);
+        self.drag_tool(scene, unit);
         if confirm {
             self.grab = None; // positions already applied
+            if self.tool.take().is_some() {
+                // preview mesh stays; the old edge ids no longer apply
+                self.selected = None;
+            }
         }
     }
 
@@ -544,7 +642,7 @@ impl EditMode {
         }
     }
 
-    fn set_mode(&mut self, mode: SelectMode) {
+    pub fn set_mode(&mut self, mode: SelectMode) {
         if self.mode != mode {
             self.mode = mode;
             self.selected = None;
@@ -800,10 +898,8 @@ impl EditMode {
 
         for &(weld, new_pos) in positions {
             topo.verts[weld] = new_pos;
-            for (i, &w) in topo.weld_of.iter().enumerate() {
-                if w == weld {
-                    mesh.positions[i] = new_pos;
-                }
+            for &i in &topo.verts_of_weld[weld] {
+                mesh.positions[i] = new_pos;
             }
         }
         mesh.recompute_normals();
@@ -813,6 +909,159 @@ impl EditMode {
 
     fn cancel_grab_inner(&mut self, scene: &mut Scene, grab: Grab) {
         self.write_positions(scene, &grab.originals);
+    }
+
+    // --- loop cut / bevel (modal edge tools) ---------------------------------
+
+    /// Ctrl+R (loop cut) / Ctrl+B (bevel) on a selected edge. Does nothing
+    /// when the edge doesn't support the operator (no quad ring to cut, or
+    /// not a simple box corner to bevel).
+    fn start_edge_tool(
+        &mut self,
+        bevel: bool,
+        scene: &mut Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        unit: Unit,
+    ) {
+        let Some(Element::Edge(a, b)) = self.selected else { return };
+        let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
+        let was_pristine = object.edited_mesh.is_none();
+        let base_mesh = object.render_mesh();
+        let base_topo = build_topology(&base_mesh);
+        let mut start_width = 0.0;
+        let kind = if bevel {
+            let Some(limit) = mesh_edit::bevel_limit(&base_topo, (a, b)) else { return };
+            start_width = limit / 9.0;
+            ToolKind::Bevel { width: start_width, limit, segments: 1 }
+        } else {
+            ToolKind::LoopCut { cuts: 1 }
+        };
+        // bevel drag reference: moving the mouse away from / toward the
+        // edge's screen position widens / narrows the bevel (Blender-style)
+        let world = scene.world_transform(object.id);
+        let mid = local_to_world(&world, 0.5 * (base_topo.verts[a] + base_topo.verts[b]));
+        let mid_cg = three_d::vec3(mid.x, mid.y, mid.z);
+        let mid_screen = camera.world_to_screen(viewport, mid_cg);
+        let start_dist = ((self.last_mouse.0 - mid_screen.0).powi(2)
+            + (self.last_mouse.1 - mid_screen.1).powi(2))
+        .sqrt();
+        let world_per_px = camera.world_per_pixel_at(viewport, mid_cg);
+        let mut tool = EdgeTool {
+            kind,
+            edge: (a, b),
+            base_mesh,
+            base_topo,
+            was_pristine,
+            highlight: Vec::new(),
+            status: String::new(),
+            mid_screen,
+            start_dist,
+            start_width,
+            world_per_px,
+        };
+        if self.apply_tool(&mut tool, scene, unit) {
+            self.selected = None;
+            self.tool = Some(tool);
+        }
+    }
+
+    /// Run the operator from the base mesh and put the result on the object
+    /// (the live preview). False when the topology doesn't support it.
+    fn apply_tool(&mut self, tool: &mut EdgeTool, scene: &mut Scene, unit: Unit) -> bool {
+        let result = match tool.kind {
+            ToolKind::LoopCut { cuts } => {
+                mesh_edit::loop_cut(&tool.base_mesh, &tool.base_topo, tool.edge, cuts)
+            }
+            ToolKind::Bevel { width, segments, .. } => {
+                mesh_edit::bevel_edge(&tool.base_mesh, &tool.base_topo, tool.edge, width, segments)
+            }
+        };
+        let Some(mesh) = result else { return false };
+        let Some(id) = self.active else { return false };
+        let Some(object) = scene.object_mut(id) else { return false };
+        object.edited_mesh = Some(mesh);
+        object.mesh_revision += 1;
+        self.rebuild_topology(scene);
+
+        // highlight the created geometry: edges whose endpoints are both new
+        if let Some(topo) = &self.topo {
+            let base_verts: std::collections::HashSet<(i64, i64, i64)> =
+                tool.base_topo.verts.iter().map(|&v| weld_key(v)).collect();
+            tool.highlight = topo
+                .edges
+                .iter()
+                .filter(|&&(a, b)| {
+                    !base_verts.contains(&weld_key(topo.verts[a]))
+                        && !base_verts.contains(&weld_key(topo.verts[b]))
+                })
+                .map(|&(a, b)| (topo.verts[a], topo.verts[b]))
+                .collect();
+        }
+        tool.status = match tool.kind {
+            ToolKind::LoopCut { cuts } => format!(
+                "Loop Cut: {cuts} cut{}   |   wheel add/remove · LMB/Enter confirm · RMB/Esc cancel",
+                if cuts == 1 { "" } else { "s" },
+            ),
+            ToolKind::Bevel { width, segments, .. } => format!(
+                "Bevel: {:.p$} {} · {segments} segment{}   |   move width · wheel segments · \
+                 LMB/Enter confirm · RMB/Esc cancel",
+                width * unit.per_meter(),
+                unit.suffix(),
+                if segments == 1 { "" } else { "s" },
+                p = unit.decimals(),
+            ),
+        };
+        true
+    }
+
+    /// Mouse-wheel notch while the tool runs: more/fewer cuts, more/fewer
+    /// bevel segments. Re-applies the preview from the base mesh.
+    fn adjust_tool(&mut self, notches: i32, scene: &mut Scene, unit: Unit) {
+        let Some(mut tool) = self.tool.take() else { return };
+        match &mut tool.kind {
+            ToolKind::LoopCut { cuts } => {
+                *cuts = (*cuts as i32 + notches).clamp(1, 32) as usize;
+            }
+            ToolKind::Bevel { segments, .. } => {
+                *segments = (*segments as i32 + notches).clamp(1, 16) as usize;
+            }
+        }
+        self.apply_tool(&mut tool, scene, unit);
+        self.tool = Some(tool);
+    }
+
+    /// Mouse motion while the bevel runs: the cursor's distance to the edge
+    /// on screen sets the width, like Blender's modal bevel. Loop cut
+    /// ignores motion (its cuts stay evenly spaced). Called once per frame;
+    /// re-applies only when the width actually changed.
+    fn drag_tool(&mut self, scene: &mut Scene, unit: Unit) {
+        let Some(mut tool) = self.tool.take() else { return };
+        if let ToolKind::Bevel { width, limit, .. } = &mut tool.kind {
+            let dist = ((self.last_mouse.0 - tool.mid_screen.0).powi(2)
+                + (self.last_mouse.1 - tool.mid_screen.1).powi(2))
+            .sqrt();
+            let new = (tool.start_width + (dist - tool.start_dist) * tool.world_per_px)
+                .clamp(*limit / 72.0, *limit);
+            if (new - *width).abs() > 1e-6 {
+                *width = new;
+                self.apply_tool(&mut tool, scene, unit);
+            }
+        }
+        self.tool = Some(tool);
+    }
+
+    /// RMB/Esc: restore the pre-tool mesh and re-select the edge.
+    fn cancel_tool(&mut self, scene: &mut Scene) {
+        let Some(tool) = self.tool.take() else { return };
+        let Some(id) = self.active else { return };
+        if let Some(object) = scene.object_mut(id) {
+            object.edited_mesh = (!tool.was_pristine).then_some(tool.base_mesh);
+            object.mesh_revision += 1;
+        }
+        self.rebuild_topology(scene);
+        let edge = Element::Edge(tool.edge.0, tool.edge.1);
+        self.selected = self.element_exists(edge).then_some(edge);
     }
 
     // --- overlay data --------------------------------------------------------
@@ -848,7 +1097,15 @@ impl EditMode {
                 }
             }
         });
-        Some(EditOverlay { edges, verts, selected })
+        let to_world = |p: Vec3| local_to_world(&world, p);
+        let highlight = self
+            .tool
+            .as_ref()
+            .map(|tool| {
+                tool.highlight.iter().map(|&(a, b)| (to_world(a), to_world(b))).collect()
+            })
+            .unwrap_or_default();
+        Some(EditOverlay { edges, verts, selected, highlight })
     }
 }
 
@@ -857,6 +1114,8 @@ pub struct EditOverlay {
     pub edges: Vec<(Vec3, Vec3)>,
     pub verts: Vec<Vec3>,
     pub selected: Option<SelectedShape>,
+    /// Pending loop-cut / bevel geometry, shown in the preview color.
+    pub highlight: Vec<(Vec3, Vec3)>,
 }
 
 pub enum SelectedShape {
@@ -1117,6 +1376,223 @@ mod tests {
         let before = scene.object(id).unwrap().pivot;
         assert!(edit.text_input("p", &mut scene));
         assert_eq!(scene.object(id).unwrap().pivot, before);
+    }
+
+    /// A top edge of the default cube, parallel to X.
+    fn top_edge(edit: &EditMode) -> (usize, usize) {
+        let topo = edit.topo.as_ref().unwrap();
+        *topo
+            .edges
+            .iter()
+            .find(|&&(a, b)| {
+                let (va, vb) = (topo.verts[a], topo.verts[b]);
+                (va.z - 1.0).abs() < 1e-4
+                    && (vb.z - 1.0).abs() < 1e-4
+                    && (va.y - vb.y).abs() < 1e-4
+            })
+            .expect("top edge along X")
+    }
+
+    #[test]
+    fn loop_cut_tool_previews_scrubs_and_cancels() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        edit.start_edge_tool(false, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_some(), "loop cut must start on a cube edge");
+        assert!(edit.status_line().unwrap().contains("Loop Cut: 1 cut"));
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "ring quads split");
+        assert!(!edit.tool.as_ref().unwrap().highlight.is_empty(), "loop is highlighted");
+
+        // wheel up: 2 cuts; wheel down twice clamps at 1
+        edit.adjust_tool(1, &mut scene, Unit::Meters);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 14);
+        assert!(edit.status_line().unwrap().contains("2 cuts"));
+        edit.adjust_tool(-1, &mut scene, Unit::Meters);
+        edit.adjust_tool(-1, &mut scene, Unit::Meters);
+        assert!(edit.status_line().unwrap().contains("1 cut"));
+
+        // cancel restores the pristine primitive and re-selects the edge
+        let edge = edit.tool.as_ref().unwrap().edge;
+        edit.cancel_tool(&mut scene);
+        assert!(edit.tool.is_none());
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "bake undone");
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
+        assert_eq!(edit.selected, Some(Element::Edge(edge.0, edge.1)));
+    }
+
+    #[test]
+    fn loop_cut_confirm_keeps_selectable_edges() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        edit.start_edge_tool(false, &mut scene, &camera, viewport, Unit::Meters);
+
+        // confirm (as handle_events does): the preview mesh simply stays
+        assert!(edit.tool.take().is_some());
+        edit.selected = None;
+        let object = scene.object(id).unwrap();
+        assert!(object.edited_mesh.is_some());
+        assert_eq!(object.edited_mesh.as_ref().unwrap().seams.len(), 4);
+        // the cut survives a topology rebuild: the loop is a real edge ring
+        edit.sync(&mut scene);
+        let topo = edit.topo.as_ref().unwrap();
+        assert_eq!(topo.faces.len(), 10);
+        assert_eq!(topo.edges.len(), 20);
+    }
+
+    #[test]
+    fn bevel_tool_scrubs_segments_and_drags_width() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+
+        edit.start_edge_tool(true, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_some(), "bevel must start on a cube edge");
+        assert!(edit.status_line().unwrap().starts_with("Bevel:"));
+        assert!(edit.status_line().unwrap().contains("1 segment"));
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 7, "chamfer face added");
+
+        // wheel: 3 segments; way down clamps at 1; way up clamps at 16
+        edit.adjust_tool(2, &mut scene, Unit::Meters);
+        assert!(edit.status_line().unwrap().contains("3 segments"));
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 9, "6 + 3 strips");
+        edit.adjust_tool(-10, &mut scene, Unit::Meters);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 7);
+        edit.adjust_tool(40, &mut scene, Unit::Meters);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6 + 16);
+
+        // dragging the mouse away from the edge widens the bevel: replay the
+        // mapping from the tool's own drag reference so the expectation is
+        // exact, and check the clamp at the geometric limit
+        let (mid, dist0, w0, wpp) = {
+            let tool = edit.tool.as_ref().unwrap();
+            (tool.mid_screen, tool.start_dist, tool.start_width, tool.world_per_px)
+        };
+        edit.last_mouse = (mid.0 + dist0 + 150.0, mid.1);
+        edit.drag_tool(&mut scene, Unit::Meters);
+        let ToolKind::Bevel { width, limit, .. } = edit.tool.as_ref().unwrap().kind else {
+            panic!("bevel tool expected");
+        };
+        assert!(wpp > 0.0, "world-per-pixel must be positive");
+        assert!((width - (w0 + 150.0 * wpp).clamp(limit / 72.0, limit)).abs() < 1e-5);
+        assert!(width > w0, "moving away from the edge widens");
+        edit.last_mouse = (mid.0 + dist0 + 1e6, mid.1);
+        edit.drag_tool(&mut scene, Unit::Meters);
+        let ToolKind::Bevel { width, .. } = edit.tool.as_ref().unwrap().kind else {
+            panic!("bevel tool expected");
+        };
+        assert!((width - limit).abs() < 1e-6, "clamps at the limit");
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6 + 16, "mesh stays valid");
+
+        edit.cancel_tool(&mut scene);
+        assert!(scene.object(id).unwrap().edited_mesh.is_none());
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
+    }
+
+    /// The real input path: Ctrl+R starts the cut, the wheel scrubs it, and
+    /// Enter / right-click settle it — all through `handle_events`.
+    #[test]
+    fn ctrl_r_wheel_and_enter_drive_the_loop_cut() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+
+        let ctrl = three_d::Modifiers { ctrl: true, ..Default::default() };
+        let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
+            edit.handle_events(
+                &mut events, &camera, viewport, scene, &selection,
+                false, false, false, true, Unit::Meters,
+            );
+            events
+        };
+
+        // Ctrl+R: tool starts, the wheel notch bumps it to 2 cuts, and both
+        // events come back handled (the wheel must not also zoom the camera)
+        let events = run(&mut edit, &mut scene, vec![
+            Event::KeyPress { kind: Key::R, modifiers: ctrl, handled: false },
+            Event::MouseWheel {
+                delta: (0.0, 24.0),
+                position: three_d::PhysicalPoint { x: 0.0, y: 0.0 },
+                modifiers: Default::default(),
+                handled: false,
+            },
+        ]);
+        assert!(edit.tool.is_some());
+        assert!(matches!(edit.tool.as_ref().unwrap().kind, ToolKind::LoopCut { cuts: 2 }));
+        assert!(events.iter().all(|e| matches!(e,
+            Event::KeyPress { handled: true, .. } | Event::MouseWheel { handled: true, .. })));
+
+        // Enter confirms: the cut mesh stays on the object
+        run(&mut edit, &mut scene, vec![
+            Event::KeyPress { kind: Key::Enter, modifiers: Default::default(), handled: false },
+        ]);
+        assert!(edit.tool.is_none());
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 14, "2 cuts kept");
+
+        // second round: Ctrl+B, cancelled with Escape. The edge must be one
+        // the cut didn't touch — cut vertices have 4 incident faces, which
+        // bevel (correctly) refuses — so take a top edge along Y at x = ±1.
+        let edge = {
+            let topo = edit.topo.as_ref().unwrap();
+            *topo
+                .edges
+                .iter()
+                .find(|&&(a, b)| {
+                    let (va, vb) = (topo.verts[a], topo.verts[b]);
+                    (va.z - 1.0).abs() < 1e-4
+                        && (vb.z - 1.0).abs() < 1e-4
+                        && (va.x - vb.x).abs() < 1e-4
+                        && va.x.abs() > 0.99
+                })
+                .expect("uncut top edge along Y")
+        };
+        edit.selected = Some(Element::Edge(edge.0, edge.1));
+        let before = scene.object(id).unwrap().edited_mesh.clone();
+        run(&mut edit, &mut scene, vec![
+            Event::KeyPress { kind: Key::B, modifiers: ctrl, handled: false },
+        ]);
+        assert!(matches!(edit.tool.as_ref().unwrap().kind, ToolKind::Bevel { .. }));
+        run(&mut edit, &mut scene, vec![
+            Event::KeyPress { kind: Key::Escape, modifiers: Default::default(), handled: false },
+        ]);
+        assert!(edit.tool.is_none());
+        assert_eq!(scene.object(id).unwrap().edited_mesh, before, "escape reverts");
+    }
+
+    #[test]
+    fn edge_tools_refuse_without_an_edge_selection() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        edit.selected = Some(Element::Vertex(0));
+        edit.start_edge_tool(false, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_none());
+        edit.start_edge_tool(true, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_none());
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "no stray bake");
     }
 
     #[test]
