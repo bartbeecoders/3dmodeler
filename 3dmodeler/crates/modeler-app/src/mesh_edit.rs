@@ -1,11 +1,11 @@
-//! Topology-editing operators for edit mode: loop cut (Ctrl+R) and edge
-//! bevel (Ctrl+B).
+//! Topology-editing operators for edit mode: loop cut (Ctrl+R), edge bevel
+//! (Ctrl+B), face extrude (E) and face inset (I).
 //!
-//! Both take the welded `Topology` view plus the underlying triangle mesh
+//! All take the welded `Topology` view plus the underlying triangle mesh
 //! and return a rebuilt mesh, leaving the inputs untouched — the modal tools
 //! re-run the operator from the pre-tool mesh every time a parameter changes
-//! (wheel notch, bevel drag), so scrubbing stays non-destructive until the
-//! user confirms.
+//! (wheel notch, drag), so scrubbing stays non-destructive until the user
+//! confirms.
 
 use crate::edit_mode::{build_topology, Topology};
 use modeler_core::glam::{Vec2, Vec3};
@@ -499,6 +499,129 @@ pub fn bevel_edge(
     Some(out)
 }
 
+/// Copy of the mesh without one welded face group's triangles (normals
+/// left empty — callers run `compact`, which recomputes them).
+fn strip_face(mesh: &MeshData, topo: &Topology, face: usize) -> MeshData {
+    let skip: HashSet<usize> = topo.faces[face].tris.iter().copied().collect();
+    let mut out = MeshData {
+        positions: mesh.positions.clone(),
+        normals: Vec::new(),
+        indices: Vec::new(),
+        seams: mesh.seams.clone(),
+    };
+    for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        if !skip.contains(&ti) {
+            out.indices.extend_from_slice(tri);
+        }
+    }
+    out
+}
+
+/// Extrude the face along its outward normal by `amount` (negative pushes
+/// inward): the face translates and a wall quad bridges each boundary edge.
+/// The base loop is seamed so walls coplanar with their neighbors (extruding
+/// a box top leaves them flush with the sides) stay separate faces. Zero
+/// amount returns the mesh unchanged — the modal tool starts there. None
+/// when the outline isn't a single simple loop (holes).
+pub fn extrude_face(
+    mesh: &MeshData,
+    topo: &Topology,
+    face: usize,
+    amount: f32,
+) -> Option<MeshData> {
+    let lp = face_loop(topo, face)?;
+    if amount.abs() < 1e-4 {
+        return Some(mesh.clone());
+    }
+    let normal = polygon_area_vector(&lp, |w| topo.verts[w]).normalize_or_zero();
+    if normal.length_squared() < 0.5 {
+        return None; // degenerate face
+    }
+    let offset = normal * amount;
+
+    let mut out = strip_face(mesh, topo, face);
+    // the moved face, same CCW orientation
+    let top: Vec<Vec3> = lp.iter().map(|&v| topo.verts[v] + offset).collect();
+    emit_polygon(&mut out, &top)?;
+    for i in 0..lp.len() {
+        let a = topo.verts[lp[i]];
+        let b = topo.verts[lp[(i + 1) % lp.len()]];
+        let base = out.positions.len() as u32;
+        // wall [a, b, b+off, a+off]: faces outward on a pull and inward on
+        // a push — the boundary of the swept slab flips with the sign
+        emit_polygon(&mut out, &[a, b, b + offset, a + offset])?;
+        // the base edge is a user cut: without it a wall flush with its
+        // neighbor face would weld back into one group
+        out.seams.push((base, base + 1));
+    }
+    compact(&mut out);
+    Some(out)
+}
+
+/// Largest usable inset thickness: just under the centroid's distance to
+/// the nearest outline edge (the border collapses around there). None when
+/// the face has no simple loop or is degenerate.
+pub fn inset_limit(topo: &Topology, face: usize) -> Option<f32> {
+    let lp = face_loop(topo, face)?;
+    let c = lp.iter().map(|&v| topo.verts[v]).sum::<Vec3>() / lp.len() as f32;
+    let mut min_d = f32::INFINITY;
+    for i in 0..lp.len() {
+        let a = topo.verts[lp[i]];
+        let e = (topo.verts[lp[(i + 1) % lp.len()]] - a).normalize_or_zero();
+        let to_c = c - a;
+        min_d = min_d.min((to_c - e * to_c.dot(e)).length());
+    }
+    (min_d.is_finite() && min_d > 1e-4).then_some(0.9 * min_d)
+}
+
+/// Inset the face: a shrunk copy sits `amount` inside the boundary with
+/// uniform border thickness (each edge shifts inward by `amount`; the new
+/// corners are the shifted edges' intersections), ringed by border quads.
+/// The inner rim and the corner spokes are seamed — the ring is coplanar
+/// with the inner face and would weld back into one group without them.
+/// Zero amount returns the mesh unchanged. None when the outline isn't a
+/// single simple loop (holes).
+pub fn inset_face(
+    mesh: &MeshData,
+    topo: &Topology,
+    face: usize,
+    amount: f32,
+) -> Option<MeshData> {
+    let lp = face_loop(topo, face)?;
+    if amount < 1e-4 {
+        return Some(mesh.clone());
+    }
+    let normal = polygon_area_vector(&lp, |w| topo.verts[w]).normalize_or_zero();
+    if normal.length_squared() < 0.5 {
+        return None;
+    }
+    let n = lp.len();
+    let pts: Vec<Vec3> = lp.iter().map(|&v| topo.verts[v]).collect();
+    let inner: Vec<Vec3> = (0..n)
+        .map(|i| {
+            // in-plane inward normals of the two edges meeting at pts[i];
+            // their offset lines intersect at v + amount·(m1+m2)/(1+m1·m2)
+            let m1 = normal.cross((pts[i] - pts[(i + n - 1) % n]).normalize_or_zero());
+            let m2 = normal.cross((pts[(i + 1) % n] - pts[i]).normalize_or_zero());
+            // reflex-spike guard: clamp the denominator so a near-180°
+            // corner can't shoot its new vertex across the face
+            pts[i] + (m1 + m2) * (amount / (1.0 + m1.dot(m2)).max(0.1))
+        })
+        .collect();
+
+    let mut out = strip_face(mesh, topo, face);
+    emit_polygon(&mut out, &inner)?;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let base = out.positions.len() as u32;
+        emit_polygon(&mut out, &[pts[i], pts[j], inner[j], inner[i]])?;
+        out.seams.push((base + 2, base + 3)); // inner rim
+        out.seams.push((base + 3, base)); // corner spoke
+    }
+    compact(&mut out);
+    Some(out)
+}
+
 /// Subdivision surface (Blender's subsurf): `levels` rounds of Catmull-
 /// Clark over the mesh. Smooth objects keep shared vertices and averaged
 /// normals; flat ones come out faceted. A triangle-count valve stops
@@ -903,6 +1026,79 @@ mod tests {
         // deterministic output: same input, same vertex order
         let again = subdivide(&mesh, 1, true);
         assert_eq!(sub, again);
+    }
+
+    /// The welded face whose vertices all sit at z = 1 (the cube top).
+    fn top_face(topo: &Topology) -> usize {
+        topo.faces
+            .iter()
+            .position(|f| f.verts.iter().all(|&v| (topo.verts[v].z - 1.0).abs() < 1e-4))
+            .expect("top face")
+    }
+
+    #[test]
+    fn extrude_pulls_a_cube_face_out() {
+        let (mesh, topo) = cube();
+        let out = extrude_face(&mesh, &topo, top_face(&topo), 0.5).expect("simple loop");
+        validate(&out);
+        // the 2×2 top face sweeps a 2×2×0.5 slab
+        assert!((volume(&out) - 10.0).abs() < 1e-3, "volume {}", volume(&out));
+        assert!((out.extents().z - 2.5).abs() < 1e-4);
+        let t = build_topology(&out);
+        assert_eq!(t.verts.len(), 12, "4 new top corners");
+        assert_eq!(t.faces.len(), 10, "walls stay separate from the flush sides");
+        assert_eq!(t.edges.len(), 20);
+    }
+
+    #[test]
+    fn extrude_negative_pushes_the_face_in() {
+        let (mesh, topo) = cube();
+        let out = extrude_face(&mesh, &topo, top_face(&topo), -0.5).expect("simple loop");
+        validate(&out);
+        // the top sinks to z = 0.5; the rim (side faces) stays at z = 1
+        assert!((volume(&out) - 6.0).abs() < 1e-3, "volume {}", volume(&out));
+        assert!((out.extents().z - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn extrude_and_inset_at_zero_keep_the_mesh() {
+        let (mesh, topo) = cube();
+        let f = top_face(&topo);
+        assert_eq!(extrude_face(&mesh, &topo, f, 0.0).as_ref(), Some(&mesh));
+        assert_eq!(inset_face(&mesh, &topo, f, 0.0).as_ref(), Some(&mesh));
+    }
+
+    #[test]
+    fn inset_rings_a_cube_face() {
+        let (mesh, topo) = cube();
+        let out = inset_face(&mesh, &topo, top_face(&topo), 0.4).expect("simple loop");
+        validate(&out);
+        assert!((volume(&out) - 8.0).abs() < 1e-3, "inset leaves the volume alone");
+        let t = build_topology(&out);
+        assert_eq!(t.verts.len(), 12, "4 inner corners");
+        assert_eq!(t.faces.len(), 10, "5 untouched + 4 ring quads + inner");
+        // uniform border thickness: inner corners at (±0.6, ±0.6, 1)
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                let q = Vec3::new(0.6 * sx, 0.6 * sy, 1.0);
+                assert!(
+                    t.verts.iter().any(|v| (*v - q).length() < 1e-4),
+                    "missing inner corner {q:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inset_limit_is_short_of_the_centroid_edge_distance() {
+        let (_, topo) = cube();
+        let limit = inset_limit(&topo, top_face(&topo)).expect("cube face");
+        assert!((limit - 0.9).abs() < 1e-4, "0.9 × the 1 m centroid-edge gap, got {limit}");
+        // the limit stays usable: the inner face survives at full width
+        let (mesh, _) = cube();
+        let out = inset_face(&mesh, &topo, top_face(&topo), limit).expect("valid at limit");
+        validate(&out);
+        assert_eq!(build_topology(&out).faces.len(), 10);
     }
 
     #[test]

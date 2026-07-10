@@ -4,8 +4,9 @@
 //! mode is vertex / edge / face — picked with 1 / 2 / 3, matched on the
 //! TYPED character so AZERTY's unshifted & / é / " work too. Click selects
 //! an element, G moves it (X/Y/Z constrain to an axis, LMB/Enter confirm,
-//! RMB/Esc cancel). The first edit bakes the primitive into an editable
-//! mesh stored on the object (saved with the scene).
+//! RMB/Esc cancel), E extrudes a face and I insets it (drag scrubs the
+//! amount, LMB release/Enter confirm). The first edit bakes the primitive
+//! into an editable mesh stored on the object (saved with the scene).
 //!
 //! Topology is a welded view of the triangle mesh: coincident vertices are
 //! merged, faces are connected coplanar triangle groups (a cube shows 6
@@ -212,16 +213,19 @@ struct Grab {
 enum ToolKind {
     LoopCut { cuts: usize },
     Bevel { width: f32, limit: f32, segments: usize },
+    Extrude { amount: f32 },
+    Inset { amount: f32, limit: f32 },
 }
 
-/// Modal loop-cut / bevel session (Ctrl+R / Ctrl+B on a selected edge). The
-/// operator re-runs from the pre-tool mesh on every parameter change (wheel
-/// notch, bevel drag), so scrubbing stays non-destructive; LMB/Enter keeps
-/// the preview, RMB/Esc restores the base mesh.
-struct EdgeTool {
+/// Modal topology-tool session: loop cut / bevel on a selected edge (Ctrl+R
+/// / Ctrl+B), extrude / inset on a selected face (E / I). The operator
+/// re-runs from the pre-tool mesh on every parameter change (wheel notch,
+/// drag), so scrubbing stays non-destructive; LMB (release, for the face
+/// tools) / Enter keeps the preview, RMB/Esc restores the base mesh.
+struct ModalTool {
     kind: ToolKind,
-    /// Selected edge, in `base_topo` welded ids.
-    edge: (usize, usize),
+    /// The element the tool started from, in `base_topo` ids.
+    element: Element,
     base_mesh: MeshData,
     base_topo: Topology,
     /// The object had no edited mesh before the tool (pristine primitive) —
@@ -231,13 +235,19 @@ struct EdgeTool {
     /// overlay so the pending cut/chamfer reads at a glance.
     highlight: Vec<(Vec3, Vec3)>,
     status: String,
-    /// Bevel drag mapping, frozen at tool start (loop cut leaves it unused):
-    /// the edge midpoint on screen, the mouse distance to it and the width
-    /// at that moment, and world meters per pixel at the edge's depth.
+    /// Drag mapping, frozen at tool start (loop cut leaves it unused): the
+    /// screen reference (bevel: edge midpoint, inset: face center, extrude:
+    /// the mouse position at start), the mouse distance to it and the width
+    /// at that moment, and world meters per pixel at the element's depth.
     mid_screen: (f32, f32),
     start_dist: f32,
     start_width: f32,
     world_per_px: f32,
+    /// Extrude: the face normal's screen direction (unit) — the drag axis.
+    drag_dir: (f32, f32),
+    /// Face tools: local point to re-pick as the result face on confirm,
+    /// so E / I chain like Blender.
+    reselect: Option<Vec3>,
 }
 
 pub struct EditMode {
@@ -251,7 +261,7 @@ pub struct EditMode {
     /// silently rebind to an unrelated object.
     scene_instance: u64,
     grab: Option<Grab>,
-    tool: Option<EdgeTool>,
+    tool: Option<ModalTool>,
     last_mouse: (f32, f32),
 }
 
@@ -265,6 +275,18 @@ fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
 
 fn world_to_local(t: &Transform, w: Vec3) -> Vec3 {
     t.inverse_transform_point(w)
+}
+
+/// Centroid and outward unit normal of a welded face group (local space).
+fn face_centroid_normal(topo: &Topology, face: usize) -> Option<(Vec3, Vec3)> {
+    let group = topo.faces.get(face)?;
+    let centroid = group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+        / group.verts.len().max(1) as f32;
+    let t = topo.tris[*group.tris.first()?];
+    let normal = (topo.verts[t[1]] - topo.verts[t[0]])
+        .cross(topo.verts[t[2]] - topo.verts[t[0]])
+        .normalize_or_zero();
+    Some((centroid, normal))
 }
 
 /// Rotate local mesh positions around a world-space pivot: local -> world,
@@ -388,8 +410,9 @@ impl EditMode {
             (Some(grab), _) => grab.status.clone(),
             (None, Some(tool)) => tool.status.clone(),
             (None, None) => format!(
-                "EDIT MODE ({}) · click select · G/R/S transform · Ctrl+R loop cut · \
-                 Ctrl+B bevel · P/A pivot/anchor · 1/2/3 vertex/edge/face · Tab exit",
+                "EDIT MODE ({}) · click select · G/R/S transform · E extrude · I inset · \
+                 Ctrl+R loop cut · Ctrl+B bevel · P/A pivot/anchor · \
+                 1/2/3 vertex/edge/face · Tab exit",
                 self.mode.label()
             ),
         })
@@ -507,7 +530,11 @@ impl EditMode {
                     self.last_mouse = (position.x, position.y);
                     if self.grab.is_some() || self.tool.is_some() {
                         match button {
-                            MouseButton::Left => confirm = true,
+                            // face tools confirm on release, so a held-LMB
+                            // drag scrubs the amount instead of settling it
+                            MouseButton::Left => {
+                                confirm = !self.tool_confirms_on_release();
+                            }
                             MouseButton::Right => cancel = true,
                             MouseButton::Middle => {}
                         }
@@ -520,6 +547,12 @@ impl EditMode {
                     if (self.grab.is_some() || self.tool.is_some())
                         && *button != MouseButton::Middle =>
                 {
+                    if *button == MouseButton::Left
+                        && !pointer_over_ui
+                        && self.tool_confirms_on_release()
+                    {
+                        confirm = true;
+                    }
                     *handled = true;
                 }
                 // loop cut / bevel: the wheel scrubs the parameter (zoom is
@@ -558,7 +591,20 @@ impl EditMode {
                     }
                 }
                 Event::Text(text) if !egui_owns_keyboard && !text.is_empty() => {
-                    let consumed = self.tool.is_some() || self.text_input(text.as_str(), scene);
+                    let consumed = self.tool.is_some()
+                        || match text.as_str() {
+                            // E / I: modal face extrude / inset — handled
+                            // here (not in text_input) for the camera and
+                            // viewport the drag mapping needs
+                            "e" | "E" | "i" | "I" => {
+                                if self.grab.is_none() {
+                                    let inset = matches!(text.as_str(), "i" | "I");
+                                    self.start_face_tool(inset, scene, camera, viewport, unit);
+                                }
+                                true
+                            }
+                            other => self.text_input(other, scene),
+                        };
                     if consumed {
                         text.clear();
                     }
@@ -580,11 +626,46 @@ impl EditMode {
         self.drag_tool(scene, unit);
         if confirm {
             self.grab = None; // positions already applied
-            if self.tool.take().is_some() {
-                // preview mesh stays; the old edge ids no longer apply
-                self.selected = None;
+            if let Some(tool) = self.tool.take() {
+                let noop = match tool.kind {
+                    ToolKind::Extrude { amount } => amount.abs() < 1e-4,
+                    ToolKind::Inset { amount, .. } => amount < 1e-4,
+                    _ => false,
+                };
+                if noop {
+                    // confirming a zero amount changed nothing: restore the
+                    // base mesh so a pristine primitive stays unbaked
+                    self.tool = Some(tool);
+                    self.cancel_tool(scene);
+                } else {
+                    // preview mesh stays; the old element ids no longer
+                    // apply — face tools re-pick the result face so E / I
+                    // chain, edge tools clear the selection
+                    self.selected = tool.reselect.and_then(|p| self.face_near(p));
+                }
             }
         }
+    }
+
+    /// True while a modal tool that settles on LMB *release* runs (extrude
+    /// / inset — their press starts or continues the drag).
+    fn tool_confirms_on_release(&self) -> bool {
+        self.tool.as_ref().is_some_and(|t| {
+            matches!(t.kind, ToolKind::Extrude { .. } | ToolKind::Inset { .. })
+        })
+    }
+
+    /// The face whose centroid sits closest to the local-space point — how
+    /// a confirmed extrude/inset re-picks its result face after the rebuild.
+    fn face_near(&self, point: Vec3) -> Option<Element> {
+        let topo = self.topo.as_ref()?;
+        (0..topo.faces.len())
+            .filter_map(|f| {
+                let (c, _) = face_centroid_normal(topo, f)?;
+                Some(((c - point).length(), f))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, f)| Element::Face(f))
     }
 
     /// Typed characters: selection modes (AZERTY unshifted digits included)
@@ -950,9 +1031,9 @@ impl EditMode {
             + (self.last_mouse.1 - mid_screen.1).powi(2))
         .sqrt();
         let world_per_px = camera.world_per_pixel_at(viewport, mid_cg);
-        let mut tool = EdgeTool {
+        let mut tool = ModalTool {
             kind,
-            edge: (a, b),
+            element: Element::Edge(a, b),
             base_mesh,
             base_topo,
             was_pristine,
@@ -962,6 +1043,76 @@ impl EditMode {
             start_dist,
             start_width,
             world_per_px,
+            drag_dir: (0.0, 0.0),
+            reselect: None,
+        };
+        if self.apply_tool(&mut tool, scene, unit) {
+            self.selected = None;
+            self.tool = Some(tool);
+        }
+    }
+
+    /// E (extrude) / I (inset) on a selected face: start the modal session.
+    /// Does nothing when the face's outline isn't a single simple loop
+    /// (e.g. a wall face with a window hole).
+    fn start_face_tool(
+        &mut self,
+        inset: bool,
+        scene: &mut Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        unit: Unit,
+    ) {
+        let Some(Element::Face(face)) = self.selected else { return };
+        let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
+        let was_pristine = object.edited_mesh.is_none();
+        let base_mesh = object.render_mesh();
+        let base_topo = build_topology(&base_mesh);
+        let Some((centroid, normal)) = face_centroid_normal(&base_topo, face) else { return };
+        let kind = if inset {
+            let Some(limit) = mesh_edit::inset_limit(&base_topo, face) else { return };
+            ToolKind::Inset { amount: 0.0, limit }
+        } else {
+            ToolKind::Extrude { amount: 0.0 }
+        };
+
+        let world = scene.world_transform(object.id);
+        let c_world = local_to_world(&world, centroid);
+        let c_cg = three_d::vec3(c_world.x, c_world.y, c_world.z);
+        let c_screen = camera.world_to_screen(viewport, c_cg);
+        // extrude: mouse motion projected on the normal's screen direction
+        // sets the signed amount, in local units per pixel so a scaled
+        // object still tracks the cursor. A camera-facing normal has no
+        // screen direction — fall back to "up = out".
+        let n_world = local_to_world(&world, centroid + normal) - c_world;
+        let tip = c_world + n_world;
+        let tip_screen =
+            camera.world_to_screen(viewport, three_d::vec3(tip.x, tip.y, tip.z));
+        let d = (tip_screen.0 - c_screen.0, tip_screen.1 - c_screen.1);
+        let len = (d.0 * d.0 + d.1 * d.1).sqrt();
+        let drag_dir = if len > 1e-3 { (d.0 / len, d.1 / len) } else { (0.0, 1.0) };
+        let world_per_px =
+            camera.world_per_pixel_at(viewport, c_cg) / n_world.length().max(1e-6);
+        // inset: the cursor's distance to the face center scrubs the
+        // thickness — dragging toward the center insets further
+        let start_dist = ((self.last_mouse.0 - c_screen.0).powi(2)
+            + (self.last_mouse.1 - c_screen.1).powi(2))
+        .sqrt();
+
+        let mut tool = ModalTool {
+            kind,
+            element: Element::Face(face),
+            base_mesh,
+            base_topo,
+            was_pristine,
+            highlight: Vec::new(),
+            status: String::new(),
+            mid_screen: if inset { c_screen } else { self.last_mouse },
+            start_dist,
+            start_width: 0.0,
+            world_per_px,
+            drag_dir,
+            reselect: None,
         };
         if self.apply_tool(&mut tool, scene, unit) {
             self.selected = None;
@@ -971,14 +1122,21 @@ impl EditMode {
 
     /// Run the operator from the base mesh and put the result on the object
     /// (the live preview). False when the topology doesn't support it.
-    fn apply_tool(&mut self, tool: &mut EdgeTool, scene: &mut Scene, unit: Unit) -> bool {
-        let result = match tool.kind {
-            ToolKind::LoopCut { cuts } => {
-                mesh_edit::loop_cut(&tool.base_mesh, &tool.base_topo, tool.edge, cuts)
+    fn apply_tool(&mut self, tool: &mut ModalTool, scene: &mut Scene, unit: Unit) -> bool {
+        let result = match (tool.kind, tool.element) {
+            (ToolKind::LoopCut { cuts }, Element::Edge(a, b)) => {
+                mesh_edit::loop_cut(&tool.base_mesh, &tool.base_topo, (a, b), cuts)
             }
-            ToolKind::Bevel { width, segments, .. } => {
-                mesh_edit::bevel_edge(&tool.base_mesh, &tool.base_topo, tool.edge, width, segments)
+            (ToolKind::Bevel { width, segments, .. }, Element::Edge(a, b)) => {
+                mesh_edit::bevel_edge(&tool.base_mesh, &tool.base_topo, (a, b), width, segments)
             }
+            (ToolKind::Extrude { amount }, Element::Face(f)) => {
+                mesh_edit::extrude_face(&tool.base_mesh, &tool.base_topo, f, amount)
+            }
+            (ToolKind::Inset { amount, .. }, Element::Face(f)) => {
+                mesh_edit::inset_face(&tool.base_mesh, &tool.base_topo, f, amount)
+            }
+            _ => None,
         };
         let Some(mesh) = result else { return false };
         let Some(id) = self.active else { return false };
@@ -1001,6 +1159,16 @@ impl EditMode {
                 .map(|&(a, b)| (topo.verts[a], topo.verts[b]))
                 .collect();
         }
+        // the local point that re-picks the result face after confirm
+        tool.reselect = match (tool.kind, tool.element) {
+            (ToolKind::Extrude { amount }, Element::Face(f)) => {
+                face_centroid_normal(&tool.base_topo, f).map(|(c, n)| c + n * amount)
+            }
+            (ToolKind::Inset { .. }, Element::Face(f)) => {
+                face_centroid_normal(&tool.base_topo, f).map(|(c, _)| c)
+            }
+            _ => None,
+        };
         tool.status = match tool.kind {
             ToolKind::LoopCut { cuts } => format!(
                 "Loop Cut: {cuts} cut{}   |   wheel add/remove · LMB/Enter confirm · RMB/Esc cancel",
@@ -1014,12 +1182,27 @@ impl EditMode {
                 if segments == 1 { "" } else { "s" },
                 p = unit.decimals(),
             ),
+            ToolKind::Extrude { amount } => format!(
+                "Extrude: {:.p$} {}   |   drag along the normal · \
+                 LMB/Enter confirm · RMB/Esc cancel",
+                amount * unit.per_meter(),
+                unit.suffix(),
+                p = unit.decimals(),
+            ),
+            ToolKind::Inset { amount, .. } => format!(
+                "Inset: {:.p$} {}   |   drag toward the face center · \
+                 LMB/Enter confirm · RMB/Esc cancel",
+                amount * unit.per_meter(),
+                unit.suffix(),
+                p = unit.decimals(),
+            ),
         };
         true
     }
 
     /// Mouse-wheel notch while the tool runs: more/fewer cuts, more/fewer
-    /// bevel segments. Re-applies the preview from the base mesh.
+    /// bevel segments (extrude/inset have no wheel parameter). Re-applies
+    /// the preview from the base mesh.
     fn adjust_tool(&mut self, notches: i32, scene: &mut Scene, unit: Unit) {
         let Some(mut tool) = self.tool.take() else { return };
         match &mut tool.kind {
@@ -1029,32 +1212,54 @@ impl EditMode {
             ToolKind::Bevel { segments, .. } => {
                 *segments = (*segments as i32 + notches).clamp(1, 16) as usize;
             }
+            ToolKind::Extrude { .. } | ToolKind::Inset { .. } => {}
         }
         self.apply_tool(&mut tool, scene, unit);
         self.tool = Some(tool);
     }
 
-    /// Mouse motion while the bevel runs: the cursor's distance to the edge
-    /// on screen sets the width, like Blender's modal bevel. Loop cut
-    /// ignores motion (its cuts stay evenly spaced). Called once per frame;
-    /// re-applies only when the width actually changed.
+    /// Mouse motion while a tool runs: the bevel width follows the cursor's
+    /// distance to the edge (Blender's modal bevel), the extrude amount the
+    /// drag along the face normal's screen direction (signed — pulling
+    /// against the normal pushes the face in), the inset thickness the drag
+    /// toward the face center. Loop cut ignores motion (its cuts stay
+    /// evenly spaced). Called once per frame; re-applies only on change.
     fn drag_tool(&mut self, scene: &mut Scene, unit: Unit) {
         let Some(mut tool) = self.tool.take() else { return };
-        if let ToolKind::Bevel { width, limit, .. } = &mut tool.kind {
-            let dist = ((self.last_mouse.0 - tool.mid_screen.0).powi(2)
-                + (self.last_mouse.1 - tool.mid_screen.1).powi(2))
-            .sqrt();
-            let new = (tool.start_width + (dist - tool.start_dist) * tool.world_per_px)
-                .clamp(*limit / 72.0, *limit);
-            if (new - *width).abs() > 1e-6 {
+        let dist = ((self.last_mouse.0 - tool.mid_screen.0).powi(2)
+            + (self.last_mouse.1 - tool.mid_screen.1).powi(2))
+        .sqrt();
+        let changed = match &mut tool.kind {
+            ToolKind::LoopCut { .. } => false,
+            ToolKind::Bevel { width, limit, .. } => {
+                let new = (tool.start_width + (dist - tool.start_dist) * tool.world_per_px)
+                    .clamp(*limit / 72.0, *limit);
+                let changed = (new - *width).abs() > 1e-6;
                 *width = new;
-                self.apply_tool(&mut tool, scene, unit);
+                changed
             }
+            ToolKind::Extrude { amount } => {
+                let dx = self.last_mouse.0 - tool.mid_screen.0;
+                let dy = self.last_mouse.1 - tool.mid_screen.1;
+                let new = (dx * tool.drag_dir.0 + dy * tool.drag_dir.1) * tool.world_per_px;
+                let changed = (new - *amount).abs() > 1e-6;
+                *amount = new;
+                changed
+            }
+            ToolKind::Inset { amount, limit } => {
+                let new = ((tool.start_dist - dist) * tool.world_per_px).clamp(0.0, *limit);
+                let changed = (new - *amount).abs() > 1e-6;
+                *amount = new;
+                changed
+            }
+        };
+        if changed {
+            self.apply_tool(&mut tool, scene, unit);
         }
         self.tool = Some(tool);
     }
 
-    /// RMB/Esc: restore the pre-tool mesh and re-select the edge.
+    /// RMB/Esc: restore the pre-tool mesh and re-select the element.
     fn cancel_tool(&mut self, scene: &mut Scene) {
         let Some(tool) = self.tool.take() else { return };
         let Some(id) = self.active else { return };
@@ -1063,8 +1268,7 @@ impl EditMode {
             object.mesh_revision += 1;
         }
         self.rebuild_topology(scene);
-        let edge = Element::Edge(tool.edge.0, tool.edge.1);
-        self.selected = self.element_exists(edge).then_some(edge);
+        self.selected = self.element_exists(tool.element).then_some(tool.element);
     }
 
     // --- overlay data --------------------------------------------------------
@@ -1421,12 +1625,12 @@ mod tests {
         assert!(edit.status_line().unwrap().contains("1 cut"));
 
         // cancel restores the pristine primitive and re-selects the edge
-        let edge = edit.tool.as_ref().unwrap().edge;
+        let element = edit.tool.as_ref().unwrap().element;
         edit.cancel_tool(&mut scene);
         assert!(edit.tool.is_none());
         assert!(scene.object(id).unwrap().edited_mesh.is_none(), "bake undone");
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
-        assert_eq!(edit.selected, Some(Element::Edge(edge.0, edge.1)));
+        assert_eq!(edit.selected, Some(element));
     }
 
     #[test]
@@ -1579,6 +1783,193 @@ mod tests {
         ]);
         assert!(edit.tool.is_none());
         assert_eq!(scene.object(id).unwrap().edited_mesh, before, "escape reverts");
+    }
+
+    /// The welded face whose vertices all sit at z = 1 (the cube top).
+    fn top_face_of(edit: &EditMode) -> usize {
+        let topo = edit.topo.as_ref().unwrap();
+        topo.faces
+            .iter()
+            .position(|f| f.verts.iter().all(|&v| (topo.verts[v].z - 1.0).abs() < 1e-4))
+            .expect("top face")
+    }
+
+    /// E extrudes through the real input path: Text starts the tool, mouse
+    /// motion scrubs the amount, and — unlike the edge tools — LMB press
+    /// keeps the drag alive; the *release* confirms and re-selects the
+    /// moved face for chaining.
+    #[test]
+    fn e_extrudes_the_selected_face_and_release_confirms() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected = Some(Element::Face(top_face_of(&edit)));
+
+        let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
+            edit.handle_events(
+                &mut events, &camera, viewport, scene, &selection,
+                false, false, false, true, Unit::Meters,
+            );
+        };
+
+        // E starts the modal extrude at zero — the mesh is untouched so far
+        run(&mut edit, &mut scene, vec![Event::Text("e".to_string())]);
+        assert!(matches!(edit.tool.as_ref().unwrap().kind, ToolKind::Extrude { .. }));
+        assert!(edit.status_line().unwrap().starts_with("Extrude:"));
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
+
+        // drag 120 px along the normal's screen direction
+        let (start, dir, wpp) = {
+            let tool = edit.tool.as_ref().unwrap();
+            (tool.mid_screen, tool.drag_dir, tool.world_per_px)
+        };
+        edit.last_mouse = (start.0 + 120.0 * dir.0, start.1 + 120.0 * dir.1);
+        edit.drag_tool(&mut scene, Unit::Meters);
+        let ToolKind::Extrude { amount } = edit.tool.as_ref().unwrap().kind else {
+            panic!("extrude tool expected");
+        };
+        assert!((amount - 120.0 * wpp).abs() < 1e-5, "drag maps to the amount");
+        assert!(amount > 1e-3);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "walls + top preview");
+
+        // LMB press must NOT settle it (a held-button drag continues) ...
+        let at = three_d::PhysicalPoint { x: edit.last_mouse.0, y: edit.last_mouse.1 };
+        run(&mut edit, &mut scene, vec![Event::MousePress {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Default::default(),
+            handled: false,
+        }]);
+        assert!(edit.tool.is_some(), "press keeps the tool running");
+
+        // ... the release confirms and keeps the extrusion
+        run(&mut edit, &mut scene, vec![Event::MouseRelease {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Default::default(),
+            handled: false,
+        }]);
+        assert!(edit.tool.is_none());
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "extrusion kept");
+
+        // the moved face is re-selected, sitting at z = 1 + amount
+        let Some(Element::Face(f)) = edit.selected else { panic!("face re-selected") };
+        let topo = edit.topo.as_ref().unwrap();
+        assert!(topo.faces[f]
+            .verts
+            .iter()
+            .all(|&v| (topo.verts[v].z - (1.0 + amount)).abs() < 1e-3));
+    }
+
+    #[test]
+    fn i_insets_the_selected_face_and_escape_restores() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        let top = top_face_of(&edit);
+        edit.selected = Some(Element::Face(top));
+
+        let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
+            edit.handle_events(
+                &mut events, &camera, viewport, scene, &selection,
+                false, false, false, true, Unit::Meters,
+            );
+        };
+
+        run(&mut edit, &mut scene, vec![Event::Text("i".to_string())]);
+        let ToolKind::Inset { limit, .. } = edit.tool.as_ref().unwrap().kind else {
+            panic!("inset tool expected");
+        };
+        assert!((limit - 0.9).abs() < 1e-4, "0.9 × the centroid-edge gap");
+
+        // move 100 px toward the face center: thickness = 100 px × w/px
+        let (mid, d0, wpp) = {
+            let tool = edit.tool.as_ref().unwrap();
+            (tool.mid_screen, tool.start_dist, tool.world_per_px)
+        };
+        assert!(d0 > 100.0, "test setup: the cursor starts away from the face");
+        let toward = ((mid.0 - edit.last_mouse.0) / d0, (mid.1 - edit.last_mouse.1) / d0);
+        edit.last_mouse =
+            (edit.last_mouse.0 + 100.0 * toward.0, edit.last_mouse.1 + 100.0 * toward.1);
+        edit.drag_tool(&mut scene, Unit::Meters);
+        let ToolKind::Inset { amount, .. } = edit.tool.as_ref().unwrap().kind else {
+            panic!("inset tool expected");
+        };
+        assert!((amount - (100.0 * wpp).clamp(0.0, limit)).abs() < 1e-5);
+        assert!(amount > 1e-3);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "ring + inner preview");
+
+        // Escape reverts to the pristine primitive and re-selects the face
+        run(&mut edit, &mut scene, vec![Event::KeyPress {
+            kind: Key::Escape,
+            modifiers: Default::default(),
+            handled: false,
+        }]);
+        assert!(edit.tool.is_none());
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "bake undone");
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
+        assert_eq!(edit.selected, Some(Element::Face(top)));
+    }
+
+    #[test]
+    fn face_tools_refuse_without_a_face_selection() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        let (a, b) = edit.topo.as_ref().unwrap().edges[0];
+        edit.selected = Some(Element::Edge(a, b));
+        edit.start_face_tool(false, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_none());
+        edit.start_face_tool(true, &mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_none());
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "no stray bake");
+    }
+
+    /// Confirming without ever dragging must leave the object untouched —
+    /// in particular a pristine primitive must not silently gain a baked
+    /// mesh copy.
+    #[test]
+    fn confirming_a_zero_extrude_keeps_the_primitive_pristine() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        let top = top_face_of(&edit);
+        edit.selected = Some(Element::Face(top));
+
+        let mut events = vec![Event::Text("e".to_string())];
+        edit.handle_events(
+            &mut events, &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert!(edit.tool.is_some());
+        let mut events = vec![Event::KeyPress {
+            kind: Key::Enter,
+            modifiers: Default::default(),
+            handled: false,
+        }];
+        edit.handle_events(
+            &mut events, &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert!(edit.tool.is_none());
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "no bake for a no-op");
+        assert_eq!(edit.selected, Some(Element::Face(top)), "face stays selected");
     }
 
     #[test]
