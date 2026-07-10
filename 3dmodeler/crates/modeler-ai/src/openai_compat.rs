@@ -17,6 +17,8 @@ enum Catalog {
     OpenRouter,
     /// `/language-models`: includes token prices in 1/100 cent per MTok.
     XAi,
+    /// `/models`, ids only, local inference — every model is free.
+    LocalFree,
     /// `/models`, ids only, no fallback table (unknown vendor).
     Plain,
 }
@@ -31,6 +33,8 @@ pub const OPENAI: OpenAiCompat = OpenAiCompat { catalog: Catalog::OpenAi, key_re
 pub const OPENROUTER: OpenAiCompat =
     OpenAiCompat { catalog: Catalog::OpenRouter, key_required: true };
 pub const XAI: OpenAiCompat = OpenAiCompat { catalog: Catalog::XAi, key_required: true };
+pub const LMSTUDIO: OpenAiCompat =
+    OpenAiCompat { catalog: Catalog::LocalFree, key_required: false };
 pub const CUSTOM: OpenAiCompat = OpenAiCompat { catalog: Catalog::Plain, key_required: false };
 
 fn headers(cfg: &ProviderConfig) -> Vec<(String, String)> {
@@ -114,6 +118,8 @@ impl Provider for OpenAiCompat {
                         )
                     }
                     Catalog::OpenAi => pricing::openai(&id),
+                    // local inference has no per-token price
+                    Catalog::LocalFree => (Some(0.0), Some(0.0)),
                     Catalog::Plain => (None, None),
                 };
                 Some(ModelInfo {
@@ -385,6 +391,25 @@ mod tests {
         let models = XAI.parse_models(body).unwrap();
         assert_eq!(models[0].input_per_mtok, Some(2.0));
         assert_eq!(models[0].output_per_mtok, Some(10.0));
+    }
+
+    #[test]
+    fn lmstudio_models_are_free_and_keyless() {
+        // LM Studio's /v1/models shape (ids only, local server)
+        let body = r#"{"data": [
+            {"id": "qwen2.5-coder-14b-instruct", "object": "model", "owned_by": "organization_owner"},
+            {"id": "llama-3.2-3b-instruct", "object": "model", "owned_by": "organization_owner"}
+        ], "object": "list"}"#;
+        let models = LMSTUDIO.parse_models(body).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].input_per_mtok, Some(0.0), "local models are free");
+        assert_eq!(models[0].output_per_mtok, Some(0.0));
+
+        // no API key required, default endpoint is the local server
+        let cfg = ProviderConfig::new(ProviderKind::LmStudio);
+        let http = LMSTUDIO.list_models_request(&cfg).unwrap();
+        assert_eq!(http.url, "http://localhost:1234/v1/models");
+        assert!(!http.headers.iter().any(|(k, _)| k == "authorization"));
     }
 
     #[test]

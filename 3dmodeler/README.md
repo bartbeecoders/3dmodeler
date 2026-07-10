@@ -114,9 +114,10 @@ drives the same commands as the MCP server (add/update/delete objects,
 lights, walls, groups, the asset library, physics, viewport modes) and can
 take viewport screenshots to check its own work.
 
-- **Providers**: Anthropic, OpenAI, OpenRouter, xAI, or any OpenAI-compatible
-  endpoint (Ollama, LM Studio, vLLM, …). Configure with the ⚙ button in the
-  panel: API key, endpoint, then *Fetch models* to pick a model — each one is
+- **Providers**: Anthropic, OpenAI, OpenRouter, xAI, LM Studio (local), or
+  any OpenAI-compatible endpoint (Ollama, vLLM, …). Configure with the ⚙
+  button in the panel: API key (none for LM Studio), endpoint, then *Fetch
+  models* to pick a model — each one is
   listed with its price per million tokens (from the provider's API where
   available, a built-in approximation otherwise).
 - **Costs**: every interaction shows what it cost (tokens × the model's

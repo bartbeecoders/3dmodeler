@@ -17,23 +17,26 @@ mod types;
 
 pub use types::*;
 
-/// The built-in provider set. `Custom` is any OpenAI-compatible endpoint the
-/// user points at (LM Studio, Ollama, vLLM, a proxy, …).
+/// The built-in provider set. `LmStudio` is the local LM Studio server;
+/// `Custom` is any other OpenAI-compatible endpoint the user points at
+/// (Ollama, vLLM, a proxy, …).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
     OpenRouter,
     XAi,
+    LmStudio,
     Custom,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 5] = [
+    pub const ALL: [ProviderKind; 6] = [
         ProviderKind::Anthropic,
         ProviderKind::OpenAi,
         ProviderKind::OpenRouter,
         ProviderKind::XAi,
+        ProviderKind::LmStudio,
         ProviderKind::Custom,
     ];
 
@@ -43,6 +46,7 @@ impl ProviderKind {
             ProviderKind::OpenAi => "OpenAI",
             ProviderKind::OpenRouter => "OpenRouter",
             ProviderKind::XAi => "xAI",
+            ProviderKind::LmStudio => "LM Studio (local)",
             ProviderKind::Custom => "Custom (OpenAI-compatible)",
         }
     }
@@ -54,6 +58,7 @@ impl ProviderKind {
             ProviderKind::OpenAi => "https://api.openai.com/v1",
             ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
             ProviderKind::XAi => "https://api.x.ai/v1",
+            ProviderKind::LmStudio => "http://localhost:1234/v1",
             ProviderKind::Custom => "http://localhost:11434/v1",
         }
     }
@@ -65,6 +70,7 @@ impl ProviderKind {
             ProviderKind::OpenAi => "sk-…",
             ProviderKind::OpenRouter => "sk-or-…",
             ProviderKind::XAi => "xai-…",
+            ProviderKind::LmStudio => "(not needed)",
             ProviderKind::Custom => "(optional)",
         }
     }
@@ -113,6 +119,7 @@ pub fn provider_for(kind: ProviderKind) -> &'static dyn Provider {
         ProviderKind::OpenAi => &openai_compat::OPENAI,
         ProviderKind::OpenRouter => &openai_compat::OPENROUTER,
         ProviderKind::XAi => &openai_compat::XAI,
+        ProviderKind::LmStudio => &openai_compat::LMSTUDIO,
         ProviderKind::Custom => &openai_compat::CUSTOM,
     }
 }
