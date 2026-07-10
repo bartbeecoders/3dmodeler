@@ -128,6 +128,10 @@ pub struct ModelInfo {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
     pub context_length: Option<u64>,
+    /// Can this model call tools (drive the modeler)? None = the provider
+    /// does not say (local/custom endpoints — depends on the loaded model).
+    #[serde(default)]
+    pub tools: Option<bool>,
 }
 
 impl ModelInfo {

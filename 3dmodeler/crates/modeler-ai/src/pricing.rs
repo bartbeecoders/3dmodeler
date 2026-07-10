@@ -53,6 +53,13 @@ fn lookup(table: &[(&str, f64, f64)], id: &str) -> (Option<f64>, Option<f64>) {
     (None, None)
 }
 
+/// Tool/function calling on OpenAI chat models: everything current supports
+/// it except the early o1 reasoning previews and the ChatGPT-tuned snapshot.
+pub fn openai_supports_tools(id: &str) -> bool {
+    let no_tools = ["o1-mini", "o1-preview", "chatgpt-"];
+    !no_tools.iter().any(|p| id.starts_with(p))
+}
+
 /// OpenAI's `/models` mixes chat models with audio/image/embedding endpoints;
 /// keep only what a chat window can talk to.
 pub fn openai_is_chat_model(id: &str) -> bool {
@@ -79,6 +86,15 @@ mod tests {
     fn unknown_models_have_no_price() {
         assert_eq!(openai("some-future-model"), (None, None));
         assert_eq!(anthropic("claude-x"), (None, None));
+    }
+
+    #[test]
+    fn tool_support_exceptions() {
+        assert!(openai_supports_tools("gpt-4o"));
+        assert!(openai_supports_tools("gpt-5-mini"));
+        assert!(!openai_supports_tools("o1-mini"));
+        assert!(!openai_supports_tools("o1-preview"));
+        assert!(!openai_supports_tools("chatgpt-4o-latest"));
     }
 
     #[test]

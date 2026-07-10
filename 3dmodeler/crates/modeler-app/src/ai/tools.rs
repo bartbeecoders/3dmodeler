@@ -11,7 +11,19 @@ use crate::commands;
 use modeler_ai::ToolSpec;
 use serde_json::{json, Value};
 
-pub fn system_prompt() -> String {
+/// `tools_enabled = false` (model without tool support) swaps the builder
+/// persona for an advisor that knows it cannot touch the scene.
+pub fn system_prompt(tools_enabled: bool) -> String {
+    if !tools_enabled {
+        return "You are an experienced 3D modeling assistant embedded in a 3D modeler \
+                (Z-up, meters, primitive-based: plane/cube/sphere/cylinder/cone/torus, \
+                walls with door/window cutouts, point/sun/spot lights, physics). \
+                This chat session has NO tool access, so you cannot inspect or edit the \
+                scene yourself — give the user concise, concrete modeling guidance \
+                (steps, dimensions, placements) they can apply with the app's own tools \
+                instead. Never pretend an edit happened."
+            .to_string();
+    }
     r#"You are an experienced 3D modeling assistant embedded in a 3D modeler. You build and edit the user's live scene by calling tools.
 
 WORLD
@@ -26,6 +38,7 @@ WORKFLOW
 - After building or changing something substantial, call screenshot to check your work visually, then fix what looks wrong. The viewport shows the whole scene.
 - Lights: primitives "light" (point), "sun", "spot" with color, intensity, spot_angle_deg, shadows. Lights only affect the render when the viewport lighting is "scene" — call set_view {"lighting":"scene"} when the user cares about lighting/mood. "Night" = dim bluish sun (intensity ~0.2) + warm point/spot lights; "day" = one strong sun (intensity ~3).
 - Reuse: create_library_object captures objects as a named asset; place_library_object stamps copies (a whole building, tree, lamppost). For a city: build one of each thing, save to the library, then place many instances — far cheaper than re-modeling.
+- Reference images: add_reference_image puts a picture on an axis plane (from a file path the user gives, or base64); calibrate_reference_image scales it to real-world size from two pixel points and a distance.
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
@@ -210,10 +223,72 @@ pub fn catalog() -> Vec<ToolSpec> {
             &["asset"],
         ),
         tool(
+            "update_library_object",
+            "Rename/describe a library asset, or recapture its contents from scene objects.",
+            json!({
+                "asset": {"type": ["string", "integer"], "description": "asset name or id"},
+                "new_name": {"type": "string"},
+                "description": {"type": "string"},
+                "objects": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "recapture from these root objects"},
+                "pivot": {"type": "array", "items": {"type": "number"}},
+                "anchor": {"type": "array", "items": {"type": "number"}}
+            }),
+            &["asset"],
+        ),
+        tool(
             "delete_library_object",
             "Remove an asset from the library.",
             json!({"asset": {"type": ["string", "integer"]}}),
             &["asset"],
+        ),
+        tool(
+            "add_reference_image",
+            "Put a reference picture on an axis plane. Needs 'path' (a file on this machine) or 'data_base64'.",
+            json!({
+                "path": {"type": "string", "description": "image file path (native app only)"},
+                "data_base64": {"type": "string", "description": "raw image bytes, base64"},
+                "name": {"type": "string"},
+                "plane": {"type": "string", "enum": ["x", "y", "z"]},
+                "location": {"type": "array", "items": {"type": "number"}},
+                "rotation_deg": {"type": "number"},
+                "width_m": {"type": "number", "description": "display width in meters"},
+                "opacity": {"type": "number", "description": "0..1"},
+                "flip_h": {"type": "boolean"}
+            }),
+            &[],
+        ),
+        tool(
+            "update_reference_image",
+            "Change a reference image (plane, location, size, opacity, visibility, name).",
+            json!({
+                "image": {"type": ["string", "integer"], "description": "image name or id"},
+                "new_name": {"type": "string"},
+                "plane": {"type": "string", "enum": ["x", "y", "z"]},
+                "location": {"type": "array", "items": {"type": "number"}},
+                "rotation_deg": {"type": "number"},
+                "width_m": {"type": "number"},
+                "opacity": {"type": "number"},
+                "visible": {"type": "boolean"},
+                "flip_h": {"type": "boolean"}
+            }),
+            &["image"],
+        ),
+        tool(
+            "delete_reference_image",
+            "Remove a reference image from the scene.",
+            json!({"image": {"type": ["string", "integer"]}}),
+            &["image"],
+        ),
+        tool(
+            "calibrate_reference_image",
+            "Scale a reference image to reality: two points in source-image pixels plus the real distance between them.",
+            json!({
+                "image": {"type": ["string", "integer"]},
+                "point_a_px": {"type": "array", "items": {"type": "number"}, "description": "[x, y] pixels"},
+                "point_b_px": {"type": "array", "items": {"type": "number"}, "description": "[x, y] pixels"},
+                "real_distance_m": {"type": "number"}
+            }),
+            &["image", "point_a_px", "point_b_px", "real_distance_m"],
         ),
         tool(
             "set_view",
@@ -287,6 +362,37 @@ mod tests {
             assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
             assert!(!tool.description.is_empty(), "{}", tool.name);
         }
+    }
+
+    #[test]
+    fn catalog_covers_the_full_mcp_command_set() {
+        // every command the MCP server exposes must be callable by the
+        // assistant too (they share commands::execute)
+        let mcp_commands = [
+            "get_scene", "new_scene", "add_object", "update_object", "delete_object",
+            "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
+            "break_into_bricks", "add_measurement", "simulate", "set_view", "screenshot",
+            "add_reference_image", "update_reference_image", "delete_reference_image",
+            "calibrate_reference_image", "get_library", "create_library_object",
+            "update_library_object", "delete_library_object", "place_library_object",
+        ];
+        let catalog = catalog();
+        for command in mcp_commands {
+            assert!(
+                catalog.iter().any(|t| t.name == command),
+                "missing tool for MCP command '{command}'"
+            );
+        }
+        assert_eq!(catalog.len(), mcp_commands.len(), "unexpected extra tools");
+    }
+
+    #[test]
+    fn chat_only_prompt_forbids_pretending() {
+        let with_tools = system_prompt(true);
+        let chat_only = system_prompt(false);
+        assert!(with_tools.contains("calling tools"));
+        assert!(chat_only.contains("NO tool access"));
+        assert!(chat_only.contains("Never pretend"));
     }
 
     #[test]

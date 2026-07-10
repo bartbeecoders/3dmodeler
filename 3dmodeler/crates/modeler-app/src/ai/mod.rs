@@ -166,6 +166,14 @@ impl ChatSession {
             }
         }
         self.active = Some((kind, model));
+        // starting fresh with a model that can't call tools: say so once
+        if self.messages.is_empty()
+            && self.model_info(settings).and_then(|m| m.tools) == Some(false)
+        {
+            self.entries.push(Entry::Error(
+                "this model has no tool support — chat only, it cannot edit the scene".into(),
+            ));
+        }
         self.entries.push(Entry::User(text.to_string()));
         self.messages.push(ChatMessage::user_text(text));
         self.turn_usage = Usage::default();
@@ -227,11 +235,14 @@ impl ChatSession {
             self.entries.push(Entry::Error("provider not configured".into()));
             return;
         };
+        // a model without tool support gets a chat-only session — offering
+        // tools anyway makes providers reject the request outright
+        let tools_enabled = self.model_info(settings).and_then(|m| m.tools) != Some(false);
         let request = ChatRequest {
             model,
-            system: tools::system_prompt(),
+            system: tools::system_prompt(tools_enabled),
             messages: self.messages.clone(),
-            tools: tools::catalog(),
+            tools: if tools_enabled { tools::catalog() } else { Vec::new() },
             max_tokens: MAX_TOKENS,
         };
         match provider_for(kind).chat_request(&state.config, &request) {

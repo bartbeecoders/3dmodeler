@@ -122,12 +122,23 @@ impl Provider for OpenAiCompat {
                     Catalog::LocalFree => (Some(0.0), Some(0.0)),
                     Catalog::Plain => (None, None),
                 };
+                let tools = match self.catalog {
+                    // supported_parameters lists "tools" on capable models
+                    Catalog::OpenRouter => m["supported_parameters"]
+                        .as_array()
+                        .map(|params| params.iter().any(|p| p == "tools")),
+                    Catalog::OpenAi => Some(pricing::openai_supports_tools(&id)),
+                    Catalog::XAi => Some(true), // all Grok chat models
+                    // depends on the model the user loaded — unknowable here
+                    Catalog::LocalFree | Catalog::Plain => None,
+                };
                 Some(ModelInfo {
                     name: m["name"].as_str().unwrap_or(&id).to_string(),
                     id,
                     input_per_mtok: input,
                     output_per_mtok: output,
                     context_length: m["context_length"].as_u64(),
+                    tools,
                 })
             })
             .collect();
@@ -367,17 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_models_carry_prices() {
-        let body = r#"{"data": [{
-            "id": "anthropic/claude-sonnet-4.5",
-            "name": "Anthropic: Claude Sonnet 4.5",
-            "context_length": 200000,
-            "pricing": {"prompt": "0.000003", "completion": "0.000015"}
-        }]}"#;
+    fn openrouter_models_carry_prices_and_tool_support() {
+        let body = r#"{"data": [
+            {
+                "id": "anthropic/claude-sonnet-4.5",
+                "name": "Anthropic: Claude Sonnet 4.5",
+                "context_length": 200000,
+                "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+                "supported_parameters": ["max_tokens", "tools", "tool_choice"]
+            },
+            {
+                "id": "meta-llama/llama-3.2-1b",
+                "name": "Meta: Llama 3.2 1B",
+                "context_length": 131072,
+                "pricing": {"prompt": "0", "completion": "0"},
+                "supported_parameters": ["max_tokens", "temperature"]
+            },
+            {
+                "id": "vendor/no-params-field",
+                "name": "No Params",
+                "pricing": {"prompt": "0", "completion": "0"}
+            }
+        ]}"#;
         let models = OPENROUTER.parse_models(body).unwrap();
-        assert_eq!(models[0].input_per_mtok, Some(3.0));
-        assert_eq!(models[0].output_per_mtok, Some(15.0));
-        assert_eq!(models[0].context_length, Some(200000));
+        let by_id = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+        let sonnet = by_id("anthropic/claude-sonnet-4.5");
+        assert_eq!(sonnet.input_per_mtok, Some(3.0));
+        assert_eq!(sonnet.output_per_mtok, Some(15.0));
+        assert_eq!(sonnet.context_length, Some(200000));
+        assert_eq!(sonnet.tools, Some(true));
+        assert_eq!(by_id("meta-llama/llama-3.2-1b").tools, Some(false));
+        assert_eq!(by_id("vendor/no-params-field").tools, None);
     }
 
     #[test]
@@ -391,6 +422,7 @@ mod tests {
         let models = XAI.parse_models(body).unwrap();
         assert_eq!(models[0].input_per_mtok, Some(2.0));
         assert_eq!(models[0].output_per_mtok, Some(10.0));
+        assert_eq!(models[0].tools, Some(true));
     }
 
     #[test]
@@ -404,6 +436,7 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].input_per_mtok, Some(0.0), "local models are free");
         assert_eq!(models[0].output_per_mtok, Some(0.0));
+        assert_eq!(models[0].tools, None, "tool support depends on the loaded model");
 
         // no API key required, default endpoint is the local server
         let cfg = ProviderConfig::new(ProviderKind::LmStudio);
@@ -423,6 +456,7 @@ mod tests {
         assert_eq!(models.len(), 1, "non-chat models are hidden");
         assert_eq!(models[0].id, "gpt-4o");
         assert!(models[0].input_per_mtok.is_some());
+        assert_eq!(models[0].tools, Some(true));
     }
 
     #[test]

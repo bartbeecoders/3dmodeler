@@ -61,6 +61,7 @@ impl Provider for Anthropic {
                     input_per_mtok: input,
                     output_per_mtok: output,
                     context_length: None,
+                    tools: Some(true), // every current Claude model has tool use
                 })
             })
             .collect())

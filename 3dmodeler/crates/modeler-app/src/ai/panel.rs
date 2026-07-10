@@ -49,6 +49,15 @@ fn short_price(model: &ModelInfo) -> String {
     }
 }
 
+/// Tool-capability tag for a model row ("can it drive the modeler?").
+fn tools_tag(model: &ModelInfo) -> &'static str {
+    match model.tools {
+        Some(true) => "  ·  tools ✔",
+        Some(false) => "  ·  no tools",
+        None => "",
+    }
+}
+
 /// The panel's text is a size up from the app default — chat is prose, not
 /// chrome, and API keys / model ids need to be legible.
 fn bigger_text(ui: &mut egui::Ui) {
@@ -292,9 +301,30 @@ impl ChatPanel {
             self.model_list_ui(ui, state);
         }
 
-        // the chosen model's full price tag
+        // the chosen model's full price tag + what it can do here
         if let Some(model) = state.models.iter().find(|m| m.id == state.model) {
             ui.weak(egui::RichText::new(model.price_label()).small());
+            match model.tools {
+                Some(true) => {
+                    ui.weak(egui::RichText::new(
+                        "Tool use ✔ — the model can inspect and edit the scene.",
+                    ).small());
+                }
+                Some(false) => {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        egui::RichText::new(
+                            "No tool use — chat only, this model cannot edit the scene.",
+                        )
+                        .small(),
+                    );
+                }
+                None => {
+                    ui.weak(egui::RichText::new(
+                        "Tool support unknown (depends on the loaded model) — tools will be offered.",
+                    ).small());
+                }
+            }
         }
         match kind {
             ProviderKind::Anthropic | ProviderKind::OpenAi => {
@@ -359,7 +389,12 @@ impl ChatPanel {
                     );
                     for model in members {
                         let selected = state.model == model.id;
-                        let row = format!("{}   ·   {}", model.name, short_price(model));
+                        let row = format!(
+                            "{}   ·   {}{}",
+                            model.name,
+                            short_price(model),
+                            tools_tag(model)
+                        );
                         if ui
                             .selectable_label(selected, row)
                             .on_hover_text(&model.id)
@@ -473,6 +508,7 @@ mod tests {
             input_per_mtok: input,
             output_per_mtok: output,
             context_length: None,
+            tools: None,
         }
     }
 

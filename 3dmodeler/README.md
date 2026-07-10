@@ -122,6 +122,11 @@ take viewport screenshots to check its own work.
   available, a built-in approximation otherwise).
 - **Costs**: every interaction shows what it cost (tokens × the model's
   price), plus a running session total in the panel footer.
+- **Tool use**: the model picker marks which models can call tools
+  (`tools ✔` / `no tools`) — tool-capable models get the modeler's full MCP
+  command set (objects, lights, walls, reference images, library, physics,
+  screenshots); models without tool support fall back to chat-only advice
+  instead of erroring.
 - Works natively and in the browser build (some providers block direct
   browser calls — Anthropic and OpenRouter allow them).
 - Extending: new providers implement request-building + response-parsing in
