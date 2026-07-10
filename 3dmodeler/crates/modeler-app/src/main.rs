@@ -7,6 +7,7 @@
 mod add_menu;
 mod ai;
 mod axis_widget;
+mod clipboard;
 mod commands;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
@@ -87,6 +88,7 @@ pub fn selection_bounds(scene: &Scene, selection: &Selection) -> Option<(glam::V
 pub fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
+    clipboard::init();
 
     // Native: own the winit window and event loop instead of using
     // three_d::Window::render_loop — three-d does not forward OS file-drop
@@ -206,6 +208,12 @@ pub fn main() {
         let mcp_status = Some(control.as_ref().map(|c| c.status()));
         #[cfg(target_arch = "wasm32")]
         let mcp_status: Option<Option<ui::McpStatus>> = None;
+        // paste (Ctrl+V) into focused text fields: three-d never reads the
+        // OS clipboard, so bridge it into a Text event before egui runs
+        clipboard::inject_paste(
+            &mut frame_input.events,
+            gui.context().egui_wants_keyboard_input(),
+        );
         let mut pointer_over_ui = false;
         gui.update(
             &mut frame_input.events,

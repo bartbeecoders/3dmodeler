@@ -1,6 +1,6 @@
 [package]
 name = "modeler-app"
-version = "0.2.31"
+version = "0.2.32"
 edition = "2021"
 description = "3D modeler application: viewport, tools, UI (native + browser)"
 
@@ -20,6 +20,7 @@ tiny_http = "0.12"
 rfd = "0.15"
 dirs = "5"
 ureq = "2"
+arboard = "3" # OS clipboard for paste into egui fields (see clipboard.rs)
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -45,6 +46,8 @@ web-sys = { version = "0.3", features = [
     "RequestInit",
     "RequestMode",
     "Response",
+    "ClipboardEvent",
+    "DataTransfer",
 ] }
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
