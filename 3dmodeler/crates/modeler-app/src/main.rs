@@ -96,7 +96,7 @@ pub fn main() {
     // manager. The loop below replicates render_loop's behavior exactly,
     // plus WindowEvent::DroppedFile.
     #[cfg(not(target_arch = "wasm32"))]
-    let (event_loop, winit_window, gl) = {
+    let (event_loop, winit_window, gl, vsync) = {
         let event_loop = winit::event_loop::EventLoop::new();
         let winit_window = winit::window::WindowBuilder::new()
             .with_title("3D Modeler")
@@ -105,9 +105,31 @@ pub fn main() {
             .build(&event_loop)
             .unwrap();
         winit_window.focus_window();
+        // VMs and remote desktops often lack GL niceties — VirtualBox e.g.
+        // has no swap-control (vsync) extension — so fall back progressively
+        // instead of crashing at startup. Without vsync the main loop caps
+        // the frame rate itself (below).
+        let mut vsync = true;
         let gl = WindowedContext::from_winit_window(&winit_window, SurfaceSettings::default())
-            .unwrap();
-        (event_loop, winit_window, gl)
+            .or_else(|_| {
+                vsync = false;
+                WindowedContext::from_winit_window(
+                    &winit_window,
+                    SurfaceSettings { vsync: false, ..Default::default() },
+                )
+            })
+            .or_else(|_| {
+                // bare-bones GL: no vsync, no multisampling
+                WindowedContext::from_winit_window(
+                    &winit_window,
+                    SurfaceSettings { vsync: false, multisamples: 0, ..Default::default() },
+                )
+            })
+            .expect("cannot create an OpenGL context — is 3D acceleration available?");
+        if !vsync {
+            println!("vsync unavailable (VM or remote desktop?) — limiting to ~60 fps");
+        }
+        (event_loop, winit_window, gl, vsync)
     };
     #[cfg(not(target_arch = "wasm32"))]
     let context: Context = (*gl).clone();
@@ -990,6 +1012,9 @@ pub fn main() {
         use winit::event_loop::ControlFlow;
 
         let mut frame_input_generator = FrameInputGenerator::from_winit_window(&winit_window);
+        // without swap-control the GPU never blocks us — pace the loop by hand
+        let frame_budget = std::time::Duration::from_micros(16_600);
+        let mut last_frame = std::time::Instant::now();
         event_loop.run(move |event, _, control_flow| match event {
             WinitEvent::MainEventsCleared => winit_window.request_redraw(),
             WinitEvent::RedrawRequested(_) => {
@@ -1007,6 +1032,13 @@ pub fn main() {
                         *control_flow = ControlFlow::Poll;
                         winit_window.request_redraw();
                     }
+                }
+                if !vsync {
+                    let elapsed = last_frame.elapsed();
+                    if elapsed < frame_budget {
+                        std::thread::sleep(frame_budget - elapsed);
+                    }
+                    last_frame = std::time::Instant::now();
                 }
             }
             WinitEvent::WindowEvent { ref event, .. } => {
