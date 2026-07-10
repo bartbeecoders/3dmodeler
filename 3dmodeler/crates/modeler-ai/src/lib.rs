@@ -116,3 +116,18 @@ pub fn provider_for(kind: ProviderKind) -> &'static dyn Provider {
         ProviderKind::Custom => &openai_compat::CUSTOM,
     }
 }
+
+/// A short slice of a response body for error messages — enough to see what
+/// the server actually sent (HTML error page, proxy message, …).
+pub(crate) fn excerpt(body: &str) -> String {
+    const LIMIT: usize = 280;
+    let trimmed = body.trim();
+    let cut: String = trimmed.chars().take(LIMIT).collect();
+    if trimmed.chars().count() > LIMIT {
+        format!("{cut}…")
+    } else if cut.is_empty() {
+        "(empty response)".to_string()
+    } else {
+        cut
+    }
+}

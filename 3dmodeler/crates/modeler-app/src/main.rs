@@ -132,6 +132,11 @@ pub fn main() {
     let mut cutout_handles = cutout_handles::CutoutHandles::new();
     let mut poke_tool = poke::PokeTool::new();
     let mut ui_state = ui::UiState::new();
+    // dev/test hook: start with the AI panel open (used by UI verification)
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var("MODELER_AI_PANEL").is_ok() {
+        ui_state.chat_panel.open = true;
+    }
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
     let mut wall_tool = wall_tool::WallTool::new();

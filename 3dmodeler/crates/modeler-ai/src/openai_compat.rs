@@ -77,7 +77,8 @@ impl Provider for OpenAiCompat {
     }
 
     fn parse_models(&self, body: &str) -> Result<Vec<ModelInfo>, String> {
-        let value: Value = serde_json::from_str(body).map_err(|e| format!("bad JSON: {e}"))?;
+        let value: Value = serde_json::from_str(body)
+            .map_err(|e| format!("bad JSON: {e}\n{}", crate::excerpt(body)))?;
         if let Some(message) = api_error(&value) {
             return Err(message);
         }
@@ -168,13 +169,14 @@ impl Provider for OpenAiCompat {
     }
 
     fn parse_chat(&self, body: &str) -> Result<ChatResponse, String> {
-        let value: Value = serde_json::from_str(body).map_err(|e| format!("bad JSON: {e}"))?;
+        let value: Value = serde_json::from_str(body)
+            .map_err(|e| format!("bad JSON: {e}\n{}", crate::excerpt(body)))?;
         if let Some(message) = api_error(&value) {
             return Err(message);
         }
         let choice = &value["choices"][0];
         if choice.is_null() {
-            return Err("no choices in response".into());
+            return Err(format!("no choices in response\n{}", crate::excerpt(body)));
         }
         let message = &choice["message"];
         let mut blocks = Vec::new();

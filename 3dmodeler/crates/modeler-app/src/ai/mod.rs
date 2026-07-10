@@ -39,8 +39,9 @@ pub struct ToolContext<'a> {
 pub enum Entry {
     User(String),
     Assistant(String),
-    /// A tool call: name, compact argument summary, ok flag.
-    Tool { name: String, summary: String, ok: bool },
+    /// A tool call: name, compact argument summary, ok flag. `detail` holds
+    /// the full response for failed calls (expandable in the log).
+    Tool { name: String, summary: String, ok: bool, detail: Option<String> },
     Error(String),
     /// Per-interaction footer: cost (None = no price data), tokens, requests.
     Cost { usd: Option<f64>, usage: Usage, requests: u32 },
@@ -366,15 +367,26 @@ impl ChatSession {
                     name: name.clone(),
                     summary: String::new(),
                     ok: true,
+                    detail: None,
                 });
                 continue;
             }
             let response = tools::dispatch(name, input, &mut ctx);
             let ok = response["ok"].as_bool().unwrap_or(false);
+            // failed calls keep the full exchange for the expandable log entry
+            let detail = (!ok).then(|| {
+                format!(
+                    "input:\n{}\n\nresponse:\n{}",
+                    serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
+                    serde_json::to_string_pretty(&response)
+                        .unwrap_or_else(|_| response.to_string()),
+                )
+            });
             self.entries.push(Entry::Tool {
                 name: name.clone(),
                 summary: tools::summarize(name, input, &response),
                 ok,
+                detail,
             });
             results.push(ContentBlock::ToolResult {
                 id: id.clone(),
