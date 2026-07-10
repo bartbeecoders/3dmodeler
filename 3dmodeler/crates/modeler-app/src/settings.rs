@@ -7,8 +7,56 @@
 //! settings files loadable when new fields are added.
 
 use crate::theme::{self, Theme};
+use modeler_ai::{ModelInfo, ProviderConfig, ProviderKind};
 use serde::{Deserialize, Serialize};
 use three_d::egui;
+
+/// One AI provider's persisted state: credentials/endpoint, the chosen
+/// model, and the last fetched model catalog (so prices and the picker work
+/// offline on the next start).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiProviderState {
+    pub config: ProviderConfig,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub models: Vec<ModelInfo>,
+}
+
+impl AiProviderState {
+    pub fn new(kind: ProviderKind) -> Self {
+        Self { config: ProviderConfig::new(kind), model: String::new(), models: Vec::new() }
+    }
+}
+
+/// AI assistant settings. API keys land in the settings store (config dir /
+/// localStorage) — same trust level as the rest of the user's local config.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    pub active: ProviderKind,
+    pub providers: Vec<AiProviderState>,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self { active: ProviderKind::Anthropic, providers: Vec::new() }
+    }
+}
+
+impl AiSettings {
+    pub fn state(&self, kind: ProviderKind) -> Option<&AiProviderState> {
+        self.providers.iter().find(|p| p.config.kind == kind)
+    }
+
+    /// The provider's state, created on first access.
+    pub fn state_mut(&mut self, kind: ProviderKind) -> &mut AiProviderState {
+        if !self.providers.iter().any(|p| p.config.kind == kind) {
+            self.providers.push(AiProviderState::new(kind));
+        }
+        self.providers.iter_mut().find(|p| p.config.kind == kind).unwrap()
+    }
+}
 
 /// Display unit for lengths. The world unit is ALWAYS 1 meter (box3d and the
 /// scene format store meters); the unit only changes how values are shown
@@ -91,6 +139,8 @@ pub struct Settings {
     /// Defaults for walls drawn with the wall tool, meters.
     pub default_wall_height: f32,
     pub default_wall_thickness: f32,
+    /// AI assistant: providers, keys, model choices.
+    pub ai: AiSettings,
 }
 
 impl Default for Settings {
@@ -104,6 +154,7 @@ impl Default for Settings {
             default_save_dir: None,
             default_wall_height: 2.5,
             default_wall_thickness: 0.2,
+            ai: AiSettings::default(),
         }
     }
 }

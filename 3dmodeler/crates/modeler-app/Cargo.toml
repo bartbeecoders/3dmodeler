@@ -1,11 +1,12 @@
 [package]
 name = "modeler-app"
-version = "0.2.30"
+version = "0.2.31"
 edition = "2021"
 description = "3D modeler application: viewport, tools, UI (native + browser)"
 
 [dependencies]
 modeler-core = { path = "../modeler-core" }
+modeler-ai = { path = "../modeler-ai" }
 box3d-sys = { path = "../box3d-sys" }
 three-d = { version = "0.19", features = ["egui-gui"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,12 +17,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 winit = "0.28" # same version as three-d's (we own the event loop for OS file drops)
 tiny_http = "0.12"
-png = "0.17"
 rfd = "0.15"
 dirs = "5"
+ureq = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "console",
     "Storage",
@@ -38,6 +40,11 @@ web-sys = { version = "0.3", features = [
     "File",
     "FileReader",
     "Event",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
 ] }
-js-sys = "0.3" 
+js-sys = "0.3"
 console_error_panic_hook = "0.1"

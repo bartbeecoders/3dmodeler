@@ -4,6 +4,7 @@ members = [
     "crates/box3d-sys",
     "crates/phase0-spike",
     "crates/modeler-core",
+    "crates/modeler-ai",
     "crates/modeler-app",
     "crates/modeler-mcp",
 ]

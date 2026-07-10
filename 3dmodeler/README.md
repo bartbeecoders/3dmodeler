@@ -105,6 +105,28 @@ claude mcp add modeler -- $PWD/target/release/modeler-mcp   # one-time
 Full setup for Claude Desktop / Cursor / Windsurf / VS Code, the tool
 reference and troubleshooting: [docs/mcp.md](docs/mcp.md).
 
+# AI assistant (chat)
+
+Toolbar **AI** button (or View ▸ AI Assistant): a chat panel where a language
+model builds and edits the scene for you — *"recreate the Eiffel tower"*,
+*"make it taller"*, *"add some lights"*, *"make it night time"*. The model
+drives the same commands as the MCP server (add/update/delete objects,
+lights, walls, groups, the asset library, physics, viewport modes) and can
+take viewport screenshots to check its own work.
+
+- **Providers**: Anthropic, OpenAI, OpenRouter, xAI, or any OpenAI-compatible
+  endpoint (Ollama, LM Studio, vLLM, …). Configure with the ⚙ button in the
+  panel: API key, endpoint, then *Fetch models* to pick a model — each one is
+  listed with its price per million tokens (from the provider's API where
+  available, a built-in approximation otherwise).
+- **Costs**: every interaction shows what it cost (tokens × the model's
+  price), plus a running session total in the panel footer.
+- Works natively and in the browser build (some providers block direct
+  browser calls — Anthropic and OpenRouter allow them).
+- Extending: new providers implement request-building + response-parsing in
+  `crates/modeler-ai` (no transport code); new tools are one entry in
+  `modeler-app/src/ai/tools.rs` on top of the shared command executor.
+
 ## Deploying
 
 ```bash

@@ -5,7 +5,9 @@
 //! b3World; clicks select via b3World_CastRayClosest.
 
 mod add_menu;
+mod ai;
 mod axis_widget;
+mod commands;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
 mod camera;
@@ -16,6 +18,7 @@ mod grid;
 mod library;
 mod mesh_edit;
 mod modal;
+mod net;
 mod object_ops;
 mod io;
 mod overlay;
@@ -148,6 +151,7 @@ pub fn main() {
         (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
     #[cfg(not(target_arch = "wasm32"))]
     let mut control = control::ControlServer::start();
+    let mut chat = ai::ChatSession::new();
 
     info("box3d physics mirror created");
 
@@ -232,6 +236,7 @@ pub fn main() {
                     &modal_status,
                     fps,
                     mcp_status,
+                    &mut chat,
                 );
 
                 // overlays never draw over the menu bar / sidebar / status bar
@@ -296,7 +301,7 @@ pub fn main() {
                     layout.right_offset,
                     layout.top_offset,
                 );
-                axis_widget::view_label(gui_context, &camera, 0.0, layout.top_offset);
+                axis_widget::view_label(gui_context, &camera, layout.left_offset, layout.top_offset);
                 poke_tool.draw(gui_context);
 
                 // Blender-style operator status while transforming
@@ -304,7 +309,7 @@ pub fn main() {
                     let screen = gui_context.content_rect();
                     egui::Area::new(egui::Id::new("modal-status"))
                         .fixed_pos(egui::pos2(
-                            screen.left() + 12.0,
+                            screen.left() + layout.left_offset + 12.0,
                             screen.top() + layout.top_offset + 30.0,
                         ))
                         .order(egui::Order::Foreground)
@@ -327,6 +332,7 @@ pub fn main() {
                 if let Some(pos) = gui_context.input(|i| i.pointer.latest_pos()) {
                     let screen = gui_context.content_rect();
                     pointer_over_ui |= pos.x > screen.right() - layout.right_offset
+                        || pos.x < screen.left() + layout.left_offset
                         || pos.y < screen.top() + layout.top_offset
                         || pos.y > screen.bottom() - layout.bottom_offset;
                 }
@@ -757,6 +763,19 @@ pub fn main() {
             );
         }
 
+        // AI assistant: deliver finished responses, run requested tools
+        chat.poll(
+            &mut settings,
+            ai::ToolContext {
+                scene: &mut scene,
+                selection: &mut sel,
+                physics: &mut physics,
+                library: &mut library,
+                shade_mode: &mut shade_mode,
+                lighting_mode: &mut lighting_mode,
+            },
+        );
+
         // step the simulation (writes transforms back into the scene)
         physics.update(&mut scene, frame_input.elapsed_time as f32 / 1000.0);
 
@@ -915,12 +934,23 @@ pub fn main() {
             })
             .unwrap();
 
+        // the AI assistant's screenshot tool sees the frame just rendered
+        if chat.wants_screenshot() {
+            let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
+            chat.deliver_screenshot(
+                &pixels,
+                frame_input.viewport.width,
+                frame_input.viewport.height,
+                &settings,
+            );
+        }
+
         // deliver any pending screenshot requests from the control API
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(control) = control.as_mut() {
             if !control.pending_screenshots.is_empty() {
                 let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
-                let response = match control::encode_screenshot(
+                let response = match commands::encode_screenshot(
                     &pixels,
                     frame_input.viewport.width,
                     frame_input.viewport.height,

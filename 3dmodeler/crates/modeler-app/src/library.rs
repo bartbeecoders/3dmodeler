@@ -218,6 +218,7 @@ impl LibraryPanel {
         top_offset: f32,
         right_offset: f32,
         bottom_offset: f32,
+        left_offset: f32,
     ) {
         if !ctx.input(|i| i.pointer.any_released()) {
             return;
@@ -227,7 +228,7 @@ impl LibraryPanel {
         }
         let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else { return };
         let screen = ctx.content_rect();
-        let in_viewport = pos.x >= screen.left()
+        let in_viewport = pos.x >= screen.left() + left_offset
             && pos.x <= screen.right() - right_offset
             && pos.y >= screen.top() + top_offset
             && pos.y <= screen.bottom() - bottom_offset;

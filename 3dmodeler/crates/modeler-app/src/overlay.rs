@@ -277,7 +277,10 @@ pub fn draw_edit_mode(
 pub fn viewport_clip(ctx: &egui::Context, layout: &crate::ui::UiLayout) -> egui::Rect {
     let screen = ctx.content_rect();
     egui::Rect::from_min_max(
-        egui::pos2(screen.left(), screen.top() + layout.top_offset),
+        egui::pos2(
+            screen.left() + layout.left_offset,
+            screen.top() + layout.top_offset,
+        ),
         egui::pos2(
             screen.right() - layout.right_offset,
             screen.bottom() - layout.bottom_offset,

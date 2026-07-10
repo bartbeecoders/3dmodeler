@@ -91,6 +91,7 @@ pub struct UiState {
     ref_setup: RefSetupDialog,
     pub library_panel: LibraryPanel,
     pub context_menu: ContextMenu,
+    pub chat_panel: crate::ai::ChatPanel,
     applied_theme: Option<Theme>,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
@@ -112,6 +113,7 @@ pub struct UiLayout {
     pub top_offset: f32,     // menu bar height (logical)
     pub right_offset: f32,   // sidebar width (logical)
     pub bottom_offset: f32,  // status bar height (logical)
+    pub left_offset: f32,    // AI chat panel width (logical)
 }
 
 impl UiState {
@@ -138,6 +140,7 @@ impl UiState {
             ref_setup: RefSetupDialog::new(),
             library_panel: LibraryPanel::new(),
             context_menu: ContextMenu::new(),
+            chat_panel: crate::ai::ChatPanel::new(),
             applied_theme: None,
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
@@ -190,6 +193,7 @@ impl UiState {
         modal_status: &Option<String>,
         fps: f32,
         mcp: Option<Option<McpStatus>>,
+        chat: &mut crate::ai::ChatSession,
     ) -> UiLayout {
         // restyle egui when the theme changed (and on the first frame)
         if self.applied_theme != Some(settings.theme) {
@@ -247,6 +251,7 @@ impl UiState {
         } else {
             0.0
         };
+        let left_offset = self.chat_panel.ui(ctx, chat, settings);
         self.keymap_window(ctx);
         self.about_window(ctx);
         self.import_window(ctx, scene, undo);
@@ -271,11 +276,12 @@ impl UiState {
             self.status_message = Some(message);
         }
         self.library_panel
-            .detect_viewport_drop(ctx, top_offset, right_offset, bottom_offset);
+            .detect_viewport_drop(ctx, top_offset, right_offset, bottom_offset, left_offset);
         UiLayout {
             top_offset,
             right_offset,
             bottom_offset,
+            left_offset,
         }
     }
 
@@ -365,6 +371,7 @@ impl UiState {
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
                                     shade_mode, lighting_mode, xray,
+                                    &mut self.chat_panel.open,
                                 ),
                                 Menu::Help => {
                                     let mut close = false;
@@ -434,6 +441,10 @@ impl UiState {
                         *on = !*on;
                     }
                 };
+
+                // "AI" as text: egui's built-in fonts have no robot emoji
+                toggle(ui, &mut self.chat_panel.open, "AI", "AI Assistant chat");
+                ui.separator();
 
                 if icon(ui, "🗋", "New scene (Ctrl+N)") {
                     self.action_new_scene(scene, selection, undo);
@@ -2063,8 +2074,18 @@ fn view_menu(
     shade_mode: &mut ShadeMode,
     lighting_mode: &mut LightingMode,
     xray: &mut bool,
+    chat_open: &mut bool,
 ) -> bool {
     let mut close = false;
+    if ui
+        .selectable_label(*chat_open, "AI Assistant")
+        .on_hover_text("Chat with an AI that models alongside you")
+        .clicked()
+    {
+        *chat_open = !*chat_open;
+        close = true;
+    }
+    ui.separator();
     ui.label(egui::RichText::new("Viewport shading").weak().size(11.0));
     ui.horizontal(|ui| {
         for (mode, label) in [
