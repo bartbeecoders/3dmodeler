@@ -16,3 +16,6 @@ CMakeUserPresets.json
 *.b3rec
 
 Reference-Images/
+
+Vibecoding/
+secret*.*
