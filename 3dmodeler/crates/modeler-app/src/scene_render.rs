@@ -42,7 +42,7 @@ pub enum LightingMode {
 const ACTIVE_OUTLINE: Srgba = Srgba::new(255, 170, 64, 255);
 const SELECTED_OUTLINE: Srgba = Srgba::new(230, 110, 20, 255);
 const OVERLAP_OUTLINE: Srgba = Srgba::new(235, 60, 50, 255);
-const OUTLINE_SCALE: f32 = 1.03;
+const OUTLINE_SCALE: f32 = 1.015;
 
 struct CachedModel {
     primitive: Primitive,
