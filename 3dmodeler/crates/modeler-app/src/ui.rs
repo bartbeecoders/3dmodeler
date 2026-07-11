@@ -87,6 +87,12 @@ pub struct UiState {
     brick_dialog: Option<i32>,
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
+    /// Scene version at the last save/load/new (None until the first frame
+    /// establishes the baseline). Differing from `scene.version()` means
+    /// there are unsaved changes.
+    saved_version: Option<u64>,
+    /// "Unsaved changes" confirmation before New scene wipes the document.
+    confirm_new_open: bool,
     settings_window: SettingsWindow,
     ref_setup: RefSetupDialog,
     pub library_panel: LibraryPanel,
@@ -136,6 +142,8 @@ impl UiState {
             brick_dialog: None,
             status_message: None,
             current_file: None,
+            saved_version: None,
+            confirm_new_open: false,
             settings_window: SettingsWindow::new(),
             ref_setup: RefSetupDialog::new(),
             library_panel: LibraryPanel::new(),
@@ -201,6 +209,11 @@ impl UiState {
             settings.theme.apply(ctx);
             self.applied_theme = Some(settings.theme);
         }
+        // the freshly started scene is the clean baseline for unsaved-changes
+        // detection (set once, on the first frame)
+        if self.saved_version.is_none() {
+            self.saved_version = Some(scene.version());
+        }
         // finished reference-image picks arrive here
         if let Some((name, bytes)) = ref_image::poll_image() {
             match ref_image::make_reference(name, &bytes) {
@@ -220,6 +233,7 @@ impl UiState {
                     io::add_recent(&handle, scene);
                     self.status_message = Some(format!("loaded {}", io::display_name(&handle)));
                     self.current_file = Some(handle);
+                    self.saved_version = Some(scene.version());
                 }
                 Err(e) => self.status_message = Some(format!("open failed: {e}")),
             }
@@ -230,6 +244,7 @@ impl UiState {
                     io::add_recent(&handle, scene);
                     self.status_message = Some(format!("saved {}", io::display_name(&handle)));
                     self.current_file = Some(handle);
+                    self.saved_version = Some(scene.version());
                 }
                 Err(e) => self.status_message = Some(format!("save failed: {e}")),
             }
@@ -259,6 +274,7 @@ impl UiState {
         self.about_window(ctx);
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
+        self.confirm_new_window(ctx, scene, selection, undo);
         self.brick_dialog_window(ctx, scene, selection);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
@@ -664,6 +680,7 @@ impl UiState {
                             undo.reset(scene);
                             self.status_message = Some(format!("loaded {}", entry.label));
                             self.current_file = Some(entry.handle);
+                            self.saved_version = Some(scene.version());
                         }
                         Err(e) => self.status_message = Some(format!("load failed: {e}")),
                     }
@@ -693,18 +710,106 @@ impl UiState {
                 io::add_recent(&handle, scene);
                 self.status_message = Some(format!("saved {}", io::display_name(&handle)));
                 self.current_file = Some(handle);
+                self.saved_version = Some(scene.version());
             }
             Err(e) => self.status_message = Some(format!("save failed: {e}")),
         }
     }
 
-    /// File > New scene, also reachable via Ctrl+N.
+    /// File > New scene, also reachable via Ctrl+N. With unsaved changes it
+    /// only opens the confirmation dialog; the reset happens on confirm.
     pub fn action_new_scene(&mut self, scene: &mut Scene, selection: &mut Selection, undo: &mut UndoStack) {
+        if self.saved_version.is_some_and(|v| v != scene.version()) {
+            self.confirm_new_open = true;
+            return;
+        }
+        self.reset_scene(scene, selection, undo);
+    }
+
+    /// Replace the document with the default scene (New scene, post-confirm).
+    fn reset_scene(&mut self, scene: &mut Scene, selection: &mut Selection, undo: &mut UndoStack) {
         *scene = Scene::default_scene();
         selection.set(Vec::new(), None);
         self.rename = None;
         undo.reset(scene);
         self.current_file = None;
+        self.saved_version = Some(scene.version());
+    }
+
+    /// "Unsaved changes" warning shown before New scene discards the
+    /// document. Enter takes the safe path (save first when a file is known,
+    /// otherwise cancel); Escape cancels.
+    fn confirm_new_window(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        selection: &mut Selection,
+        undo: &mut UndoStack,
+    ) {
+        if !self.confirm_new_open {
+            return;
+        }
+        let mut open = true;
+        let mut save_first = false;
+        let mut discard = false;
+        let mut cancel = false;
+        let has_file = self.current_file.is_some();
+        egui::Window::new("Unsaved changes")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let name = self
+                    .current_file
+                    .as_ref()
+                    .map(io::display_name)
+                    .unwrap_or_else(|| "The current scene".to_string());
+                ui.label(format!("{name} has unsaved changes."));
+                ui.label("Starting a new scene will discard them.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if has_file && ui.button("Save, then new").clicked() {
+                        save_first = true;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        cancel = true;
+                    }
+                });
+                // Enter (with no button focused) takes the safe default
+                if dialog_confirmed(ui) {
+                    if has_file {
+                        save_first = true;
+                    } else {
+                        cancel = true;
+                    }
+                }
+            });
+
+        if save_first {
+            if let Some(handle) = self.current_file.clone() {
+                match io::save(scene, &handle) {
+                    Ok(()) => {
+                        io::add_recent(&handle, scene);
+                        self.status_message =
+                            Some(format!("saved {}", io::display_name(&handle)));
+                        self.reset_scene(scene, selection, undo);
+                    }
+                    Err(e) => self.status_message = Some(format!("save failed: {e}")),
+                }
+            }
+            self.confirm_new_open = false;
+        } else if discard {
+            self.reset_scene(scene, selection, undo);
+            self.confirm_new_open = false;
+        } else if cancel || !open {
+            self.confirm_new_open = false;
+        }
     }
 
     /// File > Save, also reachable via Ctrl+S: writes to the current file
