@@ -336,6 +336,9 @@ fn apply_ref_image_params(scene: &mut Scene, id: u64, params: &Value) -> Result<
     if let Some(v) = params.get("flip_h").and_then(Value::as_bool) {
         image.flip_h = v;
     }
+    if let Some(v) = params.get("flip_v").and_then(Value::as_bool) {
+        image.flip_v = v;
+    }
     if let Some(v) = params.get("new_name").and_then(Value::as_str) {
         if !v.trim().is_empty() {
             image.name = v.trim().to_string();
@@ -359,6 +362,7 @@ fn ref_image_json(image: &modeler_core::ReferenceImage) -> Value {
         "opacity": image.opacity,
         "visible": image.visible,
         "flip_h": image.flip_h,
+        "flip_v": image.flip_v,
         "width_px": px.map(|(w, _)| w),
         "height_px": px.map(|(_, h)| h),
         "markers": markers,

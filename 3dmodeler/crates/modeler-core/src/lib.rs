@@ -600,6 +600,10 @@ pub struct ReferenceImage {
     /// their viewing direction.
     #[serde(default)]
     pub flip_h: bool,
+    /// Mirror the image vertically (e.g. scans that came in upside down,
+    /// or a floor plan meant to be viewed from below).
+    #[serde(default)]
+    pub flip_v: bool,
     /// Original file bytes (PNG or JPEG), base64-encoded.
     pub data_base64: String,
     /// AI markers the user drew on this image (see [`ImageMarker`]).
@@ -612,13 +616,17 @@ impl ReferenceImage {
         self.width_m * self.aspect.max(1e-6)
     }
 
-    /// Basis with the horizontal flip and in-plane rotation applied:
-    /// (right, up, normal). The flip negates "right", so rendering,
-    /// picking and calibration all see the mirrored image consistently.
+    /// Basis with the horizontal/vertical flips and in-plane rotation
+    /// applied: (right, up, normal). The flips negate "right"/"up", so
+    /// rendering, picking and calibration all see the mirrored image
+    /// consistently.
     pub fn oriented_basis(&self) -> (Vec3, Vec3, Vec3) {
-        let (mut u, v, n) = self.plane.basis();
+        let (mut u, mut v, n) = self.plane.basis();
         if self.flip_h {
             u = -u;
+        }
+        if self.flip_v {
+            v = -v;
         }
         let (s, c) = self.rotation_deg.to_radians().sin_cos();
         (u * c + v * s, v * c - u * s, n)
@@ -1683,6 +1691,7 @@ mod tests {
             opacity: 0.6,
             visible: true,
             flip_h: false,
+            flip_v: false,
             data_base64: "aGVsbG8=".into(),
             markers: Vec::new(),
         };
@@ -1723,6 +1732,7 @@ mod tests {
             opacity: 0.5,
             visible: true,
             flip_h: false,
+            flip_v: false,
             data_base64: String::new(),
             markers: Vec::new(),
         };
@@ -1760,11 +1770,12 @@ mod tests {
             opacity: 0.5,
             visible: true,
             flip_h: true,
+            flip_v: true,
             data_base64: String::new(),
             markers: Vec::new(),
         });
 
-        // uv -> world -> uv is the identity, flip and rotation included
+        // uv -> world -> uv is the identity, flips and rotation included
         let image = &scene.reference_images()[0];
         for uv in [Vec2::new(0.5, 0.5), Vec2::new(0.0, 0.0), Vec2::new(0.9, 0.2)] {
             let roundtrip = image.world_to_uv(image.uv_to_world(uv));

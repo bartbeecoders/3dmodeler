@@ -254,7 +254,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "rotation_deg": {"type": "number"},
                 "width_m": {"type": "number", "description": "display width in meters"},
                 "opacity": {"type": "number", "description": "0..1"},
-                "flip_h": {"type": "boolean"}
+                "flip_h": {"type": "boolean"},
+                "flip_v": {"type": "boolean"}
             }),
             &[],
         ),
@@ -270,7 +271,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "width_m": {"type": "number"},
                 "opacity": {"type": "number"},
                 "visible": {"type": "boolean"},
-                "flip_h": {"type": "boolean"}
+                "flip_h": {"type": "boolean"},
+                "flip_v": {"type": "boolean"}
             }),
             &["image"],
         ),

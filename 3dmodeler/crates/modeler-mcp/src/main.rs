@@ -262,13 +262,14 @@ fn tool_definitions() -> Value {
                     "width_m": {"type": "number", "description": "World width in meters (default 2; height follows the aspect ratio)"},
                     "opacity": {"type": "number", "description": "0..1, default 0.5"},
                     "visible": {"type": "boolean"},
-                    "flip_h": {"type": "boolean", "description": "Mirror horizontally — needed for back/left elevations so they read correctly from their viewing direction"}
+                    "flip_h": {"type": "boolean", "description": "Mirror horizontally — needed for back/left elevations so they read correctly from their viewing direction"},
+                    "flip_v": {"type": "boolean", "description": "Mirror vertically (e.g. an upside-down scan or a plan viewed from below)"}
                 }
             }
         },
         {
             "name": "update_reference_image",
-            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility, horizontal mirroring (flip_h) or name. Reference it by name or id (see get_scene).",
+            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility, mirroring (flip_h/flip_v) or name. Reference it by name or id (see get_scene).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -280,7 +281,8 @@ fn tool_definitions() -> Value {
                     "width_m": {"type": "number"},
                     "opacity": {"type": "number"},
                     "visible": {"type": "boolean"},
-                    "flip_h": {"type": "boolean"}
+                    "flip_h": {"type": "boolean"},
+                    "flip_v": {"type": "boolean"}
                 },
                 "required": ["image"]
             }

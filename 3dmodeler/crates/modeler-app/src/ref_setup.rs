@@ -195,6 +195,7 @@ pub fn build_placements(
                 opacity: params.opacity.clamp(0.0, 1.0),
                 visible: true,
                 flip_h,
+                flip_v: false,
                 data_base64: BASE64.encode(&img.bytes),
                 markers: Vec::new(),
             }

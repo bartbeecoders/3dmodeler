@@ -212,6 +212,7 @@ pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, Stri
         opacity: 0.5,
         visible: true,
         flip_h: false,
+        flip_v: false,
         data_base64: BASE64.encode(bytes),
         markers: Vec::new(),
     })
@@ -723,6 +724,7 @@ mod tests {
             opacity: 0.5,
             visible: true,
             flip_h: false,
+            flip_v: false,
             data_base64: String::new(),
             markers: Vec::new(),
         }

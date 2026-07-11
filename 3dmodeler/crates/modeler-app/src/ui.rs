@@ -2396,6 +2396,11 @@ fn reference_image_rows(
                     )
                     .changed();
 
+                changed |= ui
+                    .checkbox(&mut edited.flip_v, "Mirror vertically")
+                    .on_hover_text("Flip the image upside down")
+                    .changed();
+
                 let calibrating = calibrate.target == Some(id);
                 if calibrating {
                     if ui.button("Cancel scale picking").clicked() {
