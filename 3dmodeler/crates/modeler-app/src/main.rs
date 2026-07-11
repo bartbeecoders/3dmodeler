@@ -15,6 +15,8 @@ mod camera;
 mod context_menu;
 mod cutout_handles;
 mod edit_mode;
+#[cfg(not(target_arch = "wasm32"))]
+mod gl_window;
 mod grid;
 mod library;
 mod mesh_edit;
@@ -105,27 +107,19 @@ pub fn main() {
             .build(&event_loop)
             .unwrap();
         winit_window.focus_window();
-        // VMs and remote desktops often lack GL niceties — VirtualBox e.g.
-        // has no swap-control (vsync) extension — so fall back progressively
-        // instead of crashing at startup. Without vsync the main loop caps
-        // the frame rate itself (below).
-        let mut vsync = true;
-        let gl = WindowedContext::from_winit_window(&winit_window, SurfaceSettings::default())
-            .or_else(|_| {
-                vsync = false;
-                WindowedContext::from_winit_window(
+        // gl_window tolerates missing swap-control (VirtualBox, remote
+        // desktops); if even the default config fails, retry without MSAA
+        // for bare-bones GL drivers before giving up.
+        let gl = gl_window::GlWindow::new(&winit_window, SurfaceSettings::default())
+            .or_else(|e| {
+                println!("default GL config failed ({e}) — retrying without MSAA");
+                gl_window::GlWindow::new(
                     &winit_window,
-                    SurfaceSettings { vsync: false, ..Default::default() },
-                )
-            })
-            .or_else(|_| {
-                // bare-bones GL: no vsync, no multisampling
-                WindowedContext::from_winit_window(
-                    &winit_window,
-                    SurfaceSettings { vsync: false, multisamples: 0, ..Default::default() },
+                    SurfaceSettings { multisamples: 0, ..Default::default() },
                 )
             })
             .expect("cannot create an OpenGL context — is 3D acceleration available?");
+        let vsync = gl.vsync;
         if !vsync {
             println!("vsync unavailable (VM or remote desktop?) — limiting to ~60 fps");
         }
