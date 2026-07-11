@@ -118,7 +118,26 @@ pub fn main() {
                     SurfaceSettings { multisamples: 0, ..Default::default() },
                 )
             })
-            .expect("cannot create an OpenGL context — is 3D acceleration available?");
+            .unwrap_or_else(|e| {
+                // a real dialog: VM users double-click the exe and would
+                // never see a console panic
+                let message = format!(
+                    "The 3D modeler could not start:\n{e}.\n\n\
+                     In a virtual machine (VirtualBox, VMware):\n\
+                     • enable 3D acceleration in the VM display settings\n\
+                     • install the guest additions / VMware tools\n\n\
+                     Alternative (software rendering): download Mesa for Windows\n\
+                     (github.com/pal1000/mesa-dist-win, llvmpipe) and put its\n\
+                     opengl32.dll next to modeler-app.exe."
+                );
+                eprintln!("{message}");
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("3D Modeler — cannot start")
+                    .set_description(&message)
+                    .show();
+                std::process::exit(1);
+            });
         let vsync = gl.vsync;
         if !vsync {
             println!("vsync unavailable (VM or remote desktop?) — limiting to ~60 fps");

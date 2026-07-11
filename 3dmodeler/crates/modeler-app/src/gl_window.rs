@@ -10,6 +10,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use glutin::prelude::*;
+use three_d::context::HasContext; // glow's version() lives on this trait
 use three_d::{Context, HardwareAcceleration, SurfaceSettings};
 
 pub struct GlWindow {
@@ -86,11 +87,50 @@ impl GlWindow {
         let gl_surface =
             unsafe { gl_display.create_window_surface(&config, &surface_attributes) }
                 .map_err(|e| format!("GL surface creation failed: {e}"))?;
-        let gl_context = gl_context
+        let mut gl_context = gl_context
             .make_current(&gl_surface)
             .map_err(|e| format!("make_current failed: {e}"))?;
 
-        // THE deviation from three-d: swap-control may simply not exist
+        let load_glow = || unsafe {
+            three_d::context::Context::from_loader_function(|s| {
+                let s = std::ffi::CString::new(s)
+                    .expect("failed to construct C string from string for gl proc address");
+                gl_display.get_proc_address(&s)
+            })
+        };
+        let mut glow_context = load_glow();
+
+        // legacy drivers (VirtualBox without 3D acceleration hands out GL
+        // 1.1; some hand out 2.1 compatibility unless asked) — explicitly
+        // request a 3.3 context before concluding the system can't render
+        let mut version = glow_context.version().clone();
+        if version.major < 3 {
+            let modern_attributes = glutin::context::ContextAttributesBuilder::new()
+                .with_context_api(glutin::context::ContextApi::OpenGl(Some(
+                    glutin::context::Version::new(3, 3),
+                )))
+                .build(Some(raw_window_handle));
+            if let Ok(modern) =
+                unsafe { gl_display.create_context(&config, &modern_attributes) }
+            {
+                if let Ok(current) = modern.make_current(&gl_surface) {
+                    gl_context = current;
+                    glow_context = load_glow();
+                    version = glow_context.version().clone();
+                }
+            }
+        }
+        if version.major < 3 {
+            return Err(format!(
+                "this system only provides OpenGL {}.{}{} — the modeler needs OpenGL 3.3 \
+                 or newer",
+                version.major,
+                version.minor,
+                if version.is_embedded { " ES" } else { "" },
+            ));
+        }
+
+        // deviation from three-d: swap-control may simply not exist
         // (VirtualBox, some remote desktops). That is not fatal.
         let interval = if settings.vsync {
             glutin::surface::SwapInterval::Wait(std::num::NonZeroU32::new(1).unwrap())
@@ -100,14 +140,8 @@ impl GlWindow {
         let swap_control_ok = gl_surface.set_swap_interval(&gl_context, interval).is_ok();
         let vsync = settings.vsync && swap_control_ok;
 
-        let context = Context::from_gl_context(std::sync::Arc::new(unsafe {
-            three_d::context::Context::from_loader_function(|s| {
-                let s = std::ffi::CString::new(s)
-                    .expect("failed to construct C string from string for gl proc address");
-                gl_display.get_proc_address(&s)
-            })
-        }))
-        .map_err(|e| format!("GL feature detection failed: {e}"))?;
+        let context = Context::from_gl_context(std::sync::Arc::new(glow_context))
+            .map_err(|e| format!("GL feature detection failed: {e}"))?;
 
         Ok(Self { context, surface: gl_surface, glutin_context: gl_context, vsync })
     }
