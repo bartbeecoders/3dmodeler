@@ -4,7 +4,7 @@
 
 use crate::camera::BlenderCamera;
 use crate::modal::{GuideKind, Guides};
-use crate::ref_image::CalibrateTool;
+use crate::ref_image::{CalibrateTool, MarkerTool};
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
@@ -299,6 +299,7 @@ pub fn draw(
     selection: &Selection,
     measure: &MeasureTool,
     calibrate: &CalibrateTool,
+    marker_tool: &MarkerTool,
     unit: Unit,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
@@ -322,6 +323,113 @@ pub fn draw(
     if calibrate.points.len() == 2 {
         if let (Some(a), Some(b)) = (project(calibrate.points[0]), project(calibrate.points[1])) {
             painter.line_segment([a, b], egui::Stroke::new(1.5, DIM_COLOR));
+        }
+    }
+
+    // --- AI markers on reference images -------------------------------------
+    const MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(205, 130, 255);
+    let draw_marker_shape =
+        |kind: modeler_core::MarkerKind, screen: &[egui::Pos2], label: &str| {
+            use modeler_core::MarkerKind;
+            match kind {
+                MarkerKind::Point => {
+                    let Some(&pos) = screen.first() else { return };
+                    painter.circle_stroke(pos, 6.0, egui::Stroke::new(2.0, MARKER_COLOR));
+                    painter.circle_filled(pos, 2.0, MARKER_COLOR);
+                }
+                MarkerKind::Line => {
+                    for pair in screen.windows(2) {
+                        painter.line_segment(
+                            [pair[0], pair[1]],
+                            egui::Stroke::new(2.0, MARKER_COLOR),
+                        );
+                    }
+                    for &p in screen {
+                        painter.circle_filled(p, 3.0, MARKER_COLOR);
+                    }
+                }
+                MarkerKind::Area => {
+                    if screen.len() >= 3 {
+                        // translucent fan fill; the outline is authoritative
+                        // for concave shapes
+                        let fill = egui::Color32::from_rgba_premultiplied(70, 40, 90, 60);
+                        let mut mesh = egui::Mesh::default();
+                        for &p in screen {
+                            mesh.colored_vertex(p, fill);
+                        }
+                        for i in 1..screen.len() as u32 - 1 {
+                            mesh.add_triangle(0, i, i + 1);
+                        }
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                    painter.add(egui::Shape::closed_line(
+                        screen.to_vec(),
+                        egui::Stroke::new(2.0, MARKER_COLOR),
+                    ));
+                    for &p in screen {
+                        painter.circle_filled(p, 3.0, MARKER_COLOR);
+                    }
+                }
+            }
+            if !label.is_empty() {
+                let anchor = match kind {
+                    MarkerKind::Point => screen[0],
+                    // centroid keeps the label inside lines and areas
+                    _ => {
+                        let sum = screen
+                            .iter()
+                            .fold(egui::Vec2::ZERO, |s, p| s + p.to_vec2());
+                        (sum / screen.len() as f32).to_pos2()
+                    }
+                };
+                text_with_bg(
+                    &painter,
+                    anchor + egui::vec2(0.0, -10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    label,
+                    11.0,
+                    MARKER_COLOR,
+                );
+            }
+        };
+    for image in scene.reference_images() {
+        if !image.visible {
+            continue;
+        }
+        for marker in &image.markers {
+            let screen: Vec<egui::Pos2> = marker
+                .points
+                .iter()
+                .filter_map(|&uv| project(image.uv_to_world(uv)))
+                .collect();
+            if screen.len() != marker.points.len() {
+                continue; // partially behind the camera
+            }
+            draw_marker_shape(marker.kind, &screen, &marker.name);
+        }
+    }
+    // marker being drawn right now: same look, no label yet
+    if let Some(image) = marker_tool
+        .target
+        .and_then(|id| scene.reference_images().iter().find(|i| i.id == id))
+    {
+        let screen: Vec<egui::Pos2> = marker_tool
+            .points
+            .iter()
+            .filter_map(|&uv| project(image.uv_to_world(uv)))
+            .collect();
+        if screen.len() == marker_tool.points.len() && !screen.is_empty() {
+            // draw an unfinished area as an open polyline: the closing edge
+            // appears once there are enough points to close the shape
+            let kind = if marker_tool.picking()
+                && marker_tool.kind == modeler_core::MarkerKind::Area
+                && screen.len() < 3
+            {
+                modeler_core::MarkerKind::Line
+            } else {
+                marker_tool.kind
+            };
+            draw_marker_shape(kind, &screen, "");
         }
     }
 

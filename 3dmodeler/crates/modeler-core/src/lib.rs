@@ -529,6 +529,53 @@ impl ImagePlane {
     }
 }
 
+/// Shape of an AI marker drawn on a reference image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkerKind {
+    /// A single spot (1 point).
+    Point,
+    /// An open polyline (≥ 2 points).
+    Line,
+    /// A closed polygon (≥ 3 points; the closing edge is implicit).
+    Area,
+}
+
+impl MarkerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkerKind::Point => "Point",
+            MarkerKind::Line => "Line",
+            MarkerKind::Area => "Area",
+        }
+    }
+
+    /// Fewest points that make this kind of marker well-formed.
+    pub fn min_points(self) -> usize {
+        match self {
+            MarkerKind::Point => 1,
+            MarkerKind::Line => 2,
+            MarkerKind::Area => 3,
+        }
+    }
+}
+
+/// An AI marker: a point, line or area the user draws ON a reference image,
+/// together with a free-text note. The AI assistant and MCP clients read
+/// markers to anchor instructions to spots on the image ("build a 2.2 m wall
+/// along this line"). Points are normalized image coordinates — u right,
+/// v down, both 0..1 with the origin at the image's top-left, like pixels —
+/// so markers stay glued to the image through moves, rescales, calibration
+/// and plane changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageMarker {
+    pub id: u64,
+    pub name: String,
+    pub kind: MarkerKind,
+    pub points: Vec<Vec2>,
+    /// User-provided context/instructions for the AI ("front door here").
+    pub note: String,
+}
+
 /// A reference image shown in the viewport as a flat, optionally transparent
 /// picture locked to an axis plane. The image bytes (PNG/JPEG) are embedded
 /// base64 so scenes stay self-contained across save/load and platforms.
@@ -555,6 +602,9 @@ pub struct ReferenceImage {
     pub flip_h: bool,
     /// Original file bytes (PNG or JPEG), base64-encoded.
     pub data_base64: String,
+    /// AI markers the user drew on this image (see [`ImageMarker`]).
+    #[serde(default)]
+    pub markers: Vec<ImageMarker>,
 }
 
 impl ReferenceImage {
@@ -585,6 +635,28 @@ impl ReferenceImage {
             self.location + half_w + half_h,
             self.location - half_w + half_h,
         ]
+    }
+
+    /// Map a normalized image coordinate (u right, v down, 0..1, origin
+    /// top-left — the marker convention) to its world-space position on the
+    /// image plane.
+    pub fn uv_to_world(&self, uv: Vec2) -> Vec3 {
+        let (u_axis, v_axis, _) = self.oriented_basis();
+        self.location
+            + u_axis * ((uv.x - 0.5) * self.width_m)
+            + v_axis * ((0.5 - uv.y) * self.height_m())
+    }
+
+    /// Inverse of `uv_to_world`: project a world point onto the image plane
+    /// and express it in normalized image coordinates (may exceed 0..1 for
+    /// points beside the image).
+    pub fn world_to_uv(&self, p: Vec3) -> Vec2 {
+        let (u_axis, v_axis, _) = self.oriented_basis();
+        let rel = p - self.location;
+        Vec2::new(
+            rel.dot(u_axis) / self.width_m.max(1e-9) + 0.5,
+            0.5 - rel.dot(v_axis) / self.height_m().max(1e-9),
+        )
     }
 
     /// Distance along a ray to the image rectangle, if it hits (viewport
@@ -1094,6 +1166,45 @@ impl Scene {
         }
     }
 
+    /// Add an AI marker to a reference image; assigns a fresh id and a
+    /// unique name within that image (empty name defaults to the kind).
+    /// Returns the marker id, or None when the image does not exist.
+    pub fn add_image_marker(&mut self, image_id: u64, mut marker: ImageMarker) -> Option<u64> {
+        let image = self.reference_images.iter_mut().find(|r| r.id == image_id)?;
+        self.next_id += 1;
+        self.version += 1;
+        marker.id = self.next_id;
+        let base = if marker.name.trim().is_empty() {
+            marker.kind.label()
+        } else {
+            marker.name.trim()
+        };
+        let mut name = base.to_string();
+        let mut i = 1;
+        while image.markers.iter().any(|m| m.name == name) {
+            name = format!("{base}.{i:03}");
+            i += 1;
+        }
+        marker.name = name;
+        image.markers.push(marker);
+        Some(self.next_id)
+    }
+
+    /// Remove a marker from a reference image; true when something was
+    /// actually removed.
+    pub fn remove_image_marker(&mut self, image_id: u64, marker_id: u64) -> bool {
+        let Some(image) = self.reference_images.iter_mut().find(|r| r.id == image_id) else {
+            return false;
+        };
+        let before = image.markers.len();
+        image.markers.retain(|m| m.id != marker_id);
+        let removed = image.markers.len() != before;
+        if removed {
+            self.version += 1;
+        }
+        removed
+    }
+
     // --- measurements ----------------------------------------------------
 
     pub fn measurements(&self) -> &[Measurement] {
@@ -1573,6 +1684,7 @@ mod tests {
             visible: true,
             flip_h: false,
             data_base64: "aGVsbG8=".into(),
+            markers: Vec::new(),
         };
         let a = scene.add_reference_image(image.clone());
         let b = scene.add_reference_image(image);
@@ -1612,6 +1724,7 @@ mod tests {
             visible: true,
             flip_h: false,
             data_base64: String::new(),
+            markers: Vec::new(),
         };
         // corners span x -2..2, z 0..2 at y = 0
         let corners = image.corners();
@@ -1631,6 +1744,86 @@ mod tests {
         assert!(image
             .intersect_ray(Vec3::new(0.0, -5.0, 1.0), Vec3::new(1.0, 0.0, 0.0))
             .is_none());
+    }
+
+    #[test]
+    fn image_markers_roundtrip_uv_world_and_json() {
+        let mut scene = Scene::default_scene();
+        let image_id = scene.add_reference_image(ReferenceImage {
+            id: 0,
+            name: "plan".into(),
+            plane: ImagePlane::Z,
+            location: Vec3::new(1.0, 2.0, 0.0),
+            rotation_deg: 30.0,
+            width_m: 4.0,
+            aspect: 0.5,
+            opacity: 0.5,
+            visible: true,
+            flip_h: true,
+            data_base64: String::new(),
+            markers: Vec::new(),
+        });
+
+        // uv -> world -> uv is the identity, flip and rotation included
+        let image = &scene.reference_images()[0];
+        for uv in [Vec2::new(0.5, 0.5), Vec2::new(0.0, 0.0), Vec2::new(0.9, 0.2)] {
+            let roundtrip = image.world_to_uv(image.uv_to_world(uv));
+            assert!((roundtrip - uv).length() < 1e-5, "{uv:?} -> {roundtrip:?}");
+        }
+        // the image center maps to its world location
+        assert!((image.uv_to_world(Vec2::new(0.5, 0.5)) - image.location).length() < 1e-6);
+        // v = 1 is the bottom edge: below the center along the plane's "up"
+        let (_, v_axis, _) = image.oriented_basis();
+        let bottom = image.uv_to_world(Vec2::new(0.5, 1.0));
+        assert!((bottom - image.location + v_axis * (0.5 * image.height_m())).length() < 1e-5);
+
+        // add: fresh ids, unique names, kind label as the default name
+        let marker = |kind: MarkerKind, points: Vec<Vec2>| ImageMarker {
+            id: 0,
+            name: String::new(),
+            kind,
+            points,
+            note: "the front door".into(),
+        };
+        let a = scene
+            .add_image_marker(image_id, marker(MarkerKind::Point, vec![Vec2::new(0.5, 0.5)]))
+            .unwrap();
+        let b = scene
+            .add_image_marker(
+                image_id,
+                marker(MarkerKind::Line, vec![Vec2::new(0.1, 0.5), Vec2::new(0.9, 0.5)]),
+            )
+            .unwrap();
+        let c = scene
+            .add_image_marker(image_id, marker(MarkerKind::Point, vec![Vec2::new(0.2, 0.2)]))
+            .unwrap();
+        assert!(a != b && b != c);
+        assert!(scene.add_image_marker(9999, marker(MarkerKind::Point, vec![])).is_none());
+        let names: Vec<_> = scene.reference_images()[0]
+            .markers
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["Point", "Line", "Point.001"]);
+
+        // markers survive save/load; old files (no field) still load
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(data.reference_images[0].markers.len(), 3);
+        assert_eq!(data.reference_images[0].markers[1].kind, MarkerKind::Line);
+        assert_eq!(data.reference_images[0].markers[1].note, "the front door");
+        let old: ReferenceImage = serde_json::from_str(
+            r#"{"id": 1, "name": "x", "plane": "Y", "location": [0,0,0],
+                "rotation_deg": 0, "width_m": 2, "aspect": 1, "opacity": 0.5,
+                "visible": true, "data_base64": ""}"#,
+        )
+        .unwrap();
+        assert!(old.markers.is_empty());
+
+        // remove: only the targeted marker goes; bad ids are a no-op
+        assert!(scene.remove_image_marker(image_id, b));
+        assert!(!scene.remove_image_marker(image_id, b));
+        assert!(!scene.remove_image_marker(9999, a));
+        assert_eq!(scene.reference_images()[0].markers.len(), 2);
     }
 
     #[test]

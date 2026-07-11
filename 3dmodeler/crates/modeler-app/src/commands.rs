@@ -7,7 +7,7 @@
 
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
-use modeler_core::glam::{EulerRot, Quat, Vec3};
+use modeler_core::glam::{EulerRot, Quat, Vec2, Vec3};
 use modeler_core::{
     library, Library, LibraryAsset, ObjectId, Primitive, Scene, Transform, WallCutout,
 };
@@ -346,6 +346,8 @@ fn apply_ref_image_params(scene: &mut Scene, id: u64, params: &Value) -> Result<
 
 fn ref_image_json(image: &modeler_core::ReferenceImage) -> Value {
     let px = crate::ref_image::decoded_size(&image.data_base64);
+    let markers: Vec<Value> =
+        image.markers.iter().map(|m| marker_json(image, m)).collect();
     json!({
         "id": image.id,
         "name": image.name,
@@ -359,7 +361,122 @@ fn ref_image_json(image: &modeler_core::ReferenceImage) -> Value {
         "flip_h": image.flip_h,
         "width_px": px.map(|(w, _)| w),
         "height_px": px.map(|(_, h)| h),
+        "markers": markers,
     })
+}
+
+// --- AI markers on reference images ------------------------------------------
+
+fn marker_json(image: &modeler_core::ReferenceImage, marker: &modeler_core::ImageMarker) -> Value {
+    let px = crate::ref_image::decoded_size(&image.data_base64);
+    let points_px: Value = match px {
+        Some((w, h)) => marker
+            .points
+            .iter()
+            .map(|p| json!([p.x * w as f32, p.y * h as f32]))
+            .collect(),
+        None => Value::Null,
+    };
+    let world: Vec<Vec3> = marker.points.iter().map(|&p| image.uv_to_world(p)).collect();
+    let points_world: Vec<Value> = world.iter().map(|w| json!([w.x, w.y, w.z])).collect();
+    let mut json = json!({
+        "id": marker.id,
+        "name": marker.name,
+        "kind": marker.kind.label().to_ascii_lowercase(),
+        "note": marker.note,
+        "points_px": points_px,
+        "points_world": points_world,
+    });
+    // world length of the polyline (areas: closed perimeter) — saves the
+    // AI a hand computation when building along a marked line
+    if marker.kind != modeler_core::MarkerKind::Point && world.len() >= 2 {
+        let mut length: f32 = world.windows(2).map(|s| (s[1] - s[0]).length()).sum();
+        if marker.kind == modeler_core::MarkerKind::Area {
+            length += (world[0] - world[world.len() - 1]).length();
+        }
+        json["length_m"] = json!(length);
+    }
+    json
+}
+
+/// Resolve a marker on an image: numeric id or (unique-within-image) name.
+fn resolve_marker(
+    image: &modeler_core::ReferenceImage,
+    reference: &Value,
+) -> Result<u64, String> {
+    if let Some(n) = reference.as_u64() {
+        if image.markers.iter().any(|m| m.id == n) {
+            return Ok(n);
+        }
+        return Err(format!("no marker with id {n} on image '{}'", image.name));
+    }
+    let name = reference
+        .as_str()
+        .ok_or("marker reference must be a name or an id")?;
+    if let Some(marker) = image.markers.iter().find(|m| m.name == name) {
+        return Ok(marker.id);
+    }
+    if let Ok(n) = name.parse::<u64>() {
+        if image.markers.iter().any(|m| m.id == n) {
+            return Ok(n);
+        }
+    }
+    Err(format!("no marker named '{name}' on image '{}'", image.name))
+}
+
+fn marker_kind_from(value: &Value) -> Result<modeler_core::MarkerKind, String> {
+    match value.as_str() {
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "point" => Ok(modeler_core::MarkerKind::Point),
+            "line" => Ok(modeler_core::MarkerKind::Line),
+            "area" => Ok(modeler_core::MarkerKind::Area),
+            other => Err(format!("unknown marker kind '{other}' (point|line|area)")),
+        },
+        None => Err("missing 'kind' (point|line|area)".to_string()),
+    }
+}
+
+/// Parse `points_px` ([[x, y], ...] in source-image pixels, origin top-left,
+/// the calibrate_reference_image convention) into normalized marker
+/// coordinates, validating the count against the marker kind.
+fn marker_points_from(
+    image: &modeler_core::ReferenceImage,
+    value: &Value,
+    kind: modeler_core::MarkerKind,
+) -> Result<Vec<Vec2>, String> {
+    let points = value
+        .as_array()
+        .ok_or("'points_px' must be an array of [x, y] pixel pairs")?;
+    if points.len() < kind.min_points() {
+        return Err(format!(
+            "a {} marker needs at least {} point(s), got {}",
+            kind.label().to_ascii_lowercase(),
+            kind.min_points(),
+            points.len()
+        ));
+    }
+    if kind == modeler_core::MarkerKind::Point && points.len() > 1 {
+        return Err("a point marker takes exactly 1 point".to_string());
+    }
+    let (width_px, height_px) = crate::ref_image::decoded_size(&image.data_base64)
+        .ok_or("embedded image data is not decodable")?;
+    points
+        .iter()
+        .map(|p| {
+            let a = p
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or("each point must be [x, y] in source-image pixels")?;
+            let (x, y) = (
+                a[0].as_f64().ok_or("each point must be [x, y] numbers")?,
+                a[1].as_f64().ok_or("each point must be [x, y] numbers")?,
+            );
+            Ok(Vec2::new(
+                x as f32 / width_px.max(1) as f32,
+                y as f32 / height_px.max(1) as f32,
+            ))
+        })
+        .collect()
 }
 
 /// Resolve a library-asset reference: numeric id or (unique) name.
@@ -800,6 +917,97 @@ fn execute_inner(
                 "image": ref_image_json(scene.reference_images().iter().find(|r| r.id == id).unwrap()),
             }))
         }
+        "add_image_marker" => {
+            let image_id = resolve_ref_image(scene, &command["image"])?;
+            let kind = marker_kind_from(&command["kind"])?;
+            let image = scene
+                .reference_images()
+                .iter()
+                .find(|r| r.id == image_id)
+                .ok_or("reference image vanished")?;
+            let points = marker_points_from(image, &command["points_px"], kind)?;
+            let marker = modeler_core::ImageMarker {
+                id: 0, // assigned by the scene
+                name: command["name"].as_str().unwrap_or_default().trim().to_string(),
+                kind,
+                points,
+                note: command["note"].as_str().unwrap_or_default().trim().to_string(),
+            };
+            let marker_id = scene
+                .add_image_marker(image_id, marker)
+                .ok_or("reference image vanished")?;
+            let image = scene.reference_images().iter().find(|r| r.id == image_id).unwrap();
+            let marker = image.markers.iter().find(|m| m.id == marker_id).unwrap();
+            Ok(json!({"marker": marker_json(image, marker)}))
+        }
+        "update_image_marker" => {
+            let image_id = resolve_ref_image(scene, &command["image"])?;
+            let image = scene
+                .reference_images()
+                .iter()
+                .find(|r| r.id == image_id)
+                .ok_or("reference image vanished")?;
+            let marker_id = resolve_marker(image, &command["marker"])?;
+            let current_kind =
+                image.markers.iter().find(|m| m.id == marker_id).unwrap().kind;
+            // a kind change re-validates the (possibly replaced) points
+            let kind = match command.get("kind").filter(|v| !v.is_null()) {
+                Some(v) => marker_kind_from(v)?,
+                None => current_kind,
+            };
+            let points = match command.get("points_px").filter(|v| !v.is_null()) {
+                Some(v) => Some(marker_points_from(image, v, kind)?),
+                None => None,
+            };
+            if points.is_none() && kind != current_kind {
+                let count = image
+                    .markers
+                    .iter()
+                    .find(|m| m.id == marker_id)
+                    .unwrap()
+                    .points
+                    .len();
+                if count < kind.min_points()
+                    || (kind == modeler_core::MarkerKind::Point && count > 1)
+                {
+                    return Err(format!(
+                        "cannot retype to {}: the marker has {count} point(s) — pass points_px too",
+                        kind.label().to_ascii_lowercase()
+                    ));
+                }
+            }
+            {
+                let image = scene.reference_image_mut(image_id).unwrap();
+                let marker =
+                    image.markers.iter_mut().find(|m| m.id == marker_id).unwrap();
+                marker.kind = kind;
+                if let Some(points) = points {
+                    marker.points = points;
+                }
+                if let Some(v) = command.get("note").and_then(Value::as_str) {
+                    marker.note = v.trim().to_string();
+                }
+                if let Some(v) = command.get("new_name").and_then(Value::as_str) {
+                    if !v.trim().is_empty() {
+                        marker.name = v.trim().to_string();
+                    }
+                }
+            }
+            let image = scene.reference_images().iter().find(|r| r.id == image_id).unwrap();
+            let marker = image.markers.iter().find(|m| m.id == marker_id).unwrap();
+            Ok(json!({"marker": marker_json(image, marker)}))
+        }
+        "delete_image_marker" => {
+            let image_id = resolve_ref_image(scene, &command["image"])?;
+            let image = scene
+                .reference_images()
+                .iter()
+                .find(|r| r.id == image_id)
+                .ok_or("reference image vanished")?;
+            let marker_id = resolve_marker(image, &command["marker"])?;
+            scene.remove_image_marker(image_id, marker_id);
+            Ok(json!({}))
+        }
         "get_library" => {
             let assets: Vec<Value> = library_doc.assets().iter().map(asset_json).collect();
             Ok(json!({"assets": assets}))
@@ -904,6 +1112,7 @@ fn execute_inner(
              delete_object, set_parent, attach_object, group_objects, ungroup_object, \
              add_measurement, simulate, screenshot, add_reference_image, \
              update_reference_image, delete_reference_image, calibrate_reference_image, \
+             add_image_marker, update_image_marker, delete_image_marker, \
              get_library, create_library_object, update_library_object, \
              delete_library_object, place_library_object)"
         )),
@@ -1034,6 +1243,90 @@ mod tests {
             &mut lib,
         );
         assert_eq!(response["ok"], false);
+    }
+
+    #[test]
+    fn image_marker_commands_roundtrip() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+        let mut run = |cmd: Value| execute(&cmd, &mut scene, &mut sel, &mut physics, &mut lib);
+
+        // 8x4 px plan on the floor, 2 m wide -> 1 m tall, centered at origin
+        let response = run(json!({
+            "cmd": "add_reference_image", "data_base64": tiny_png_base64(),
+            "name": "plan", "plane": "z", "location": [0.0, 0.0, 0.0]
+        }));
+        assert_eq!(response["ok"], true, "{response}");
+
+        // a line across the middle: (0,2)-(8,2) px = full 2 m width
+        let response = run(json!({
+            "cmd": "add_image_marker", "image": "plan", "kind": "line",
+            "points_px": [[0, 2], [8, 2]], "note": "wall goes here"
+        }));
+        assert_eq!(response["ok"], true, "{response}");
+        let marker = &response["marker"];
+        assert_eq!(marker["name"], "Line");
+        assert_eq!(marker["kind"], "line");
+        assert_eq!(marker["note"], "wall goes here");
+        assert!((marker["length_m"].as_f64().unwrap() - 2.0).abs() < 1e-5);
+        // px roundtrip and world mapping: (0,2) px = left-middle = (-1, 0, 0)
+        assert_eq!(marker["points_px"][0][0].as_f64().unwrap() as i32, 0);
+        assert_eq!(marker["points_px"][1][0].as_f64().unwrap() as i32, 8);
+        let w0: Vec<f64> = marker["points_world"][0]
+            .as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert!((w0[0] + 1.0).abs() < 1e-5 && w0[1].abs() < 1e-5 && w0[2].abs() < 1e-5);
+
+        // markers appear in get_scene under their image
+        let response = run(json!({"cmd": "get_scene"}));
+        assert_eq!(response["reference_images"][0]["markers"][0]["name"], "Line");
+
+        // update: rename, note, and new points; then retype to an area
+        let id = marker["id"].as_u64().unwrap();
+        let response = run(json!({
+            "cmd": "update_image_marker", "image": "plan", "marker": id,
+            "new_name": "south wall", "note": "2.2 m high"
+        }));
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["marker"]["name"], "south wall");
+        assert_eq!(response["marker"]["note"], "2.2 m high");
+        // retype without enough points is rejected with guidance
+        let response = run(json!({
+            "cmd": "update_image_marker", "image": "plan", "marker": "south wall",
+            "kind": "area"
+        }));
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().unwrap().contains("points_px"));
+        let response = run(json!({
+            "cmd": "update_image_marker", "image": "plan", "marker": "south wall",
+            "kind": "area", "points_px": [[0, 0], [8, 0], [8, 4], [0, 4]]
+        }));
+        assert_eq!(response["ok"], true, "{response}");
+        // perimeter of the full 2 x 1 m image
+        assert!((response["marker"]["length_m"].as_f64().unwrap() - 6.0).abs() < 1e-4);
+
+        // errors: too few points, bad kind, unknown marker
+        let response = run(json!({
+            "cmd": "add_image_marker", "image": "plan", "kind": "line",
+            "points_px": [[1, 1]]
+        }));
+        assert_eq!(response["ok"], false);
+        let response = run(json!({
+            "cmd": "add_image_marker", "image": "plan", "kind": "blob",
+            "points_px": [[1, 1]]
+        }));
+        assert_eq!(response["ok"], false);
+        let response = run(json!({
+            "cmd": "delete_image_marker", "image": "plan", "marker": "nope"
+        }));
+        assert_eq!(response["ok"], false);
+
+        // delete by name
+        let response = run(json!({
+            "cmd": "delete_image_marker", "image": "plan", "marker": "south wall"
+        }));
+        assert_eq!(response["ok"], true, "{response}");
+        let response = run(json!({"cmd": "get_scene"}));
+        assert_eq!(response["reference_images"][0]["markers"].as_array().unwrap().len(), 0);
     }
 
     #[test]

@@ -178,6 +178,7 @@ pub fn main() {
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
+    let mut marker_tool = ref_image::MarkerTool::new();
     let mut image_move = ref_image::ImageMoveTool::new();
     let mut settings = settings::Settings::load();
     let mut saved_settings = settings.clone();
@@ -271,6 +272,7 @@ pub fn main() {
                     &mut undo,
                     &mut measure,
                     &mut calibrate,
+                    &mut marker_tool,
                     &mut settings,
                     &mut library,
                     edit_point,
@@ -299,6 +301,7 @@ pub fn main() {
                     &sel,
                     &measure,
                     &calibrate,
+                    &marker_tool,
                     settings.unit,
                 );
                 // grab handles on the openings of selected walls
@@ -582,6 +585,41 @@ pub fn main() {
                     }
                     Event::KeyPress { kind: Key::Escape, handled, .. } if !*handled => {
                         calibrate.cancel();
+                        *handled = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // AI marker drawing: pick points on the reference image plane;
+        // Enter finishes a line/area, Esc cancels
+        if marker_tool.picking() {
+            for event in frame_input.events.iter_mut() {
+                match event {
+                    Event::MousePress {
+                        button: MouseButton::Left,
+                        position,
+                        handled,
+                        ..
+                    } if !*handled && !pointer_over_ui => {
+                        let (origin, direction) =
+                            camera.pick_ray(frame_input.viewport, position.x, position.y);
+                        marker_tool.add_ray(
+                            &scene,
+                            glam::Vec3::new(origin.x, origin.y, origin.z),
+                            glam::Vec3::new(direction.x, direction.y, direction.z),
+                        );
+                        *handled = true;
+                    }
+                    Event::KeyPress { kind: Key::Enter, handled, .. }
+                        if !*handled && !egui_owns_keyboard =>
+                    {
+                        marker_tool.finish();
+                        *handled = true;
+                    }
+                    Event::KeyPress { kind: Key::Escape, handled, .. } if !*handled => {
+                        marker_tool.cancel();
                         *handled = true;
                     }
                     _ => {}

@@ -14,14 +14,14 @@ use crate::physics::{PhysicsMirror, SimState};
 use crate::undo::UndoStack;
 use crate::io;
 use crate::overlay::MeasureTool;
-use crate::ref_image::{self, CalibrateTool};
+use crate::ref_image::{self, CalibrateTool, MarkerTool};
 use crate::ref_setup::RefSetupDialog;
 use crate::scene_render::{LightingMode, ShadeMode};
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use crate::theme::{self, Theme};
-use modeler_core::ImagePlane;
 use modeler_core::glam::{EulerRot, Quat, Vec3};
+use modeler_core::{ImagePlane, MarkerKind};
 use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
 use three_d::egui;
 use three_d::Event;
@@ -180,6 +180,7 @@ impl UiState {
         undo: &mut UndoStack,
         measure: &mut MeasureTool,
         calibrate: &mut CalibrateTool,
+        marker_tool: &mut MarkerTool,
         settings: &mut Settings,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
@@ -243,11 +244,13 @@ impl UiState {
                 snap_to_vertex, shade_mode, lighting_mode, xray, edit,
             );
         let bottom_offset = self.status_bar(
-            ctx, scene, physics, measure, calibrate, snap_to_grid, settings, modal_status, fps,
-            mcp,
+            ctx, scene, physics, measure, calibrate, marker_tool, snap_to_grid, settings,
+            modal_status, fps, mcp,
         );
         let right_offset = if self.show_sidebar {
-            self.sidebar(ctx, scene, selection, settings, calibrate, library, edit_point)
+            self.sidebar(
+                ctx, scene, selection, settings, calibrate, marker_tool, library, edit_point,
+            )
         } else {
             0.0
         };
@@ -259,6 +262,9 @@ impl UiState {
         self.brick_dialog_window(ctx, scene, selection);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
+        if let Some(message) = marker_window(ctx, scene, marker_tool) {
+            self.status_message = Some(message);
+        }
         if let Some(message) = self.ref_setup.window(ctx, scene, settings) {
             self.status_message = Some(message);
         }
@@ -879,6 +885,7 @@ impl UiState {
         physics: &mut PhysicsMirror,
         measure: &MeasureTool,
         calibrate: &CalibrateTool,
+        marker_tool: &MarkerTool,
         snap_to_grid: &mut bool,
         settings: &Settings,
         modal_status: &Option<String>,
@@ -931,6 +938,18 @@ impl UiState {
                         "Scale image: click point {} of 2 on the image · Esc cancel",
                         calibrate.points.len() + 1
                     )
+                } else if marker_tool.picking() {
+                    match marker_tool.kind {
+                        modeler_core::MarkerKind::Point => {
+                            "Point marker: click a spot on the image · Esc cancel".to_string()
+                        }
+                        kind => format!(
+                            "{} marker: click points on the image ({} so far) · \
+                             Enter finish · Esc cancel",
+                            kind.label(),
+                            marker_tool.points.len()
+                        ),
+                    }
                 } else if measure.active {
                     if measure.first.is_some() {
                         "Measure: click the second point · Esc cancel".to_string()
@@ -1043,6 +1062,7 @@ impl UiState {
         selection: &mut Selection,
         settings: &Settings,
         calibrate: &mut CalibrateTool,
+        marker_tool: &mut MarkerTool,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
     ) -> f32 {
@@ -1087,7 +1107,7 @@ impl UiState {
                 ui.separator();
                 if !scene.reference_images().is_empty() {
                     theme::section_header(ui, "Reference Images");
-                    reference_image_rows(ui, scene, selection, settings, calibrate);
+                    reference_image_rows(ui, scene, selection, settings, calibrate, marker_tool);
                     ui.separator();
                 }
                 if !scene.measurements().is_empty() {
@@ -2190,6 +2210,7 @@ fn reference_image_rows(
     selection: &mut Selection,
     settings: &Settings,
     calibrate: &mut CalibrateTool,
+    marker_tool: &mut MarkerTool,
 ) {
     let unit = settings.unit;
     let ids: Vec<u64> = scene.reference_images().iter().map(|r| r.id).collect();
@@ -2322,6 +2343,81 @@ fn reference_image_rows(
                 {
                     calibrate.start(id);
                 }
+
+                // AI markers: annotate the image for the AI assistant
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("AI markers").size(11.0).weak());
+                    if marker_tool.active() && marker_tool.target == Some(id) {
+                        if ui.small_button("Cancel drawing").clicked() {
+                            marker_tool.cancel();
+                        }
+                    } else {
+                        for (label, kind, tip) in [
+                            ("+ Point", MarkerKind::Point, "Click a spot on the image"),
+                            (
+                                "+ Line",
+                                MarkerKind::Line,
+                                "Click points along a line on the image · Enter to finish",
+                            ),
+                            (
+                                "+ Area",
+                                MarkerKind::Area,
+                                "Click the corners of an area on the image · Enter to \
+                                 finish (closes automatically)",
+                            ),
+                        ] {
+                            if ui
+                                .small_button(label)
+                                .on_hover_text(format!(
+                                    "{tip}. Give it a note the AI can follow — \
+                                     e.g. \"build a wall along this line\"."
+                                ))
+                                .clicked()
+                            {
+                                marker_tool.start(id, kind);
+                            }
+                        }
+                    }
+                });
+                let mut delete_marker: Option<u64> = None;
+                for marker in &mut edited.markers {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✖").on_hover_text("Delete marker").clicked() {
+                            delete_marker = Some(marker.id);
+                        }
+                        ui.label(
+                            egui::RichText::new(marker.kind.label().to_ascii_lowercase())
+                                .size(11.0)
+                                .weak(),
+                        );
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut marker.name)
+                                    .desired_width(90.0)
+                                    .font(egui::TextStyle::Small),
+                            )
+                            .on_hover_text("Marker name — refer to it in AI prompts")
+                            .changed();
+                    });
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::multiline(&mut marker.note)
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("note for the AI…")
+                                .font(egui::TextStyle::Small),
+                        )
+                        .on_hover_text(
+                            "Context the AI reads with this marker — \
+                             e.g. \"front door, 0.9 m wide\"",
+                        )
+                        .changed();
+                }
+                if let Some(marker_id) = delete_marker {
+                    edited.markers.retain(|m| m.id != marker_id);
+                    changed = true;
+                }
             });
 
         if changed {
@@ -2335,8 +2431,81 @@ fn reference_image_rows(
         if calibrate.target == Some(id) {
             calibrate.cancel();
         }
+        if marker_tool.target == Some(id) {
+            marker_tool.cancel();
+        }
         scene.remove_reference_image(id);
     }
+}
+
+/// After the marker points are picked: name the marker, attach the note for
+/// the AI, and save it onto the image.
+fn marker_window(
+    ctx: &egui::Context,
+    scene: &mut Scene,
+    marker_tool: &mut MarkerTool,
+) -> Option<String> {
+    if !(marker_tool.active() && marker_tool.done) {
+        return None;
+    }
+    let image_id = marker_tool.target?;
+    // the image can vanish while the dialog is up (MCP delete, undo)
+    if !scene.reference_images().iter().any(|r| r.id == image_id) {
+        marker_tool.cancel();
+        return None;
+    }
+
+    let mut open = true;
+    let mut done = false;
+    let mut message = None;
+    egui::Window::new(format!("New {} marker", marker_tool.kind.label().to_ascii_lowercase()))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let response = ui.text_edit_singleline(&mut marker_tool.name_input);
+                if marker_tool.name_input.is_empty() && marker_tool.note_input.is_empty() {
+                    response.request_focus();
+                }
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = true;
+                }
+            });
+            ui.label("Note for the AI (optional)");
+            ui.add(
+                egui::TextEdit::multiline(&mut marker_tool.note_input)
+                    .desired_rows(2)
+                    .desired_width(260.0)
+                    .hint_text("e.g. build a 2.2 m wall along this line"),
+            );
+            if ui.button("Add marker").clicked() {
+                done = true;
+            }
+            if done {
+                let kind = marker_tool.kind;
+                let marker = modeler_core::ImageMarker {
+                    id: 0, // assigned by the scene
+                    name: marker_tool.name_input.trim().to_string(),
+                    kind,
+                    points: marker_tool.points.clone(),
+                    note: marker_tool.note_input.trim().to_string(),
+                };
+                if scene.add_image_marker(image_id, marker).is_some() {
+                    message = Some(format!(
+                        "{} marker added — reference it in AI prompts",
+                        kind.label()
+                    ));
+                }
+                marker_tool.cancel();
+            }
+        });
+    if !open {
+        marker_tool.cancel();
+    }
+    message
 }
 
 /// After two points are picked: ask for the real-world distance and rescale.

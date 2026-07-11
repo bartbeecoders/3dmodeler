@@ -39,6 +39,7 @@ WORKFLOW
 - Lights: primitives "light" (point), "sun", "spot" with color, intensity, spot_angle_deg, shadows. Lights only affect the render when the viewport lighting is "scene" — call set_view {"lighting":"scene"} when the user cares about lighting/mood. "Night" = dim bluish sun (intensity ~0.2) + warm point/spot lights; "day" = one strong sun (intensity ~3).
 - Reuse: create_library_object captures objects as a named asset; place_library_object stamps copies (a whole building, tree, lamppost). For a city: build one of each thing, save to the library, then place many instances — far cheaper than re-modeling.
 - Reference images: add_reference_image puts a picture on an axis plane (from a file path the user gives, or base64); calibrate_reference_image scales it to real-world size from two pixel points and a distance.
+- AI markers: users draw points, lines and areas on reference images and attach notes to them. get_scene lists them per image with notes and world coordinates (points_world; lines/areas also report length_m). When the user says "this line", "the marked area", "the markers", read them from get_scene and build exactly on those world coordinates, following each marker's note ("draw a wall on this line" = wall segments along the line's points_world). You can also add/update/delete markers yourself (add_image_marker, pixel coordinates) to annotate an image or propose placements.
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
@@ -291,6 +292,40 @@ pub fn catalog() -> Vec<ToolSpec> {
             &["image", "point_a_px", "point_b_px", "real_distance_m"],
         ),
         tool(
+            "add_image_marker",
+            "Draw an AI marker (point / line / area) with a note on a reference image; get_scene reports markers back in world coordinates.",
+            json!({
+                "image": {"type": ["string", "integer"], "description": "image name or id"},
+                "kind": {"type": "string", "enum": ["point", "line", "area"]},
+                "points_px": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "[[x, y], ...] source-image pixels, origin top-left"},
+                "name": {"type": "string"},
+                "note": {"type": "string", "description": "context attached to the marker"}
+            }),
+            &["image", "kind", "points_px"],
+        ),
+        tool(
+            "update_image_marker",
+            "Rename a marker, edit its note, or replace its points/kind.",
+            json!({
+                "image": {"type": ["string", "integer"], "description": "image name or id"},
+                "marker": {"type": ["string", "integer"], "description": "marker name or id"},
+                "new_name": {"type": "string"},
+                "note": {"type": "string"},
+                "kind": {"type": "string", "enum": ["point", "line", "area"]},
+                "points_px": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "replaces all points"}
+            }),
+            &["image", "marker"],
+        ),
+        tool(
+            "delete_image_marker",
+            "Remove an AI marker from a reference image.",
+            json!({
+                "image": {"type": ["string", "integer"]},
+                "marker": {"type": ["string", "integer"]}
+            }),
+            &["image", "marker"],
+        ),
+        tool(
             "set_view",
             "Viewport shading/lighting. lighting 'scene' renders the scene's own lights (needed for day/night moods); 'studio' is neutral work lighting.",
             json!({
@@ -330,7 +365,7 @@ pub fn dispatch(name: &str, input: &Value, ctx: &mut ToolContext) -> Value {
 pub fn summarize(_name: &str, input: &Value, response: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     for key in ["primitive", "new_name", "name", "object", "asset", "child", "parent",
-                "action", "shading", "lighting"] {
+                "image", "marker", "kind", "action", "shading", "lighting"] {
         if let Some(v) = input.get(key) {
             match v {
                 Value::String(s) => parts.push(s.clone()),
@@ -373,7 +408,8 @@ mod tests {
             "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
             "break_into_bricks", "add_measurement", "simulate", "set_view", "screenshot",
             "add_reference_image", "update_reference_image", "delete_reference_image",
-            "calibrate_reference_image", "get_library", "create_library_object",
+            "calibrate_reference_image", "add_image_marker", "update_image_marker",
+            "delete_image_marker", "get_library", "create_library_object",
             "update_library_object", "delete_library_object", "place_library_object",
         ];
         let catalog = catalog();

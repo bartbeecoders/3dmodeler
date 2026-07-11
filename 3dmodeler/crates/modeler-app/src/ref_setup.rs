@@ -196,6 +196,7 @@ pub fn build_placements(
                 visible: true,
                 flip_h,
                 data_base64: BASE64.encode(&img.bytes),
+                markers: Vec::new(),
             }
         })
         .collect()

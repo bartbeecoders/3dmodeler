@@ -10,7 +10,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use modeler_core::glam;
-use modeler_core::{ReferenceImage, Scene};
+use modeler_core::{MarkerKind, ReferenceImage, Scene};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use three_d::*;
@@ -213,6 +213,7 @@ pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, Stri
         visible: true,
         flip_h: false,
         data_base64: BASE64.encode(bytes),
+        markers: Vec::new(),
     })
 }
 
@@ -427,6 +428,103 @@ impl CalibrateTool {
     }
 }
 
+// --------------------------------------------------------------- AI markers --
+
+/// Viewport drawing tool for AI markers: pick a point / polyline / polygon
+/// directly on a reference image, then name it and attach a note for the AI
+/// (the save dialog lives in ui.rs). Picks intersect the image plane like
+/// the calibration tool; points are kept in normalized image coordinates.
+pub struct MarkerTool {
+    pub target: Option<u64>,
+    pub kind: MarkerKind,
+    pub points: Vec<glam::Vec2>,
+    /// Picking finished — the name/note dialog is up.
+    pub done: bool,
+    pub name_input: String,
+    pub note_input: String,
+}
+
+impl MarkerTool {
+    pub fn new() -> Self {
+        Self {
+            target: None,
+            kind: MarkerKind::Point,
+            points: Vec::new(),
+            done: false,
+            name_input: String::new(),
+            note_input: String::new(),
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// Still picking points in the viewport?
+    pub fn picking(&self) -> bool {
+        self.active() && !self.done
+    }
+
+    pub fn start(&mut self, image_id: u64, kind: MarkerKind) {
+        self.target = Some(image_id);
+        self.kind = kind;
+        self.points.clear();
+        self.done = false;
+        self.name_input.clear();
+        self.note_input.clear();
+    }
+
+    pub fn cancel(&mut self) {
+        self.target = None;
+        self.points.clear();
+        self.done = false;
+        self.name_input.clear();
+        self.note_input.clear();
+    }
+
+    /// Enter: accept the picked points when they make a valid marker
+    /// (a point marker completes on its single click instead).
+    pub fn finish(&mut self) {
+        if self.picking() && self.points.len() >= self.kind.min_points() {
+            self.done = true;
+        }
+    }
+
+    /// Feed a viewport pick ray; intersects the target image's plane and
+    /// stores the pick in image coordinates (edge picks clamp onto the
+    /// image, picks well off it are stray clicks and ignored).
+    pub fn add_ray(&mut self, scene: &Scene, origin: glam::Vec3, direction: glam::Vec3) {
+        if !self.picking() {
+            return;
+        }
+        let Some(image) = self
+            .target
+            .and_then(|id| scene.reference_images().iter().find(|i| i.id == id))
+        else {
+            self.cancel();
+            return;
+        };
+        let (_, _, normal) = image.oriented_basis();
+        let denom = direction.dot(normal);
+        if denom.abs() < 1e-6 {
+            return; // looking along the plane — no usable intersection
+        }
+        let t = (image.location - origin).dot(normal) / denom;
+        if t <= 0.0 {
+            return;
+        }
+        let uv = image.world_to_uv(origin + direction * t);
+        let margin = 0.05;
+        if uv.x < -margin || uv.x > 1.0 + margin || uv.y < -margin || uv.y > 1.0 + margin {
+            return;
+        }
+        self.points.push(uv.clamp(glam::Vec2::ZERO, glam::Vec2::ONE));
+        if self.kind == MarkerKind::Point {
+            self.done = true;
+        }
+    }
+}
+
 // --- viewport move tool -----------------------------------------------------
 
 struct ImageGrab {
@@ -626,6 +724,7 @@ mod tests {
             visible: true,
             flip_h: false,
             data_base64: String::new(),
+            markers: Vec::new(),
         }
     }
 
@@ -650,6 +749,42 @@ mod tests {
         // parallel ray is ignored
         tool.add_ray(&scene, glam::Vec3::ZERO, glam::Vec3::new(1.0, 0.0, 0.0));
         assert!(tool.points.is_empty());
+    }
+
+    #[test]
+    fn marker_tool_picks_normalized_image_points() {
+        let mut scene = Scene::new();
+        // 2 m wide, aspect 1 -> 2 m tall, centered at (0, 0, 1) on the Y plane
+        let id = scene.add_reference_image(test_image(ImagePlane::Y));
+
+        let mut tool = MarkerTool::new();
+        tool.start(id, MarkerKind::Line);
+        assert!(tool.picking());
+        // center pick -> uv (0.5, 0.5)
+        tool.add_ray(&scene, glam::Vec3::new(0.0, 5.0, 1.0), glam::Vec3::new(0.0, -1.0, 0.0));
+        // just past the right edge: clamped onto the image -> uv (1, 0.5)
+        tool.add_ray(&scene, glam::Vec3::new(1.02, 5.0, 1.0), glam::Vec3::new(0.0, -1.0, 0.0));
+        // a stray click far off the image is ignored
+        tool.add_ray(&scene, glam::Vec3::new(4.0, 5.0, 1.0), glam::Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(tool.points.len(), 2);
+        assert!((tool.points[0] - glam::Vec2::new(0.5, 0.5)).length() < 1e-5);
+        assert!((tool.points[1] - glam::Vec2::new(1.0, 0.5)).length() < 1e-5);
+        assert!(!tool.done, "a line keeps picking until finish()");
+        tool.finish();
+        assert!(tool.done && !tool.picking());
+
+        // an area needs 3 points: finish() with 2 keeps picking
+        tool.start(id, MarkerKind::Area);
+        tool.add_ray(&scene, glam::Vec3::new(0.0, 5.0, 1.0), glam::Vec3::new(0.0, -1.0, 0.0));
+        tool.add_ray(&scene, glam::Vec3::new(0.5, 5.0, 1.0), glam::Vec3::new(0.0, -1.0, 0.0));
+        tool.finish();
+        assert!(tool.picking());
+
+        // a point marker completes on its single click; v grows downward
+        tool.start(id, MarkerKind::Point);
+        tool.add_ray(&scene, glam::Vec3::new(0.0, 5.0, 1.5), glam::Vec3::new(0.0, -1.0, 0.0));
+        assert!(tool.done);
+        assert!((tool.points[0] - glam::Vec2::new(0.5, 0.25)).length() < 1e-5);
     }
 
     #[test]

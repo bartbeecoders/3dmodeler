@@ -48,7 +48,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "get_scene",
-            "description": "Read the full scene: all objects (id, name, primitive, local & world transforms, parent, pivot & anchor points, group flag, color, physics flags, dimensions in meters), measurements and the simulation state. Call this first to see what exists.",
+            "description": "Read the full scene: all objects (id, name, primitive, local & world transforms, parent, pivot & anchor points, group flag, color, physics flags, dimensions in meters), measurements, reference images (including their AI markers — user-drawn points/lines/areas with notes, in pixel AND world coordinates) and the simulation state. Call this first to see what exists. When the user refers to something they marked on a reference image, read the markers' points_world and notes from here.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -355,6 +355,49 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "add_image_marker",
+            "description": "Draw an AI marker on a reference image: a point, a line (open polyline) or an area (closed polygon), with an optional free-text note. Markers anchor instructions to spots on the image — e.g. mark a line and ask for a wall along it. Points are given in SOURCE-IMAGE PIXELS (origin top-left, like calibrate_reference_image); get_scene reports each marker back with both pixel and world coordinates (points_world) plus its world length, so you can build exactly on the marked geometry. Users can also draw markers directly in the app.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Reference image name (or id as string)"},
+                    "kind": {"type": "string", "enum": ["point", "line", "area"], "description": "point = 1 point, line = open polyline (≥2), area = closed polygon (≥3, closing edge implicit)"},
+                    "points_px": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "[[x, y], ...] in source-image pixels, origin top-left"},
+                    "name": {"type": "string", "description": "Optional name (unique per image, like objects)"},
+                    "note": {"type": "string", "description": "Context / instructions attached to the marker (e.g. 'front door, 0.9 m wide')"}
+                },
+                "required": ["image", "kind", "points_px"]
+            }
+        },
+        {
+            "name": "update_image_marker",
+            "description": "Change an AI marker on a reference image: rename (new_name), edit its note, replace its points (points_px, same pixel convention as add_image_marker) or retype it (kind; pass points_px too when the current points don't fit the new kind).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Reference image name (or id as string)"},
+                    "marker": {"type": "string", "description": "Marker name (or id as string)"},
+                    "new_name": {"type": "string"},
+                    "note": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["point", "line", "area"]},
+                    "points_px": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "Replaces ALL points; [[x, y], ...] in source-image pixels"}
+                },
+                "required": ["image", "marker"]
+            }
+        },
+        {
+            "name": "delete_image_marker",
+            "description": "Remove an AI marker from a reference image (marker by name or id).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string"},
+                    "marker": {"type": "string"}
+                },
+                "required": ["image", "marker"]
+            }
+        },
+        {
             "name": "calibrate_reference_image",
             "description": "Scale a reference image to real-world size from two points: give two pixel coordinates IN THE SOURCE IMAGE (origin top-left; get_scene reports width_px/height_px) and the real distance between them in meters. The image is rescaled so that pixel span matches the distance — e.g. a blueprint's known 4 m wall. Returns the currently-measured span and the updated image.",
             "inputSchema": {
@@ -381,7 +424,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "add_object" | "add_floor" | "break_into_bricks" | "update_object" | "delete_object" | "set_parent" | "attach_object"
         | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"
         | "add_reference_image" | "update_reference_image" | "delete_reference_image"
-        | "calibrate_reference_image" | "create_library_object" | "update_library_object"
+        | "calibrate_reference_image" | "add_image_marker" | "update_image_marker"
+        | "delete_image_marker" | "create_library_object" | "update_library_object"
         | "delete_library_object" | "place_library_object" => {
             let mut command = arguments.clone();
             if !command.is_object() {
