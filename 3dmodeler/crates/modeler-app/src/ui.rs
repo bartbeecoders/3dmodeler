@@ -2467,11 +2467,11 @@ fn marker_window(
             ui.horizontal(|ui| {
                 ui.label("Name");
                 let response = ui.text_edit_singleline(&mut marker_tool.name_input);
-                if marker_tool.name_input.is_empty() && marker_tool.note_input.is_empty() {
-                    response.request_focus();
-                }
+                // read BEFORE any request_focus — see calibrate_window
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     done = true;
+                } else if marker_tool.name_input.is_empty() && marker_tool.note_input.is_empty() {
+                    response.request_focus();
                 }
             });
             ui.label("Note for the AI (optional)");
@@ -2534,9 +2534,12 @@ fn calibrate_window(
             ui.horizontal(|ui| {
                 ui.label(format!("Real distance ({}):", unit.suffix()));
                 let response = ui.text_edit_singleline(&mut calibrate.distance_input);
-                response.request_focus();
+                // Enter surrenders the field's focus: apply-on-Enter must be
+                // read BEFORE re-requesting focus, which would mask the loss
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     done = true;
+                } else {
+                    response.request_focus();
                 }
             });
             let parsed = calibrate.distance_input.trim().replace(',', ".").parse::<f32>();
