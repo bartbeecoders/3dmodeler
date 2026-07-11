@@ -439,6 +439,10 @@ impl RefSetupDialog {
                         cancelled = true;
                     }
                 });
+                // Enter = the Place button (dialog default action)
+                if crate::ui::dialog_confirmed(ui) && !self.assigned.is_empty() {
+                    accepted = true;
+                }
             });
 
         let mut status = None;

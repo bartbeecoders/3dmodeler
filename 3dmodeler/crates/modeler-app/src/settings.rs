@@ -298,6 +298,7 @@ impl SettingsWindow {
         }
 
         let mut open = self.open;
+        let mut confirmed = false;
         egui::Window::new("Preferences")
             .open(&mut open)
             .collapsible(false)
@@ -333,8 +334,10 @@ impl SettingsWindow {
                         });
                     });
                 });
+                // settings apply live, so confirming just closes the window
+                confirmed = crate::ui::dialog_confirmed(ui);
             });
-        self.open = open;
+        self.open = open && !confirmed;
     }
 }
 

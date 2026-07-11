@@ -130,6 +130,11 @@ impl LibraryPanel {
         self.drop.take()
     }
 
+    /// The create/edit dialog is on screen (see UiState::any_dialog_open).
+    pub fn dialog_open(&self) -> bool {
+        !matches!(self.dialog, Dialog::Closed)
+    }
+
     /// Sidebar section: one draggable row per asset.
     pub fn section(
         &mut self,
@@ -285,11 +290,10 @@ impl LibraryPanel {
                 }
                 ui.label("Name:");
                 let response = ui.text_edit_singleline(&mut name);
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    confirmed = true;
-                }
+                crate::ui::dialog_autofocus(ui, &response);
                 ui.label("Description:");
-                ui.add(
+                let (_, description_confirmed) = crate::ui::multiline_confirms(
+                    ui,
                     egui::TextEdit::multiline(&mut description)
                         .desired_rows(3)
                         .desired_width(280.0),
@@ -322,7 +326,11 @@ impl LibraryPanel {
                 ui.add_space(6.0);
                 let valid = !name.trim().is_empty()
                     && (editing.is_some() || !selection.is_empty());
-                if ui.add_enabled(valid, egui::Button::new("Save")).clicked() {
+                if (ui.add_enabled(valid, egui::Button::new("Save")).clicked()
+                    || description_confirmed
+                    || crate::ui::dialog_confirmed(ui))
+                    && valid
+                {
                     confirmed = true;
                 }
             });

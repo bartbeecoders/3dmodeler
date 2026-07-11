@@ -741,10 +741,8 @@ impl UiState {
             .show(ctx, |ui| {
                 ui.label("File name:");
                 let response = ui.text_edit_singleline(&mut self.save_as_buffer);
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    do_save = true;
-                }
-                if ui.button("Save").clicked() {
+                dialog_autofocus(ui, &response);
+                if ui.button("Save").clicked() || dialog_confirmed(ui) {
                     do_save = true;
                 }
             });
@@ -804,9 +802,7 @@ impl UiState {
                 ui.small("Openings, curvature and course rounding vary the exact count.");
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Break").clicked()
-                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if ui.button("Break").clicked() {
                         do_break = true;
                     }
                     if ui.button("Cancel").clicked()
@@ -815,6 +811,10 @@ impl UiState {
                         cancel = true;
                     }
                 });
+                // after the buttons: Enter on a focused Cancel must stay Cancel
+                if dialog_confirmed(ui) {
+                    do_break = true;
+                }
             });
 
         if do_break {
@@ -854,10 +854,14 @@ impl UiState {
                         egui::TextEdit::multiline(&mut self.import_buffer)
                             .desired_rows(10)
                             .desired_width(360.0)
-                            .code_editor(),
+                            .code_editor()
+                            // Tab moves to the Load button (nobody types
+                            // indentation into a paste box)
+                            .lock_focus(false),
                     );
                 });
-                if ui.button("Load").clicked() {
+                // Enter confirms only OUTSIDE the editor — inside it types JSON
+                if ui.button("Load").clicked() || dialog_confirmed(ui) {
                     match Scene::from_json(&self.import_buffer) {
                         Ok(data) => {
                             scene.restore(&data);
@@ -1650,8 +1654,11 @@ impl UiState {
                         ui.end_row();
                     }
                 });
+                if dialog_confirmed(ui) {
+                    self.show_keymap = false;
+                }
             });
-        self.show_keymap = open;
+        self.show_keymap &= open;
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -1712,8 +1719,28 @@ impl UiState {
                     );
                     ui.add_space(4.0);
                 });
+                if dialog_confirmed(ui) {
+                    self.show_about = false;
+                }
             });
-        self.show_about = open;
+        self.show_about &= open;
+    }
+
+    /// A dialog window is on screen. main.rs then leaves Tab to egui (field
+    /// traversal) instead of claiming it for edit mode.
+    pub fn any_dialog_open(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        let save_as = self.save_as_open;
+        #[cfg(not(target_arch = "wasm32"))]
+        let save_as = false;
+        self.show_keymap
+            || self.show_about
+            || self.import_open
+            || save_as
+            || self.brick_dialog.is_some()
+            || self.settings_window.open
+            || self.ref_setup.open
+            || self.library_panel.dialog_open()
     }
 }
 
@@ -2198,6 +2225,47 @@ fn view_menu(
     close
 }
 
+// --- dialog behavior -----------------------------------------------------------
+//
+// Every dialog window follows the same keyboard rules: Tab walks the fields
+// (egui's built-in focus traversal — main.rs leaves Tab to egui while a
+// dialog is open), Enter confirms the dialog's default action.
+
+/// The shared "Enter confirms the dialog" rule: Enter was pressed and no
+/// widget claims the keyboard. Single-line fields surrender focus on Enter,
+/// so the SAME press that commits the field also confirms; a focused button
+/// keeps Enter for itself (egui activates it); a multiline field keeps its
+/// newline. Call at the END of the dialog, after all widgets.
+pub(crate) fn dialog_confirmed(ui: &egui::Ui) -> bool {
+    ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+/// Keep a dialog's primary text field focused whenever nothing else has
+/// focus (first open, after a click on empty space) — Tab still walks away
+/// from it. Skipped on the Enter frame so the surrender that Enter causes
+/// stays visible to `dialog_confirmed`.
+pub(crate) fn dialog_autofocus(ui: &egui::Ui, response: &egui::Response) {
+    if !ui.input(|i| i.key_pressed(egui::Key::Enter))
+        && ui.memory(|m| m.focused().is_none())
+    {
+        response.request_focus();
+    }
+}
+
+/// A multiline dialog field where Enter CONFIRMS the dialog and Shift+Enter
+/// inserts the newline. Returns (response, confirmed-this-frame).
+pub(crate) fn multiline_confirms(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> (egui::Response, bool) {
+    let response = ui
+        .add(edit.return_key(egui::KeyboardShortcut::new(
+            egui::Modifiers::SHIFT,
+            egui::Key::Enter,
+        )))
+        .on_hover_text("Shift+Enter for a new line");
+    let confirmed = response.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
+    (response, confirmed)
+}
+
 // --- reference images ---------------------------------------------------------
 
 /// Sidebar rows for every reference image: visibility, plane, placement,
@@ -2467,21 +2535,17 @@ fn marker_window(
             ui.horizontal(|ui| {
                 ui.label("Name");
                 let response = ui.text_edit_singleline(&mut marker_tool.name_input);
-                // read BEFORE any request_focus — see calibrate_window
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    done = true;
-                } else if marker_tool.name_input.is_empty() && marker_tool.note_input.is_empty() {
-                    response.request_focus();
-                }
+                dialog_autofocus(ui, &response);
             });
             ui.label("Note for the AI (optional)");
-            ui.add(
+            let (_, note_confirmed) = multiline_confirms(
+                ui,
                 egui::TextEdit::multiline(&mut marker_tool.note_input)
                     .desired_rows(2)
                     .desired_width(260.0)
                     .hint_text("e.g. build a 2.2 m wall along this line"),
             );
-            if ui.button("Add marker").clicked() {
+            if ui.button("Add marker").clicked() || note_confirmed || dialog_confirmed(ui) {
                 done = true;
             }
             if done {
@@ -2534,17 +2598,13 @@ fn calibrate_window(
             ui.horizontal(|ui| {
                 ui.label(format!("Real distance ({}):", unit.suffix()));
                 let response = ui.text_edit_singleline(&mut calibrate.distance_input);
-                // Enter surrenders the field's focus: apply-on-Enter must be
-                // read BEFORE re-requesting focus, which would mask the loss
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    done = true;
-                } else {
-                    response.request_focus();
-                }
+                dialog_autofocus(ui, &response);
             });
             let parsed = calibrate.distance_input.trim().replace(',', ".").parse::<f32>();
             let valid = parsed.as_ref().is_ok_and(|v| *v > 0.0);
-            if ui.add_enabled(valid, egui::Button::new("Apply")).clicked() {
+            if ui.add_enabled(valid, egui::Button::new("Apply")).clicked()
+                || dialog_confirmed(ui)
+            {
                 done = true;
             }
             if done && valid {

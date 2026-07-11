@@ -220,9 +220,13 @@ pub fn main() {
     let mut on_frame = move |mut frame_input: FrameInput| -> FrameOutput {
         edit_mode.sync(&mut scene);
         // claim Tab for edit mode BEFORE egui grabs it for widget-focus
-        // traversal; when a text field had focus last frame, egui keeps it
+        // traversal; when a text field had focus last frame, egui keeps it.
+        // Dialogs keep Tab too — there it walks the dialog's fields.
+        let dialog_open = ui_state.any_dialog_open()
+            || calibrate.measured().is_some()
+            || marker_tool.active();
         let mut tab_pressed = false;
-        if !egui_kb_last_frame {
+        if !egui_kb_last_frame && !dialog_open {
             for event in frame_input.events.iter_mut() {
                 if let Event::KeyPress { kind: Key::Tab, handled, .. } = event {
                     if !*handled {
