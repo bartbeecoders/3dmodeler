@@ -1,6 +1,6 @@
 [package]
 name = "modeler-app"
-version = "0.2.43"
+version = "0.2.47"
 edition = "2021"
 description = "3D modeler application: viewport, tools, UI (native + browser)"
 
@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+hayro = "0.7" # pure-Rust PDF rasterizer: reference setup imports plan-set PDFs
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 winit = "0.28" # same version as three-d's (we own the event loop for OS file drops)

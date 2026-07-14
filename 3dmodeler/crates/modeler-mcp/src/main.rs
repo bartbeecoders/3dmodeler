@@ -73,7 +73,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "empty", "light", "sun", "spot"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "light", "sun", "spot"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
@@ -116,6 +116,21 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "add_roof",
+            "description": "Add a roof on top of walls: it covers their world-space bounding rectangle (plus an eave overhang) and stands on the tallest wall's top edge, ridge along the longer side. Kinds: point (pyramid), gable, hip, flat, shed, gambrel (barn), mansard. Takes the same optional object fields as add_object (color, new_name, ...); update_object can later change roof_kind/width/depth/height/overhang/ridge_x.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["point", "gable", "hip", "flat", "shed", "gambrel", "mansard"], "description": "Roof shape (default gable)"},
+                    "walls": {"type": "array", "items": {"type": "string"}, "description": "Wall names (or ids as strings) to size the roof from; omit to use every wall in the scene"},
+                    "height": {"type": "number", "description": "Rise in meters (default derived from the footprint)"},
+                    "overhang": {"type": "number", "description": "Eave overhang in meters (default 0.3)"},
+                    "new_name": {"type": "string"},
+                    "color": {"type": "array", "items": {"type": "number"}, "description": "[r, g, b] each 0..1"}
+                }
+            }
+        },
+        {
             "name": "break_into_bricks",
             "description": "Replace an object with individual dynamic bricks in a running bond (they collide and tumble when the simulation plays). Walls keep their door/window openings; other shapes (cubes, spheres, cones, floors, ...) are filled with bricks, curved surfaces getting a stepped approximation. The bricks land in a '<name> bricks' folder that can rebuild the original.",
             "inputSchema": {
@@ -123,6 +138,74 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "object": {"type": "string", "description": "Object name (or id as string)"},
                     "bricks": {"type": "integer", "description": "Approximate target brick count, 100..5000 (default 1000); the brick size scales to hit it"}
+                },
+                "required": ["object"]
+            }
+        },
+        {
+            "name": "boolean_objects",
+            "description": "Mesh boolean (CSG), applied IMMEDIATELY: op 'union' merges the tool objects into the target (overlapping shells weld into one solid), 'subtract' carves them out of it, 'intersect' keeps only the shared volume. The tool objects are consumed (removed from the scene); the target keeps its name, material and transform, its shape becoming the result. Lights and empties have no volume and are rejected. For a non-destructive boolean with a live viewport preview, use add_modifier instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["union", "subtract", "intersect"]},
+                    "target": {"type": "string", "description": "Object that receives the result (name or id as string)"},
+                    "tools": {"type": "array", "items": {"type": "string"}, "description": "Objects to merge in / carve out (names or ids)"}
+                },
+                "required": ["op", "target", "tools"]
+            }
+        },
+        {
+            "name": "add_modifier",
+            "description": "Add a NON-DESTRUCTIVE modifier to an object's stack (Blender-style): the viewport previews the result live; nothing is baked until apply_modifiers. type 'subdivision' smooths with Catmull-Clark (levels 1-4). type 'boolean' combines with another object (op union|subtract|intersect, tool = the other object): the tool stays in the scene, hidden, and the preview follows it when it moves — move/edit the tool to fine-tune, then apply_modifiers. Editing and physics keep using the base shape until applied.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object that gets the modifier (name or id as string)"},
+                    "type": {"type": "string", "enum": ["subdivision", "boolean"]},
+                    "levels": {"type": "integer", "description": "subdivision only: Catmull-Clark levels 1-4 (default 1)"},
+                    "op": {"type": "string", "enum": ["union", "subtract", "intersect"], "description": "boolean only: required"},
+                    "tool": {"type": "string", "description": "boolean only (required): the other object (name or id)"}
+                },
+                "required": ["object", "type"]
+            }
+        },
+        {
+            "name": "update_modifier",
+            "description": "Change a modifier on an object's stack by index (see the object's 'modifiers' in get_scene): toggle 'enabled' (preview on/off), subdivision 'levels', boolean 'op'/'tool'. The viewport preview updates live.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string"},
+                    "index": {"type": "integer", "description": "Position in the modifier stack, 0-based"},
+                    "enabled": {"type": "boolean"},
+                    "levels": {"type": "integer", "description": "subdivision only: 1-4"},
+                    "op": {"type": "string", "enum": ["union", "subtract", "intersect"], "description": "boolean only"},
+                    "tool": {"type": "string", "description": "boolean only: the other object (name or id)"}
+                },
+                "required": ["object", "index"]
+            }
+        },
+        {
+            "name": "remove_modifier",
+            "description": "Remove one modifier from an object's stack by index, discarding its effect. A boolean modifier's hidden tool object is made visible again if nothing else references it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string"},
+                    "index": {"type": "integer", "description": "Position in the modifier stack, 0-based"}
+                },
+                "required": ["object", "index"]
+            }
+        },
+        {
+            "name": "apply_modifiers",
+            "description": "Bake an object's modifier stack into its mesh (the previewed shape becomes the real one) and drop the applied entries. 'count' applies only the first N stack entries (default all). Boolean tool objects are removed once no modifier references them. Refuses when the result would be an empty mesh.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string"},
+                    "count": {"type": "integer", "description": "Apply only the first N modifiers (default: all)"}
                 },
                 "required": ["object"]
             }
@@ -136,8 +219,13 @@ fn tool_definitions() -> Value {
                     "object": {"type": "string", "description": "Object name (or id as string)"},
                     "new_name": {"type": "string"},
                     "length": {"type": "number", "description": "Wall only: length in meters"},
-                    "height": {"type": "number", "description": "Wall only: height in meters"},
+                    "height": {"type": "number", "description": "Wall or roof: height/rise in meters"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters"},
+                    "roof_kind": {"type": "string", "enum": ["point", "gable", "hip", "flat", "shed", "gambrel", "mansard"], "description": "Roofs only: change the roof shape"},
+                    "width": {"type": "number", "description": "Roofs only: footprint width (X) in meters"},
+                    "depth": {"type": "number", "description": "Roofs only: footprint depth (Y) in meters"},
+                    "overhang": {"type": "number", "description": "Roofs only: eave overhang in meters"},
+                    "ridge_x": {"type": "boolean", "description": "Roofs only: ridge (shed: high eave) along local X instead of Y"},
                     "cutouts": {"type": "array", "items": {"type": "object", "properties": {
                         "offset": {"type": "number"},
                         "width": {"type": "number"},
@@ -423,7 +511,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
-        "add_object" | "add_floor" | "break_into_bricks" | "update_object" | "delete_object" | "set_parent" | "attach_object"
+        "add_object" | "add_floor" | "add_roof" | "break_into_bricks" | "boolean_objects"
+        | "add_modifier" | "update_modifier" | "remove_modifier" | "apply_modifiers"
+        | "update_object" | "delete_object" | "set_parent" | "attach_object"
         | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"
         | "add_reference_image" | "update_reference_image" | "delete_reference_image"
         | "calibrate_reference_image" | "add_image_marker" | "update_image_marker"

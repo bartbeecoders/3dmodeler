@@ -101,11 +101,27 @@ pub fn poll_setup_images() -> Vec<(String, Vec<u8>)> {
         .unwrap_or_default()
 }
 
+/// Queue one picked/dropped setup file: PDFs are rendered page by page
+/// (each page becomes its own tray image, delivered as it finishes so the
+/// tray fills progressively), anything else is passed through as-is.
+fn deliver_setup_file(name: String, bytes: Vec<u8>) {
+    let push = |name: String, bytes: Vec<u8>| {
+        if let Ok(mut pending) = PENDING_SETUP.lock() {
+            pending.push((name, bytes));
+        }
+    };
+    if crate::pdf::is_pdf(&bytes) {
+        crate::pdf::render_pages(&name, bytes, push);
+    } else {
+        push(name, bytes);
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn request_setup_images() {
     std::thread::spawn(|| {
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg"])
+            .add_filter("Images & PDF", &["png", "jpg", "jpeg", "pdf"])
             .pick_files()
         else {
             return;
@@ -116,9 +132,7 @@ pub fn request_setup_images() {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Image".into());
-            if let Ok(mut pending) = PENDING_SETUP.lock() {
-                pending.push((name, bytes));
-            }
+            deliver_setup_file(name, bytes);
         }
     });
 }
@@ -132,7 +146,7 @@ pub fn request_setup_images() {
     let Ok(el) = document.create_element("input") else { return };
     let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() else { return };
     input.set_type("file");
-    input.set_accept("image/png,image/jpeg");
+    input.set_accept("image/png,image/jpeg,application/pdf");
     input.set_multiple(true);
     if let Some(html_el) = input.dyn_ref::<web_sys::HtmlElement>() {
         let _ = html_el.style().set_property("display", "none");
@@ -157,9 +171,9 @@ pub fn request_setup_images() {
                 let Ok(result) = reader_for_load.result() else { return };
                 let array = js_sys::Uint8Array::new(&result);
                 let bytes = array.to_vec();
-                if let Ok(mut pending) = PENDING_SETUP.lock() {
-                    pending.push((name, bytes));
-                }
+                // PDF pages render inline here (no threads on wasm): the UI
+                // stalls briefly on large sets, then the tray fills up
+                deliver_setup_file(name, bytes);
             });
             reader.set_onload(Some(onload.as_ref().unchecked_ref()));
             onload.forget();
@@ -173,14 +187,15 @@ pub fn request_setup_images() {
 }
 
 /// A file dropped onto the window from the OS (file manager drag): feed it
-/// to the reference setup dialog's tray. Non-image files are ignored.
+/// to the reference setup dialog's tray. PDFs are expanded to one image per
+/// page; other non-image files are ignored.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn push_setup_file(path: &std::path::Path) {
-    let is_image = path
+    let supported = path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
-    if !is_image {
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "pdf"));
+    if !supported {
         return;
     }
     let Ok(bytes) = std::fs::read(path) else { return };
@@ -188,9 +203,8 @@ pub fn push_setup_file(path: &std::path::Path) {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Image".into());
-    if let Ok(mut pending) = PENDING_SETUP.lock() {
-        pending.push((name, bytes));
-    }
+    // off the event loop: PDF page rendering takes ~0.2 s per sheet
+    std::thread::spawn(move || deliver_setup_file(name, bytes));
 }
 
 /// Build a `ReferenceImage` from raw file bytes: validates/decodes the image

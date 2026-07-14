@@ -223,8 +223,8 @@ impl WallTool {
 }
 
 /// Intersect a viewport pick ray with the floor plane (z = 0), optionally
-/// snapped to the grid.
-fn ground_point(
+/// snapped to the grid. Shared with the roof tool.
+pub(crate) fn ground_point(
     camera: &crate::camera::BlenderCamera,
     viewport: Viewport,
     x_px: f32,

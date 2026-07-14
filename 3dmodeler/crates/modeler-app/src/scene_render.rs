@@ -48,6 +48,9 @@ struct CachedModel {
     primitive: Primitive,
     smooth: bool,
     mesh_revision: u64,
+    /// `modifiers::stamp` of the evaluated-mesh inputs — re-meshes when a
+    /// modifier changes or a boolean tool moves (the live preview).
+    modifier_stamp: u64,
     mode: ShadeMode,
     xray: bool,
     material: Material,
@@ -149,6 +152,8 @@ fn instance_key(
     if matches!(object.primitive, Primitive::Floor { .. }) && !object.floor_outline.is_empty() {
         return None;
     }
+    // boolean modifiers make the mesh depend on other objects: unique
+    let subdivision = object.subdivision_only_levels()?;
     let (roughness, metallic) = match mode {
         ShadeMode::Solid => (0.0, 0.0),
         _ => (object.material.roughness, object.material.metallic),
@@ -156,7 +161,7 @@ fn instance_key(
     let key = GroupKey {
         primitive: object.primitive,
         smooth: object.smooth,
-        subdivision: object.subdivision,
+        subdivision,
         roughness,
         metallic,
         mode,
@@ -184,15 +189,11 @@ pub struct SceneRender {
     mesh_cache: HashMap<u64, CpuMesh>,
 }
 
-/// The mesh the viewport shows: the base mesh with the object's
-/// subdivision-surface levels applied. Editing and collision keep using
-/// the base mesh (the cage), like Blender's subsurf modifier.
-fn display_mesh(object: &modeler_core::Object) -> MeshData {
-    let base = object.render_mesh();
-    if object.subdivision == 0 {
-        return base;
-    }
-    crate::mesh_edit::subdivide(&base, object.subdivision, object.smooth)
+/// The mesh the viewport shows: the base mesh with the object's modifier
+/// stack applied (subdivision surface, live boolean previews). Editing and
+/// collision keep using the base mesh (the cage), like Blender.
+fn display_mesh(scene: &Scene, object: &modeler_core::Object) -> MeshData {
+    crate::modifiers::evaluate(scene, object.id)
 }
 
 fn to_cpu_mesh(data: &MeshData) -> CpuMesh {
@@ -354,7 +355,7 @@ impl SceneRender {
         for &(id, transformation, tier) in &singles {
             let Some(object) = scene.object(id) else { continue };
             self.order.push(id);
-            self.sync_single(object, transformation, tier, context, mode, xray);
+            self.sync_single(scene, object, transformation, tier, context, mode, xray);
         }
 
         let single_ids: HashSet<ObjectId> = singles.iter().map(|&(id, _, _)| id).collect();
@@ -424,7 +425,8 @@ impl SceneRender {
                 let mesh_hash = group_mesh_hash(&key);
                 if !self.mesh_cache.contains_key(&mesh_hash) {
                     let exemplar = scene.object(members[0].0).expect("member from this frame");
-                    self.mesh_cache.insert(mesh_hash, to_cpu_mesh(&display_mesh(exemplar)));
+                    self.mesh_cache
+                        .insert(mesh_hash, to_cpu_mesh(&display_mesh(scene, exemplar)));
                 }
                 let cpu_mesh = &self.mesh_cache[&mesh_hash];
                 // white albedo: the per-instance colors carry the base color
@@ -465,8 +467,10 @@ impl SceneRender {
     }
 
     /// Sync one per-object cached model (the pre-instancing path).
+    #[allow(clippy::too_many_arguments)]
     fn sync_single(
         &mut self,
+        scene: &Scene,
         object: &modeler_core::Object,
         transformation: Mat4,
         tier: OutlineTier,
@@ -474,11 +478,13 @@ impl SceneRender {
         mode: ShadeMode,
         xray: bool,
     ) {
+        let modifier_stamp = crate::modifiers::stamp(scene, object.id);
         let rebuild_mesh = match self.cache.get(&object.id) {
             Some(cached) => {
                 cached.primitive != object.primitive
                     || cached.smooth != object.smooth
                     || cached.mesh_revision != object.mesh_revision
+                    || cached.modifier_stamp != modifier_stamp
             }
             None => true,
         };
@@ -492,7 +498,7 @@ impl SceneRender {
         };
 
         if rebuild_mesh {
-            let new_mesh = display_mesh(object);
+            let new_mesh = display_mesh(scene, object);
             // Edit-mode vertex drags bump mesh_revision every frame but
             // keep the topology: update the existing vertex buffers in
             // place instead of recreating mesh + material + outline.
@@ -525,6 +531,7 @@ impl SceneRender {
                 cached.cpu_mesh.positions = Positions::F32(positions);
                 cached.cpu_mesh.normals = Some(normals);
                 cached.mesh_revision = object.mesh_revision;
+                cached.modifier_stamp = modifier_stamp;
                 Some(())
             })()
             .is_some();
@@ -541,6 +548,7 @@ impl SceneRender {
                         primitive: object.primitive,
                         smooth: object.smooth,
                         mesh_revision: object.mesh_revision,
+                        modifier_stamp,
                         mode,
                         xray,
                         material: object.material,
@@ -711,6 +719,19 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
         Primitive::Empty { size } => {
             9u8.hash(h);
             hash_f32(h, size);
+        }
+        Primitive::Roof { kind, width, depth, height, overhang, ridge_x } => {
+            11u8.hash(h);
+            modeler_core::RoofKind::ALL
+                .iter()
+                .position(|&k| k == kind)
+                .unwrap_or(0)
+                .hash(h);
+            hash_f32(h, width);
+            hash_f32(h, depth);
+            hash_f32(h, height);
+            hash_f32(h, overhang);
+            ridge_x.hash(h);
         }
         Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } => {
             10u8.hash(h);
@@ -900,23 +921,22 @@ impl WireframeCache {
                 continue;
             }
             seen.insert(object.id);
+            let stamp = crate::modifiers::stamp(scene, object.id);
             let stale = match self.cache.get(&object.id) {
-                Some((p, s, rev, _)) => {
-                    *p != object.primitive || *s != object.smooth || *rev != object.mesh_revision
+                Some((p, s, cached_stamp, _)) => {
+                    *p != object.primitive || *s != object.smooth || *cached_stamp != stamp
                 }
                 None => true,
             };
             if stale {
-                let topo = crate::edit_mode::build_topology(&display_mesh(object));
+                let topo = crate::edit_mode::build_topology(&display_mesh(scene, object));
                 let edges: Vec<(glam::Vec3, glam::Vec3)> = topo
                     .edges
                     .iter()
                     .map(|&(a, b)| (topo.verts[a], topo.verts[b]))
                     .collect();
-                self.cache.insert(
-                    object.id,
-                    (object.primitive, object.smooth, object.mesh_revision, edges),
-                );
+                self.cache
+                    .insert(object.id, (object.primitive, object.smooth, stamp, edges));
             }
             let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
             let tier = if selection.active() == Some(object.id) {
@@ -990,14 +1010,24 @@ mod tests {
         let selected = key_of(&scene, a, OutlineTier::Selected, ShadeMode::Shaded).unwrap();
         assert_ne!(unselected.1, selected.1, "outlines are per group");
 
-        scene.object_mut(a).unwrap().subdivision = 2;
+        crate::modifiers::set_subdivision(&mut scene, a, 2);
         let subdivided = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
-        assert_ne!(unselected.1, subdivided.1);
+        assert_ne!(unselected.1, subdivided.1, "subdivision levels split groups");
 
-        scene.object_mut(a).unwrap().subdivision = 0;
+        crate::modifiers::set_subdivision(&mut scene, a, 0);
         scene.object_mut(a).unwrap().smooth = true;
         let smooth = key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).unwrap();
         assert_ne!(unselected.1, smooth.1);
+
+        // a boolean modifier makes the mesh depend on another object: solo
+        let tool = scene.add_object(Primitive::Cube { size: 0.5 }, Transform::default());
+        scene.object_mut(a).unwrap().modifiers.push(modeler_core::Modifier::new(
+            modeler_core::ModifierKind::Boolean {
+                op: modeler_core::BooleanOp::Subtract,
+                object: tool,
+            },
+        ));
+        assert!(key_of(&scene, a, OutlineTier::None, ShadeMode::Shaded).is_none());
     }
 
     #[test]

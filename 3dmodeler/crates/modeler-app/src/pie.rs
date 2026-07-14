@@ -25,6 +25,7 @@ pub enum PieIcon {
     Plane,
     Wall,
     Floor,
+    Roof,
     Empty,
     LightPoint,
     LightSun,
@@ -52,6 +53,7 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Torus { .. } => PieIcon::Torus,
         P::Wall { .. } => PieIcon::Wall,
         P::Floor { .. } => PieIcon::Floor,
+        P::Roof { .. } => PieIcon::Roof,
         P::Empty { .. } => PieIcon::Empty,
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
@@ -374,6 +376,17 @@ fn draw_icon(
             }
             painter.line_segment([top[0] + d, top[3] + d], stroke);
             painter.line_segment([top[3] + d, top[2] + d], stroke);
+        }
+        // Roof: gable end — a house silhouette with a pitched top
+        PieIcon::Roof => {
+            let apex = p(0.0, -0.95);
+            let (l, r) = (p(-1.0, 0.1), p(1.0, 0.1));
+            painter.line_segment([l, apex], stroke);
+            painter.line_segment([apex, r], stroke);
+            // eaves stick out past the walls
+            painter.line_segment([p(-0.65, 0.1), p(-0.65, 0.9)], stroke);
+            painter.line_segment([p(0.65, 0.1), p(0.65, 0.9)], stroke);
+            painter.line_segment([p(-0.65, 0.9), p(0.65, 0.9)], stroke);
         }
         // Empty: axes star (three lines through the origin)
         PieIcon::Empty => {

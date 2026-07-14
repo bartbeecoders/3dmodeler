@@ -20,11 +20,14 @@ enum PieItem {
     Primitive(Primitive),
     Wall,
     Floor,
+    /// Gable by default; the other shapes live in the Add menu and the
+    /// sidebar Type selector.
+    Roof,
 }
 
 /// Slot order around the wheel, starting north and going clockwise.
 /// Cube sits on top — it is used the most.
-fn pie_items() -> [(PieItem, &'static str); 11] {
+fn pie_items() -> [(PieItem, &'static str); 12] {
     // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
     let c = Primitive::catalog();
     // point light; other kinds via the properties panel or the Add menu
@@ -39,6 +42,7 @@ fn pie_items() -> [(PieItem, &'static str); 11] {
         (PieItem::Primitive(c[0]), "Plane"),
         (PieItem::Primitive(light), "Light"),
         (PieItem::Primitive(c[7]), "Empty"),
+        (PieItem::Roof, "Roof"),
         (PieItem::Floor, "Floor"),
         (PieItem::Wall, "Wall"),
     ]
@@ -48,6 +52,7 @@ fn slot_icon(item: PieItem) -> PieIcon {
     match item {
         PieItem::Wall => PieIcon::Wall,
         PieItem::Floor => PieIcon::Floor,
+        PieItem::Roof => PieIcon::Roof,
         PieItem::Primitive(primitive) => pie::primitive_icon(&primitive),
     }
 }
@@ -163,6 +168,7 @@ impl AddMenu {
         scene: &mut Scene,
         selection: &mut crate::selection::Selection,
         wall_tool: &mut crate::wall_tool::WallTool,
+        roof_tool: &mut crate::roof_tool::RoofTool,
         settings: &crate::settings::Settings,
     ) -> Option<String> {
         if !self.open {
@@ -189,6 +195,13 @@ impl AddMenu {
                     PieItem::Wall => wall_tool.start(settings),
                     PieItem::Floor => {
                         status = Some(crate::object_ops::add_floor(scene, selection));
+                    }
+                    PieItem::Roof => {
+                        let kind = modeler_core::RoofKind::Gable;
+                        match crate::object_ops::add_roof(scene, selection, kind) {
+                            Some(message) => status = Some(message),
+                            None => roof_tool.start(kind),
+                        }
                     }
                 }
             }

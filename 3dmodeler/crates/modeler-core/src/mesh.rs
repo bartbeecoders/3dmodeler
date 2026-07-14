@@ -419,6 +419,203 @@ pub fn floor_polygon(outline: &[Vec2], thickness: f32) -> MeshData {
     m
 }
 
+/// Roof solid (see `Primitive::Roof`): footprint `width` × `depth` plus
+/// `overhang` on all four sides, centered on the origin in XY, base plane at
+/// z = 0, rising to z = `height`. Every kind is a watertight solid with a
+/// flat bottom cap, so the roof sits on the wall tops as a closed lid. For
+/// the oriented kinds the ridge (shed: the high eave) runs along X when
+/// `ridge_x`, else Y.
+pub fn roof(
+    kind: crate::RoofKind,
+    width: f32,
+    depth: f32,
+    height: f32,
+    overhang: f32,
+    ridge_x: bool,
+) -> MeshData {
+    use crate::RoofKind;
+    let w = (width + 2.0 * overhang.max(0.0)).max(0.02);
+    let d = (depth + 2.0 * overhang.max(0.0)).max(0.02);
+    let h = height.max(0.02);
+    // the oriented kinds are generated with the ridge along X in a
+    // length × span frame, then rotated into place when it runs along Y
+    let (len, span) = if ridge_x { (w, d) } else { (d, w) };
+    let mut m = match kind {
+        RoofKind::Flat => {
+            return box_mesh(
+                Vec3::new(0.5 * w, 0.5 * d, 0.5 * h),
+                Vec3::new(0.0, 0.0, 0.5 * h),
+            )
+        }
+        RoofKind::Point => return roof_point(w, d, h),
+        RoofKind::Mansard => return roof_mansard(w, d, h),
+        RoofKind::Shed => roof_shed(len, span, h),
+        RoofKind::Gable => roof_gable(len, span, h),
+        RoofKind::Hip => roof_hip(len, span, h),
+        RoofKind::Gambrel => roof_gambrel(len, span, h),
+    };
+    if !ridge_x {
+        // rotate +90° around Z: (x, y) → (-y, x)
+        for p in &mut m.positions {
+            *p = Vec3::new(-p.y, p.x, p.z);
+        }
+        for n in &mut m.normals {
+            *n = Vec3::new(-n.y, n.x, n.z);
+        }
+    }
+    m
+}
+
+/// One flat convex polygon face with per-face vertices; `pts` counter-
+/// clockwise seen from outside (the normal comes from the winding).
+fn poly_face(m: &mut MeshData, pts: &[Vec3]) {
+    let mut n = Vec3::ZERO;
+    for i in 0..pts.len() {
+        n += pts[i].cross(pts[(i + 1) % pts.len()]); // 2× area vector
+    }
+    let n = n.normalize_or_zero();
+    let base = m.positions.len() as u32;
+    for p in pts {
+        m.positions.push(*p);
+        m.normals.push(n);
+    }
+    for i in 1..pts.len() as u32 - 1 {
+        m.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+    }
+}
+
+/// The four base corners (CCW from above) and the bottom cap they close.
+fn roof_base(m: &mut MeshData, hx: f32, hy: f32) -> [Vec3; 4] {
+    let corners = [
+        Vec3::new(-hx, -hy, 0.0),
+        Vec3::new(hx, -hy, 0.0),
+        Vec3::new(hx, hy, 0.0),
+        Vec3::new(-hx, hy, 0.0),
+    ];
+    poly_face(m, &[corners[0], corners[3], corners[2], corners[1]]);
+    corners
+}
+
+/// Pyramid: four slopes from the eaves to an apex over the center.
+fn roof_point(w: f32, d: f32, h: f32) -> MeshData {
+    let mut m = MeshData::default();
+    let base = roof_base(&mut m, 0.5 * w, 0.5 * d);
+    let apex = Vec3::new(0.0, 0.0, h);
+    for i in 0..4 {
+        poly_face(&mut m, &[base[i], base[(i + 1) % 4], apex]);
+    }
+    m
+}
+
+/// Wedge: eave at y = -span/2 on the base plane, high eave at y = +span/2.
+fn roof_shed(len: f32, span: f32, h: f32) -> MeshData {
+    let (hl, hs) = (0.5 * len, 0.5 * span);
+    let mut m = MeshData::default();
+    let [a, b, c, e] = roof_base(&mut m, hl, hs);
+    let f = Vec3::new(hl, hs, h); // high eave corners
+    let g = Vec3::new(-hl, hs, h);
+    poly_face(&mut m, &[a, b, f, g]); // the slope
+    poly_face(&mut m, &[c, e, g, f]); // vertical high side
+    poly_face(&mut m, &[b, c, f]); // triangular ends
+    poly_face(&mut m, &[e, a, g]);
+    m
+}
+
+/// Triangular prism: two slopes to a full-length ridge, vertical gable ends.
+fn roof_gable(len: f32, span: f32, h: f32) -> MeshData {
+    let (hl, hs) = (0.5 * len, 0.5 * span);
+    let mut m = MeshData::default();
+    let [a, b, c, e] = roof_base(&mut m, hl, hs);
+    let r0 = Vec3::new(-hl, 0.0, h); // ridge ends
+    let r1 = Vec3::new(hl, 0.0, h);
+    poly_face(&mut m, &[a, b, r1, r0]); // slopes
+    poly_face(&mut m, &[c, e, r0, r1]);
+    poly_face(&mut m, &[b, c, r1]); // gable ends
+    poly_face(&mut m, &[e, a, r0]);
+    m
+}
+
+/// Hip: the ridge is pulled in from each end by the half-span so all four
+/// slopes share the pitch; short footprints degenerate into a pyramid.
+fn roof_hip(len: f32, span: f32, h: f32) -> MeshData {
+    let (hl, hs) = (0.5 * len, 0.5 * span);
+    let rx = hl - hs;
+    if rx <= 1e-5 {
+        return roof_point(len, span, h);
+    }
+    let mut m = MeshData::default();
+    let [a, b, c, e] = roof_base(&mut m, hl, hs);
+    let r0 = Vec3::new(-rx, 0.0, h);
+    let r1 = Vec3::new(rx, 0.0, h);
+    poly_face(&mut m, &[a, b, r1, r0]); // long slopes (trapezoids)
+    poly_face(&mut m, &[c, e, r0, r1]);
+    poly_face(&mut m, &[b, c, r1]); // hip ends
+    poly_face(&mut m, &[e, a, r0]);
+    m
+}
+
+/// Gambrel: prism over a pentagon section — steep lower slopes breaking
+/// into shallow upper ones — with vertical gable-end caps.
+fn roof_gambrel(len: f32, span: f32, h: f32) -> MeshData {
+    let (hl, hs) = (0.5 * len, 0.5 * span);
+    let (by, bz) = (0.5 * hs, 0.75 * h); // the pitch break
+    let v = Vec3::new;
+    let mut m = MeshData::default();
+    roof_base(&mut m, hl, hs);
+    // slope quads, walking the section from eave to eave over the ridge
+    for (y0, z0, y1, z1) in [
+        (-hs, 0.0, -by, bz),
+        (-by, bz, 0.0, h),
+        (0.0, h, by, bz),
+        (by, bz, hs, 0.0),
+    ] {
+        poly_face(
+            &mut m,
+            &[v(-hl, y0, z0), v(hl, y0, z0), v(hl, y1, z1), v(-hl, y1, z1)],
+        );
+    }
+    // pentagon end caps (this order faces -X; reversed for +X)
+    let cap = |x: f32| {
+        [v(x, -hs, 0.0), v(x, -by, bz), v(x, 0.0, h), v(x, by, bz), v(x, hs, 0.0)]
+    };
+    poly_face(&mut m, &cap(-hl));
+    let mut positive = cap(hl);
+    positive.reverse();
+    poly_face(&mut m, &positive);
+    m
+}
+
+/// Mansard: two stacked truncated pyramids — steep below the pitch break,
+/// shallow above it — closed by a small flat top.
+fn roof_mansard(w: f32, d: f32, h: f32) -> MeshData {
+    let (hx, hy) = (0.5 * w, 0.5 * d);
+    let short = hx.min(hy);
+    let ring = |inset: f32, z: f32| {
+        [
+            Vec3::new(-(hx - inset), -(hy - inset), z),
+            Vec3::new(hx - inset, -(hy - inset), z),
+            Vec3::new(hx - inset, hy - inset, z),
+            Vec3::new(-(hx - inset), hy - inset, z),
+        ]
+    };
+    let mut m = MeshData::default();
+    roof_base(&mut m, hx, hy);
+    let rings = [
+        ring(0.0, 0.0),
+        ring(0.3 * short, 0.75 * h), // steep lower stage
+        ring(0.6 * short, h),        // shallow upper stage
+    ];
+    for stage in rings.windows(2) {
+        let (lo, hi) = (stage[0], stage[1]);
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            poly_face(&mut m, &[lo[i], lo[j], hi[j], hi[i]]);
+        }
+    }
+    poly_face(&mut m, &rings[2]); // flat top
+    m
+}
+
 /// Ear-clipping triangulation of a simple CCW polygon; returns index triples
 /// into `points`. Degenerate input yields a partial (possibly empty) result
 /// rather than looping forever.
@@ -728,6 +925,85 @@ mod tests {
     }
 
     #[test]
+    fn roofs_are_watertight_solids_with_the_right_extents() {
+        use crate::RoofKind;
+        for kind in RoofKind::ALL {
+            for ridge_x in [true, false] {
+                let m = roof(kind, 4.0, 3.0, 1.2, 0.3, ridge_x);
+                validate(&m);
+
+                // footprint + overhang all around, base at z = 0, top at h
+                let e = m.extents();
+                assert!((e.x - 4.6).abs() < 1e-4, "{kind:?} extents {e:?}");
+                assert!((e.y - 3.6).abs() < 1e-4, "{kind:?} extents {e:?}");
+                assert!((e.z - 1.2).abs() < 1e-4, "{kind:?} extents {e:?}");
+                let min_z = m.positions.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+                assert!(min_z.abs() < 1e-5, "{kind:?} must stand on z = 0");
+
+                // closed 2-manifold: every welded edge is walked once in
+                // each direction (consistent winding, no open boundary)
+                let key = |p: Vec3| {
+                    (
+                        (p.x * 1e4).round() as i64,
+                        (p.y * 1e4).round() as i64,
+                        (p.z * 1e4).round() as i64,
+                    )
+                };
+                let mut ids: HashMap<(i64, i64, i64), usize> = HashMap::new();
+                let mut edges: HashMap<(usize, usize), i32> = HashMap::new();
+                for tri in m.indices.chunks_exact(3) {
+                    let welded: Vec<usize> = tri
+                        .iter()
+                        .map(|&i| {
+                            let next = ids.len();
+                            *ids.entry(key(m.positions[i as usize])).or_insert(next)
+                        })
+                        .collect();
+                    for i in 0..3 {
+                        let (a, b) = (welded[i], welded[(i + 1) % 3]);
+                        assert_ne!(a, b, "{kind:?} has a degenerate edge");
+                        let sign = if a < b { 1 } else { -1 };
+                        *edges.entry((a.min(b), a.max(b))).or_insert(0) += sign;
+                    }
+                }
+                for ((a, b), count) in edges {
+                    assert_eq!(count, 0, "{kind:?} edge {a}-{b} is unbalanced");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn roof_ridge_follows_the_requested_axis() {
+        // gable, 4 × 3, no overhang: the ridge (z = h) spans the full length
+        let ridge_of = |m: &MeshData| -> Vec<Vec3> {
+            m.positions.iter().copied().filter(|p| (p.z - 1.0).abs() < 1e-5).collect()
+        };
+        let along_x = roof(crate::RoofKind::Gable, 4.0, 3.0, 1.0, 0.0, true);
+        for p in ridge_of(&along_x) {
+            assert!(p.y.abs() < 1e-5 && p.x.abs() > 1.9, "ridge point {p:?}");
+        }
+        // ridge along Y spans the 3 m depth: endpoints at y = ±1.5
+        let along_y = roof(crate::RoofKind::Gable, 4.0, 3.0, 1.0, 0.0, false);
+        for p in ridge_of(&along_y) {
+            assert!(p.x.abs() < 1e-5 && (p.y.abs() - 1.5).abs() < 1e-4, "ridge point {p:?}");
+        }
+        // hip with ridge along X on a 6 × 2 footprint: pulled in by the
+        // half-span so the end slopes share the side pitch
+        let hip = roof(crate::RoofKind::Hip, 6.0, 2.0, 1.0, 0.0, true);
+        let ridge = ridge_of(&hip);
+        assert!(!ridge.is_empty());
+        for p in &ridge {
+            assert!(p.y.abs() < 1e-5 && (p.x.abs() - 2.0).abs() < 1e-4, "{p:?}");
+        }
+        // a square hip degenerates into a pyramid (single apex)
+        let pyramid = roof(crate::RoofKind::Hip, 2.0, 2.0, 1.0, 0.0, true);
+        for p in ridge_of(&pyramid) {
+            assert!(p.x.abs() < 1e-5 && p.y.abs() < 1e-5, "{p:?}");
+        }
+    }
+
+    #[test]
     fn wall_cutouts_open_real_holes() {
         // a point ray through the middle of the door opening must not cross
         // any triangle; through solid wall it must cross front and back
@@ -807,6 +1083,10 @@ mod tests {
             torus(24, 8, 1.0, 0.25),
             wall(4.0, 2.5, 0.2, &[]),
             wall(4.0, 2.5, 0.2, &[WallCutout::door(1.0, 4.0, 2.5), WallCutout::window(3.0, 1.5, 4.0, 2.5)]),
+            roof(crate::RoofKind::Gable, 4.0, 3.0, 1.2, 0.3, false),
+            roof(crate::RoofKind::Hip, 4.0, 3.0, 1.2, 0.3, true),
+            roof(crate::RoofKind::Gambrel, 4.0, 3.0, 1.5, 0.3, false),
+            roof(crate::RoofKind::Mansard, 4.0, 3.0, 1.5, 0.3, true),
         ] {
             for tri in mesh.indices.chunks_exact(3) {
                 let a = mesh.positions[tri[0] as usize];

@@ -171,6 +171,70 @@ pub fn catalog() -> Vec<ToolSpec> {
             &[],
         ),
         tool(
+            "add_roof",
+            "Add a roof on top of the given walls (default: every wall): it covers their bounds and sits on the tallest top edge.",
+            json!({
+                "kind": {"type": "string", "enum": ["point", "gable", "hip", "flat", "shed", "gambrel", "mansard"], "description": "roof shape (default gable)"},
+                "walls": {"type": "array", "items": {"type": ["string", "integer"]}},
+                "height": {"type": "number", "description": "rise in meters (default from the footprint)"},
+                "overhang": {"type": "number", "description": "eave overhang in meters (default 0.3)"}
+            }),
+            &[],
+        ),
+        tool(
+            "boolean_objects",
+            "Mesh boolean (CSG), applied immediately: union merges the tool objects into the target, subtract carves them out, intersect keeps the shared volume. The tools are consumed. For a non-destructive boolean the user can preview first, use add_modifier.",
+            json!({
+                "op": {"type": "string", "enum": ["union", "subtract", "intersect"]},
+                "target": object_ref("receives the result"),
+                "tools": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "objects merged into / carved out of the target"}
+            }),
+            &["op", "target", "tools"],
+        ),
+        tool(
+            "add_modifier",
+            "Add a non-destructive modifier (live viewport preview; bake with apply_modifiers). subdivision smooths (levels 1-4); boolean combines with a tool object that stays movable (hidden) while previewing.",
+            json!({
+                "object": object_ref("gets the modifier"),
+                "type": {"type": "string", "enum": ["subdivision", "boolean"]},
+                "levels": {"type": "integer", "description": "subdivision only: 1-4 (default 1)"},
+                "op": {"type": "string", "enum": ["union", "subtract", "intersect"], "description": "boolean only: required"},
+                "tool": object_ref("boolean only (required): the other object")
+            }),
+            &["object", "type"],
+        ),
+        tool(
+            "update_modifier",
+            "Change a stack entry by index: enabled (preview on/off), subdivision levels, boolean op/tool.",
+            json!({
+                "object": object_ref("owner of the modifier"),
+                "index": {"type": "integer", "description": "0-based stack position (see get_scene modifiers)"},
+                "enabled": {"type": "boolean"},
+                "levels": {"type": "integer"},
+                "op": {"type": "string", "enum": ["union", "subtract", "intersect"]},
+                "tool": object_ref("boolean only: the other object")
+            }),
+            &["object", "index"],
+        ),
+        tool(
+            "remove_modifier",
+            "Remove a modifier by index, discarding its effect (a boolean's hidden tool becomes visible again).",
+            json!({
+                "object": object_ref("owner of the modifier"),
+                "index": {"type": "integer"}
+            }),
+            &["object", "index"],
+        ),
+        tool(
+            "apply_modifiers",
+            "Bake the previewed modifier stack into the mesh (first `count` entries, default all); consumed boolean tools are removed.",
+            json!({
+                "object": object_ref("owner of the stack"),
+                "count": {"type": "integer", "description": "apply only the first N (default all)"}
+            }),
+            &["object"],
+        ),
+        tool(
             "break_into_bricks",
             "Shatter an object into physics bricks (for demolition scenes).",
             json!({
@@ -408,7 +472,10 @@ mod tests {
         let mcp_commands = [
             "get_scene", "new_scene", "add_object", "update_object", "delete_object",
             "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
-            "break_into_bricks", "add_measurement", "simulate", "set_view", "screenshot",
+            "add_roof", "break_into_bricks", "boolean_objects", "add_modifier",
+            "update_modifier", "remove_modifier", "apply_modifiers", "add_measurement",
+            "simulate", "set_view",
+            "screenshot",
             "add_reference_image", "update_reference_image", "delete_reference_image",
             "calibrate_reference_image", "add_image_marker", "update_image_marker",
             "delete_image_marker", "get_library", "create_library_object",

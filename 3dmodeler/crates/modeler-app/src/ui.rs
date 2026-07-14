@@ -194,6 +194,7 @@ impl UiState {
         edit_point: Option<(ObjectId, Vec3)>,
         edit: Option<&mut EditMode>,
         wall_tool: &mut crate::wall_tool::WallTool,
+        roof_tool: &mut crate::roof_tool::RoofTool,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -251,7 +252,7 @@ impl UiState {
         }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
-            wall_tool, snap_to_grid, shade_mode, lighting_mode, xray,
+            wall_tool, roof_tool, snap_to_grid, shade_mode, lighting_mode, xray,
         );
         let top_offset = menu_offset
             + self.toolbar(
@@ -321,6 +322,7 @@ impl UiState {
         measure: &mut MeasureTool,
         settings: &mut Settings,
         wall_tool: &mut crate::wall_tool::WallTool,
+        roof_tool: &mut crate::roof_tool::RoofTool,
         snap_to_grid: &mut bool,
         shade_mode: &mut ShadeMode,
         lighting_mode: &mut LightingMode,
@@ -382,8 +384,8 @@ impl UiState {
                                     edit_menu(ui, scene, undo, &mut self.settings_window)
                                 }
                                 Menu::Add => add_menu_items(
-                                    ui, scene, selection, measure, wall_tool, settings,
-                                    &mut self.ref_setup, &mut self.status_message,
+                                    ui, scene, selection, measure, wall_tool, roof_tool,
+                                    settings, &mut self.ref_setup, &mut self.status_message,
                                 ),
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
@@ -691,7 +693,10 @@ impl UiState {
 
         ui.separator();
         if ui.button("Export .obj").clicked() {
-            let obj = modeler_core::export_obj(scene);
+            // export what the viewport shows: modifier stacks evaluated
+            let obj = modeler_core::export_obj_with(scene, |s, o| {
+                crate::modifiers::evaluate(s, o.id)
+            });
             self.status_message =
                 Some(io::export_file("export.obj", &obj).unwrap_or_else(|e| e));
             close = true;
@@ -1890,6 +1895,7 @@ fn add_menu_items(
     selection: &mut Selection,
     measure: &mut MeasureTool,
     wall_tool: &mut crate::wall_tool::WallTool,
+    roof_tool: &mut crate::roof_tool::RoofTool,
     settings: &Settings,
     ref_setup: &mut RefSetupDialog,
     status: &mut Option<String>,
@@ -1919,6 +1925,25 @@ fn add_menu_items(
     {
         *status = Some(crate::object_ops::add_floor(scene, selection));
         return true;
+    }
+    ui.separator();
+    // roofs: one entry per shape, over the selected walls or hand-drawn
+    for kind in modeler_core::RoofKind::ALL {
+        let label = format!("{} Roof", kind.label());
+        if crate::pie::icon_menu_button(ui, &crate::pie::PieIcon::Roof, &label)
+            .on_hover_text(
+                "Put this roof on top of the selected walls; with no wall \
+                 selected, draw the roof's footprint on the floor instead \
+                 (two clicks: corner, opposite corner)",
+            )
+            .clicked()
+        {
+            match crate::object_ops::add_roof(scene, selection, kind) {
+                Some(message) => *status = Some(message),
+                None => roof_tool.start(kind),
+            }
+            return true;
+        }
     }
     ui.separator();
     // lights (Blender's Add ▸ Light)
@@ -2025,6 +2050,40 @@ fn object_menu(
     {
         *status = Some(object_ops::apply_scale(scene, selection));
         close = true;
+    }
+    ui.separator();
+    let can_boolean = selection.selected().len() >= 2 && selection.active().is_some();
+    for (op, tip) in [
+        (
+            modeler_core::BooleanOp::Union,
+            "Add a boolean modifier merging the other selected objects INTO \
+             the active one — live preview (tools hidden but movable); Apply \
+             it from the sidebar to bake",
+        ),
+        (
+            modeler_core::BooleanOp::Subtract,
+            "Add a boolean modifier carving the other selected objects OUT \
+             of the active one — live preview (tools hidden but movable); \
+             Apply it from the sidebar to bake",
+        ),
+        (
+            modeler_core::BooleanOp::Intersect,
+            "Add a boolean modifier keeping only the shared volume — live \
+             preview (tools hidden but movable); Apply it from the sidebar \
+             to bake",
+        ),
+    ] {
+        if ui
+            .add_enabled(
+                can_boolean,
+                egui::Button::new(format!("Boolean {}", op.label())),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        {
+            *status = Some(object_ops::boolean_selected(scene, selection, op));
+            close = true;
+        }
     }
     ui.separator();
     if ui
@@ -2911,22 +2970,154 @@ fn properties(
         }
     }
 
-    // subdivision surface (Blender's subsurf modifier): render-time
-    // Catmull-Clark on the base mesh; edit mode keeps editing the cage
-    let mut subdivision_change = None;
+    // modifier stack (Blender-style): the viewport previews the enabled
+    // stack live — nothing is baked until Apply; edit mode and physics
+    // keep using the base mesh (the cage)
+    let mut modifier_edits: Vec<(usize, modeler_core::Modifier)> = Vec::new();
+    let mut modifier_add: Option<modeler_core::ModifierKind> = None;
+    let mut modifier_remove: Option<usize> = None;
+    let mut modifier_apply: Option<usize> = None;
     if !primitive.is_light() && !matches!(primitive, Primitive::Empty { .. }) {
-        egui::CollapsingHeader::new("Subdivision Surface")
-            .default_open(object.subdivision > 0)
+        egui::CollapsingHeader::new("Modifiers")
+            .default_open(!object.modifiers.is_empty())
             .show(ui, |ui| {
-                let mut levels = object.subdivision as u32;
-                if int_row(ui, "Levels", &mut levels, 0..=4) {
-                    subdivision_change = Some(levels as u8);
+                for (index, modifier) in object.modifiers.iter().enumerate() {
+                    let mut edited = *modifier;
+                    let mut row_changed = false;
+                    ui.horizontal(|ui| {
+                        row_changed |= ui
+                            .checkbox(&mut edited.enabled, "")
+                            .on_hover_text(
+                                "Preview this modifier in the viewport and \
+                                 include it when applying",
+                            )
+                            .changed();
+                        ui.label(egui::RichText::new(edited.kind.label()).strong());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button("✖")
+                                    .on_hover_text(
+                                        "Remove this modifier (a boolean's hidden \
+                                         tool object is shown again)",
+                                    )
+                                    .clicked()
+                                {
+                                    modifier_remove = Some(index);
+                                }
+                                if ui
+                                    .small_button("Apply")
+                                    .on_hover_text(
+                                        "Bake this modifier and everything above it \
+                                         into the mesh. Boolean tool objects are \
+                                         removed once nothing references them",
+                                    )
+                                    .clicked()
+                                {
+                                    modifier_apply = Some(index);
+                                }
+                            },
+                        );
+                    });
+                    ui.indent(("modifier", index), |ui| match &mut edited.kind {
+                        modeler_core::ModifierKind::Subdivision { levels } => {
+                            let mut value = *levels as u32;
+                            if int_row(ui, "Levels", &mut value, 1..=4) {
+                                *levels = value as u8;
+                                row_changed = true;
+                            }
+                        }
+                        modeler_core::ModifierKind::Boolean { op, object: tool } => {
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt(("modifier-op", index))
+                                    .selected_text(op.label())
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        for candidate in modeler_core::BooleanOp::ALL {
+                                            if ui
+                                                .selectable_label(
+                                                    *op == candidate,
+                                                    candidate.label(),
+                                                )
+                                                .clicked()
+                                                && *op != candidate
+                                            {
+                                                *op = candidate;
+                                                row_changed = true;
+                                            }
+                                        }
+                                    });
+                                let current = scene
+                                    .object(*tool)
+                                    .map(|o| o.name.clone())
+                                    .unwrap_or_else(|| "pick object…".to_string());
+                                egui::ComboBox::from_id_salt(("modifier-tool", index))
+                                    .selected_text(current)
+                                    .show_ui(ui, |ui| {
+                                        for candidate in scene.objects() {
+                                            if candidate.id == active_id
+                                                || candidate.primitive.is_light()
+                                                || matches!(
+                                                    candidate.primitive,
+                                                    Primitive::Empty { .. }
+                                                )
+                                            {
+                                                continue;
+                                            }
+                                            if ui
+                                                .selectable_label(
+                                                    *tool == candidate.id,
+                                                    &candidate.name,
+                                                )
+                                                .clicked()
+                                                && *tool != candidate.id
+                                            {
+                                                *tool = candidate.id;
+                                                row_changed = true;
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                    });
+                    if row_changed {
+                        modifier_edits.push((index, edited));
+                    }
                 }
-                if object.subdivision > 0 {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("+ Subdivision")
+                        .on_hover_text(
+                            "Catmull-Clark subdivision surface (Blender's subsurf): \
+                             smooths the viewport mesh, live",
+                        )
+                        .clicked()
+                    {
+                        modifier_add = Some(modeler_core::ModifierKind::Subdivision {
+                            levels: 1,
+                        });
+                    }
+                    if ui
+                        .button("+ Boolean")
+                        .on_hover_text(
+                            "Union / subtract / intersect another object, previewed \
+                             live — pick the tool object in the dropdown, or use \
+                             Object ▸ Boolean with two objects selected",
+                        )
+                        .clicked()
+                    {
+                        modifier_add = Some(modeler_core::ModifierKind::Boolean {
+                            op: modeler_core::BooleanOp::Subtract,
+                            object: ObjectId(0),
+                        });
+                    }
+                });
+                if !object.modifiers.is_empty() {
                     ui.label(
                         egui::RichText::new(
-                            "smooths the viewport mesh; editing and physics \
-                             use the base shape",
+                            "live preview — editing and physics use the base \
+                             shape until applied",
                         )
                         .weak()
                         .size(11.0),
@@ -3018,11 +3209,28 @@ fn properties(
             object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
-    if let Some(levels) = subdivision_change {
+    let mut status = None;
+    if !modifier_edits.is_empty() || modifier_add.is_some() {
         if let Some(object) = scene.object_mut(active_id) {
-            object.subdivision = levels;
-            object.mesh_revision += 1;
+            for (index, modifier) in modifier_edits {
+                if index < object.modifiers.len() {
+                    object.modifiers[index] = modifier;
+                }
+            }
+            if let Some(kind) = modifier_add {
+                object.modifiers.push(modeler_core::Modifier::new(kind));
+            }
         }
+    }
+    if let Some(index) = modifier_remove {
+        status = Some(
+            crate::modifiers::remove(scene, active_id, index).unwrap_or_else(|e| e),
+        );
+    }
+    if let Some(index) = modifier_apply {
+        status = Some(
+            crate::modifiers::apply(scene, active_id, index + 1).unwrap_or_else(|e| e),
+        );
     }
     if revert_mesh {
         if let Some(object) = scene.object_mut(active_id) {
@@ -3033,7 +3241,7 @@ fn properties(
     if break_bricks {
         *brick_dialog = Some(object_ops::DEFAULT_BRICKS as i32);
     }
-    None
+    status
 }
 
 /// Toolbar toggle for the edit-mode element select, with a painted
@@ -3176,6 +3384,41 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive, shaped: bool) 
                 changed |= float_row(ui, "Depth", depth, 0.02);
             }
             changed |= float_row(ui, "Thickness", thickness, 0.005);
+        }
+        Primitive::Roof { kind, width, depth, height, overhang, ridge_x } => {
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                egui::ComboBox::from_id_salt("roof-kind")
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in modeler_core::RoofKind::ALL {
+                            if ui.selectable_label(*kind == k, k.label()).clicked()
+                                && *kind != k
+                            {
+                                *kind = k;
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            changed |= float_row(ui, "Width", width, 0.02);
+            changed |= float_row(ui, "Depth", depth, 0.02);
+            changed |= float_row(ui, "Height", height, 0.02);
+            ui.horizontal(|ui| {
+                ui.label("Overhang");
+                changed |= ui
+                    .add(egui::DragValue::new(overhang).speed(0.01).range(0.0..=10.0))
+                    .changed();
+            });
+            if kind.oriented() {
+                changed |= ui
+                    .checkbox(ridge_x, "Ridge along X")
+                    .on_hover_text(
+                        "The ridge (shed: the high eave) runs along the local \
+                         X axis instead of Y",
+                    )
+                    .changed();
+            }
         }
         Primitive::Empty { size } => {
             changed |= float_row(ui, "Size", size, 0.02);

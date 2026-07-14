@@ -219,6 +219,14 @@ pub struct RefSetupDialog {
     /// Tray image armed by clicking (click a slot to assign it) — the
     /// keyboard/touchpad fallback for drag-and-drop.
     selected: Option<usize>,
+    /// Full-page preview overlay: which tray image is being inspected.
+    preview: Option<usize>,
+    /// Large decoded texture for the preview; only the current one is kept
+    /// (thumbnails stay in `textures`).
+    preview_texture: Option<(usize, egui::TextureHandle)>,
+    /// Preview zoom, 1.0 = fitted to the window.
+    preview_zoom: f32,
+    preview_pan: egui::Vec2,
     /// Floor-plan slots shown above the ground floor.
     extra_floors: u32,
     building_width_m: f32,
@@ -237,6 +245,10 @@ impl RefSetupDialog {
             textures: Vec::new(),
             assigned: Vec::new(),
             selected: None,
+            preview: None,
+            preview_texture: None,
+            preview_zoom: 1.0,
+            preview_pan: egui::Vec2::ZERO,
             extra_floors: 1,
             building_width_m: 10.0,
             floor_height_m: 3.0,
@@ -253,6 +265,14 @@ impl RefSetupDialog {
         self.textures.clear();
         self.assigned.clear();
         self.selected = None;
+        self.preview = None;
+        self.preview_texture = None;
+    }
+
+    fn open_preview(&mut self, index: usize) {
+        self.preview = Some(index);
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
     }
 
     fn add_image(&mut self, name: String, bytes: Vec<u8>) {
@@ -306,6 +326,181 @@ impl RefSetupDialog {
         Some(texture)
     }
 
+    /// Decode tray image `index` at full resolution (long side capped to
+    /// the backend's texture limit — egui panics above it) for the preview.
+    fn preview_texture_for(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some((i, texture)) = &self.preview_texture {
+            if *i == index {
+                return Some(texture.clone());
+            }
+        }
+        let max_side = ctx.input(|i| i.max_texture_side).clamp(512, 4096) as u32;
+        let decoded = image::load_from_memory(&self.images[index].bytes).ok()?;
+        let decoded = if decoded.width().max(decoded.height()) > max_side {
+            decoded.thumbnail(max_side, max_side)
+        } else {
+            decoded
+        };
+        let rgba = decoded.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let texture = ctx.load_texture(
+            format!("ref-setup-preview-{index}"),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.preview_texture = Some((index, texture.clone()));
+        Some(texture)
+    }
+
+    /// Full-page preview: the image fitted to the whole window on a dark
+    /// backdrop. Scroll zooms around the pointer, dragging pans, ◀/▶ (or
+    /// arrow keys) flip through the set, Esc / ✖ / clicking outside closes.
+    fn preview_overlay(&mut self, ctx: &egui::Context) {
+        let Some(mut index) = self.preview else { return };
+        let count = self.images.len();
+        if index >= count {
+            self.preview = None;
+            return;
+        }
+        let (esc, prev, next) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        if esc {
+            self.preview = None;
+            return;
+        }
+        // keyboard page-flip only while no field holds focus (arrows edit text)
+        if (prev || next) && count > 1 && ctx.memory(|m| m.focused().is_none()) {
+            index = (index + if next { 1 } else { count - 1 }) % count;
+            self.open_preview(index);
+        }
+        let Some(texture) = self.preview_texture_for(ctx, index) else {
+            self.preview = None;
+            return;
+        };
+
+        let screen = ctx.content_rect();
+        let image = &self.images[index];
+        let caption = format!("{} — {}×{} px", image.name, image.px.0, image.px.1);
+        let mut zoom = self.preview_zoom;
+        let mut pan = self.preview_pan;
+        let mut close = false;
+        let mut flip: Option<usize> = None;
+
+        egui::Area::new(egui::Id::new("ref-setup-preview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let backdrop = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(217));
+
+                // fit the page in the window (minus a caption strip), then zoom
+                let tex_size = texture.size_vec2();
+                let avail = screen.size() - egui::vec2(32.0, 80.0);
+                let fit = (avail.x / tex_size.x).min(avail.y / tex_size.y);
+                let rect = egui::Rect::from_center_size(
+                    screen.center() - egui::vec2(0.0, 16.0) + pan,
+                    tex_size * fit * zoom,
+                );
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                // sense clicks too, so a sloppy drag on the page can't fall
+                // through to the backdrop and close the preview
+                let page = ui
+                    .interact(
+                        rect,
+                        egui::Id::new("ref-setup-preview-page"),
+                        egui::Sense::click_and_drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                pan += page.drag_delta();
+
+                // wheel (and pinch / Ctrl+wheel) zooms around the pointer
+                let (wheel, pinch, pointer) = ui.input(|i| {
+                    let wheel = if i.modifiers.ctrl { 0.0 } else { i.smooth_scroll_delta.y };
+                    (wheel, i.zoom_delta(), i.pointer.hover_pos())
+                });
+                let factor = pinch * (wheel * 0.002).exp();
+                if (factor - 1.0).abs() > 1e-4 {
+                    let old = zoom;
+                    zoom = (zoom * factor).clamp(1.0, 16.0);
+                    if let Some(pointer) = pointer {
+                        pan += (pointer - rect.center()) * (1.0 - zoom / old);
+                    }
+                }
+                if zoom <= 1.0 {
+                    pan = egui::Vec2::ZERO; // back at fit: re-center
+                }
+
+                if count > 1 {
+                    let mid = screen.center().y;
+                    let prev_rect = egui::Rect::from_center_size(
+                        egui::pos2(screen.min.x + 30.0, mid),
+                        egui::vec2(32.0, 48.0),
+                    );
+                    let next_rect = egui::Rect::from_center_size(
+                        egui::pos2(screen.max.x - 30.0, mid),
+                        egui::vec2(32.0, 48.0),
+                    );
+                    if ui.put(prev_rect, egui::Button::new("◀")).clicked() {
+                        flip = Some((index + count - 1) % count);
+                    }
+                    if ui.put(next_rect, egui::Button::new("▶")).clicked() {
+                        flip = Some((index + 1) % count);
+                    }
+                }
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(screen.max.x - 30.0, screen.min.y + 26.0),
+                    egui::vec2(28.0, 28.0),
+                );
+                if ui.put(close_rect, egui::Button::new("✖")).clicked() {
+                    close = true;
+                }
+
+                ui.painter().text(
+                    egui::pos2(screen.center().x, screen.max.y - 42.0),
+                    egui::Align2::CENTER_CENTER,
+                    caption,
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_gray(230),
+                );
+                ui.painter().text(
+                    egui::pos2(screen.center().x, screen.max.y - 22.0),
+                    egui::Align2::CENTER_CENTER,
+                    "scroll to zoom · drag to pan · arrow keys flip pages · Esc closes",
+                    egui::FontId::proportional(11.5),
+                    egui::Color32::from_gray(150),
+                );
+
+                if backdrop.clicked() {
+                    close = true;
+                }
+            });
+
+        self.preview_zoom = zoom;
+        self.preview_pan = pan;
+        if close {
+            self.preview = None;
+        } else if let Some(next) = flip {
+            self.open_preview(next);
+        }
+    }
+
     /// Draw the dialog; returns a status message when images were placed.
     pub fn window(
         &mut self,
@@ -339,14 +534,16 @@ impl RefSetupDialog {
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Add Images…").clicked() {
+                    if ui.button("Add Images / PDF…").clicked() {
                         ref_image::request_setup_images();
                     }
                     ui.label(
                         egui::RichText::new(
-                            "Load your drawing set — or drop image files straight from your file \
-                             manager — then drag each picture onto the view it shows (or click a \
-                             picture, then a slot).",
+                            "Load your drawing set — images or a multi-page PDF (each page \
+                             becomes a picture), or drop files straight from your file manager — \
+                             then drag each picture onto the view it shows (or click a picture, \
+                             then a slot). Leave the pages you don't need in the tray; \
+                             🔍 shows a page full-size.",
                         )
                         .weak(),
                     );
@@ -440,11 +637,16 @@ impl RefSetupDialog {
                         cancelled = true;
                     }
                 });
-                // Enter = the Place button (dialog default action)
-                if crate::ui::dialog_confirmed(ui) && !self.assigned.is_empty() {
+                // Enter = the Place button (dialog default action) — unless
+                // the full-page preview is up and owns the keyboard
+                if self.preview.is_none()
+                    && crate::ui::dialog_confirmed(ui)
+                    && !self.assigned.is_empty()
+                {
                     accepted = true;
                 }
             });
+        self.preview_overlay(ctx);
 
         let mut status = None;
         if accepted {
@@ -514,6 +716,19 @@ impl RefSetupDialog {
                 if click.clicked() {
                     self.selected = if armed { None } else { Some(index) };
                 }
+                // magnifier in the corner, placed AFTER the click region so
+                // it sits on top and keeps its own clicks
+                let zoom_rect = egui::Rect::from_min_size(
+                    response.rect.right_top() + egui::vec2(-26.0, 5.0),
+                    egui::vec2(20.0, 20.0),
+                );
+                if ui
+                    .put(zoom_rect, egui::Button::new("🔍").small())
+                    .on_hover_text("View full page")
+                    .clicked()
+                {
+                    self.open_preview(index);
+                }
             }
         });
     }
@@ -524,6 +739,7 @@ impl RefSetupDialog {
         let texture = assigned.and_then(|i| self.texture_for(ctx, i));
         let frame = egui::Frame::group(ui.style()).inner_margin(4.0);
         let mut clear = false;
+        let mut zoom = false;
         let (zone, payload) = ui.dnd_drop_zone::<DragImage, ()>(frame, |ui| {
             ui.set_min_size(SLOT_SIZE);
             ui.set_max_width(SLOT_SIZE.x);
@@ -540,6 +756,9 @@ impl RefSetupDialog {
                             ui.label(
                                 egui::RichText::new(&self.images[index].name).size(10.0).weak(),
                             );
+                            if ui.small_button("🔍").on_hover_text("View full page").clicked() {
+                                zoom = true;
+                            }
                             if ui.small_button("✖").on_hover_text("Clear this slot").clicked() {
                                 clear = true;
                             }
@@ -554,11 +773,24 @@ impl RefSetupDialog {
             });
         });
         let zone = zone.response.on_hover_text(slot.hover());
+        // the drop-zone response only senses hover, so clicks need their own
+        // interact region — added only while it cannot swallow the ✖/🔍
+        // buttons' clicks (i.e. the slot is empty or a tray image is armed,
+        // in which case the click means "assign here")
+        let clicked = (assigned.is_none() || self.selected.is_some())
+            && ui
+                .interact(zone.rect, egui::Id::new(("ref-setup-slot-click", slot.label())), egui::Sense::click())
+                .clicked();
         if let Some(dropped) = payload {
             self.assign(slot, dropped.0);
-        } else if zone.clicked() {
+        } else if clicked {
             if let Some(index) = self.selected {
                 self.assign(slot, index);
+            }
+        }
+        if zoom {
+            if let Some(index) = assigned {
+                self.open_preview(index);
             }
         }
         if clear {

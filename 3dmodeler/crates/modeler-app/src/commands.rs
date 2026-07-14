@@ -52,11 +52,37 @@ fn vec3_from(value: &Value) -> Option<Vec3> {
 fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
     let (rx, ry, rz) = object.transform.rotation.to_euler(EulerRot::XYZ);
     let world = scene.world_transform(object.id);
-    // edited meshes (edit mode, Apply Scale) replace the primitive's shape
-    let dims = match &object.edited_mesh {
-        Some(mesh) => mesh.extents() * world.scale.abs(),
-        None => object.primitive.dimensions() * world.scale.abs(),
+    // dimensions of what the viewport shows: enabled modifiers evaluated;
+    // else the edited mesh (edit mode, Apply) or the primitive's shape
+    let dims = if object.has_enabled_modifiers() {
+        crate::modifiers::evaluate(scene, object.id).extents() * world.scale.abs()
+    } else {
+        match &object.edited_mesh {
+            Some(mesh) => mesh.extents() * world.scale.abs(),
+            None => object.primitive.dimensions() * world.scale.abs(),
+        }
     };
+    let modifiers: Vec<Value> = object
+        .modifiers
+        .iter()
+        .enumerate()
+        .map(|(index, m)| match m.kind {
+            modeler_core::ModifierKind::Subdivision { levels } => json!({
+                "index": index,
+                "type": "subdivision",
+                "levels": levels,
+                "enabled": m.enabled,
+            }),
+            modeler_core::ModifierKind::Boolean { op, object: tool } => json!({
+                "index": index,
+                "type": "boolean",
+                "op": op.label().to_ascii_lowercase(),
+                "object": tool.0,
+                "object_name": scene.object(tool).map(|o| o.name.clone()),
+                "enabled": m.enabled,
+            }),
+        })
+        .collect();
     let mut json = json!({
         "id": object.id.0,
         "name": object.name,
@@ -71,7 +97,8 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "group": object.group,
         "visible": object.visible,
         "smooth": object.smooth,
-        "subdivision": object.subdivision,
+        "subdivision": object.subdivision_only_levels().unwrap_or(0),
+        "modifiers": modifiers,
         "dynamic": object.dynamic,
         "density": object.density,
         "color": object.material.base_color,
@@ -117,6 +144,14 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
         "torus" => Some(catalog[6]),
         "wall" => Some(Primitive::Wall { length: 2.0, height: 2.5, thickness: 0.2 }),
         "floor" => Some(Primitive::Floor { width: 4.0, depth: 4.0, thickness: 0.1 }),
+        "roof" => Some(Primitive::Roof {
+            kind: modeler_core::RoofKind::Gable,
+            width: 4.0,
+            depth: 4.0,
+            height: modeler_core::RoofKind::Gable.default_height(4.0),
+            overhang: crate::object_ops::ROOF_OVERHANG,
+            ridge_x: true,
+        }),
         "empty" => Some(catalog[7]),
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
@@ -175,6 +210,29 @@ fn apply_object_params(
                 thickness: t.unwrap_or(thickness).max(0.002),
             };
         }
+    }
+    // roof shape (roofs only; ignored elsewhere)
+    if let Primitive::Roof { kind, width, depth, height, overhang, ridge_x } =
+        object.primitive
+    {
+        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+        let kind = match params.get("roof_kind").and_then(Value::as_str) {
+            Some(s) => modeler_core::RoofKind::from_name(s).ok_or_else(|| {
+                format!("unknown roof_kind '{s}' (point|gable|hip|flat|shed|gambrel|mansard)")
+            })?,
+            None => kind,
+        };
+        object.primitive = Primitive::Roof {
+            kind,
+            width: get("width").unwrap_or(width).max(0.1),
+            depth: get("depth").unwrap_or(depth).max(0.1),
+            height: get("height").unwrap_or(height).max(0.02),
+            overhang: get("overhang").unwrap_or(overhang).max(0.0),
+            ridge_x: params
+                .get("ridge_x")
+                .and_then(Value::as_bool)
+                .unwrap_or(ridge_x),
+        };
     }
     if let Some(cutouts) = cutouts {
         object.cutouts = cutouts?;
@@ -242,8 +300,8 @@ fn apply_object_params(
         object.smooth = v;
     }
     if let Some(v) = params.get("subdivision").and_then(Value::as_u64) {
-        object.subdivision = v.min(4) as u8;
-        object.mesh_revision += 1; // the viewport mesh cache keys on it
+        // compatibility: maps onto the subdivision modifier in the stack
+        crate::modifiers::set_subdivision_on(object, v.min(4) as u8);
     }
     if let Some(v) = params.get("visible").and_then(Value::as_bool) {
         object.visible = v;
@@ -685,7 +743,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|empty|light|sun|spot)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|light|sun|spot)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());
@@ -714,6 +772,33 @@ fn execute_inner(
             let object = scene.object(id).unwrap();
             Ok(json!({"id": id.0, "name": object.name, "status": message}))
         }
+        "add_roof" => {
+            let kind = match command.get("kind").and_then(Value::as_str) {
+                Some(s) => modeler_core::RoofKind::from_name(s).ok_or_else(|| {
+                    format!("unknown roof kind '{s}' (point|gable|hip|flat|shed|gambrel|mansard)")
+                })?,
+                None => modeler_core::RoofKind::Gable,
+            };
+            // explicit wall list, else every wall in the scene
+            let walls: Vec<ObjectId> = match command.get("walls").filter(|v| !v.is_null()) {
+                Some(refs) => refs
+                    .as_array()
+                    .ok_or("'walls' must be an array of names/ids")?
+                    .iter()
+                    .map(|r| resolve(scene, r))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => scene
+                    .objects()
+                    .iter()
+                    .filter(|o| matches!(o.primitive, Primitive::Wall { .. }))
+                    .map(|o| o.id)
+                    .collect(),
+            };
+            let (id, message) = crate::object_ops::add_roof_for_walls(scene, &walls, kind);
+            apply_object_params(scene, id, command)?;
+            let object = scene.object(id).unwrap();
+            Ok(json!({"id": id.0, "name": object.name, "status": message}))
+        }
         "break_into_bricks" => {
             let id = resolve(scene, &command["object"])?;
             // optional target count, clamped to the UI slider range
@@ -728,6 +813,140 @@ fn execute_inner(
                 .ok_or("this object cannot break into bricks (no volume)")?;
             selection.retain_existing(|i| scene.object(i).is_some());
             Ok(json!({"count": bricks.len()}))
+        }
+        "boolean_objects" => {
+            let op = command["op"]
+                .as_str()
+                .and_then(modeler_core::BooleanOp::from_name)
+                .ok_or("missing or unknown 'op' (union|subtract|intersect)")?;
+            let target = resolve(scene, &command["target"])?;
+            let tools: Vec<ObjectId> = command["tools"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or("'tools' must be a non-empty array of names/ids")?
+                .iter()
+                .map(|r| resolve(scene, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let message = crate::object_ops::boolean_apply(scene, target, &tools, op)?;
+            selection.retain_existing(|i| scene.object(i).is_some());
+            Ok(json!({
+                "object": object_json(scene, scene.object(target).unwrap()),
+                "status": message,
+            }))
+        }
+        "add_modifier" => {
+            let id = resolve(scene, &command["object"])?;
+            let kind = command["type"]
+                .as_str()
+                .ok_or("missing 'type' (subdivision|boolean)")?;
+            let message = match kind.to_ascii_lowercase().as_str() {
+                "subdivision" => {
+                    let levels = command["levels"].as_u64().unwrap_or(1).clamp(1, 4) as u8;
+                    let object = scene.object_mut(id).ok_or("no such object")?;
+                    object.modifiers.push(modeler_core::Modifier::new(
+                        modeler_core::ModifierKind::Subdivision { levels },
+                    ));
+                    format!("added subdivision modifier (levels {levels}) — preview is live")
+                }
+                "boolean" => {
+                    let op = command["op"]
+                        .as_str()
+                        .and_then(modeler_core::BooleanOp::from_name)
+                        .ok_or("missing or unknown 'op' (union|subtract|intersect)")?;
+                    let tool = resolve(scene, &command["tool"])?;
+                    crate::modifiers::add_boolean(scene, id, &[tool], op)?
+                }
+                other => {
+                    return Err(format!("unknown modifier type '{other}' (subdivision|boolean)"))
+                }
+            };
+            Ok(json!({
+                "object": object_json(scene, scene.object(id).unwrap()),
+                "status": message,
+            }))
+        }
+        "update_modifier" => {
+            let id = resolve(scene, &command["object"])?;
+            let index = command["index"].as_u64().ok_or("missing 'index'")? as usize;
+            let tool = match command.get("tool").filter(|v| !v.is_null()) {
+                Some(t) => Some(resolve(scene, t)?),
+                None => None,
+            };
+            let op = match command.get("op").and_then(Value::as_str) {
+                Some(s) => Some(modeler_core::BooleanOp::from_name(s).ok_or_else(|| {
+                    format!("unknown op '{s}' (union|subtract|intersect)")
+                })?),
+                None => None,
+            };
+            let enabled = command.get("enabled").and_then(Value::as_bool);
+            let levels = command.get("levels").and_then(Value::as_u64);
+
+            // validate against the modifier's kind before mutating anything
+            let object = scene.object(id).ok_or("no such object")?;
+            let current = object
+                .modifiers
+                .get(index)
+                .ok_or_else(|| format!("no modifier at index {index}"))?
+                .kind;
+            match current {
+                modeler_core::ModifierKind::Subdivision { .. } => {
+                    if op.is_some() || tool.is_some() {
+                        return Err("'op'/'tool' apply to boolean modifiers only".to_string());
+                    }
+                }
+                modeler_core::ModifierKind::Boolean { .. } => {
+                    if levels.is_some() {
+                        return Err("'levels' applies to subdivision modifiers only".to_string());
+                    }
+                    if tool == Some(id) {
+                        return Err("an object cannot be its own boolean tool".to_string());
+                    }
+                }
+            }
+            let object = scene.object_mut(id).expect("checked above");
+            let modifier = &mut object.modifiers[index];
+            if let Some(e) = enabled {
+                modifier.enabled = e;
+            }
+            match &mut modifier.kind {
+                modeler_core::ModifierKind::Subdivision { levels: current } => {
+                    if let Some(l) = levels {
+                        *current = l.clamp(1, 4) as u8;
+                    }
+                }
+                modeler_core::ModifierKind::Boolean { op: current_op, object: current_tool } => {
+                    if let Some(o) = op {
+                        *current_op = o;
+                    }
+                    if let Some(t) = tool {
+                        *current_tool = t;
+                    }
+                }
+            }
+            Ok(json!({"object": object_json(scene, scene.object(id).unwrap())}))
+        }
+        "remove_modifier" => {
+            let id = resolve(scene, &command["object"])?;
+            let index = command["index"].as_u64().ok_or("missing 'index'")? as usize;
+            let message = crate::modifiers::remove(scene, id, index)?;
+            Ok(json!({
+                "object": object_json(scene, scene.object(id).unwrap()),
+                "status": message,
+            }))
+        }
+        "apply_modifiers" => {
+            let id = resolve(scene, &command["object"])?;
+            // apply the first `count` stack entries (default: all)
+            let count = command["count"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX);
+            let message = crate::modifiers::apply(scene, id, count)?;
+            selection.retain_existing(|i| scene.object(i).is_some()); // tools may be consumed
+            Ok(json!({
+                "object": object_json(scene, scene.object(id).unwrap()),
+                "status": message,
+            }))
         }
         "update_object" => {
             let id = resolve(scene, &command["object"])?;

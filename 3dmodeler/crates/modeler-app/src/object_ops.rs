@@ -311,6 +311,124 @@ pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
     message
 }
 
+// --- mesh booleans (CSG) -------------------------------------------------------
+
+/// Add a boolean MODIFIER to the ACTIVE object for each other selected
+/// object (Object menu): the viewport previews the result live — the tools
+/// are hidden but stay in the scene and can still be moved — and nothing
+/// is baked until the user applies the modifier from the sidebar. Returns
+/// a status-bar message.
+pub fn boolean_selected(
+    scene: &mut Scene,
+    selection: &mut Selection,
+    op: modeler_core::BooleanOp,
+) -> String {
+    let Some(target) = selection.active() else {
+        return "boolean needs an active object to receive the result".to_string();
+    };
+    let tools: Vec<ObjectId> = selection
+        .selected()
+        .iter()
+        .copied()
+        .filter(|&id| id != target)
+        .collect();
+    if tools.is_empty() {
+        return "select at least two objects — the active one receives the result"
+            .to_string();
+    }
+    match crate::modifiers::add_boolean(scene, target, &tools, op) {
+        Ok(message) => {
+            selection.set(vec![target], Some(target));
+            message
+        }
+        Err(message) => message,
+    }
+}
+
+/// The id-list core of [`boolean_selected`]; also driven directly by the
+/// control API (`boolean_objects` command). The tool meshes are brought
+/// into the target's local frame, combined one by one, and the result is
+/// stored as the target's edited mesh; the tool objects are removed (their
+/// children survive, unparented in place).
+pub fn boolean_apply(
+    scene: &mut Scene,
+    target: ObjectId,
+    tools: &[ObjectId],
+    op: modeler_core::BooleanOp,
+) -> Result<String, String> {
+    let no_volume = |o: &modeler_core::Object| {
+        o.primitive.is_light() || matches!(o.primitive, Primitive::Empty { .. })
+    };
+    let target_object = scene.object(target).ok_or("no such target object")?;
+    if no_volume(target_object) {
+        return Err(format!(
+            "'{}' is a light/empty — it has no volume to combine",
+            target_object.name
+        ));
+    }
+    let mut tool_ids: Vec<ObjectId> = Vec::new();
+    for &tool in tools {
+        if tool == target {
+            return Err("the target cannot be one of the tools".to_string());
+        }
+        let tool_object = scene
+            .object(tool)
+            .ok_or_else(|| format!("no tool object with id {}", tool.0))?;
+        if no_volume(tool_object) {
+            return Err(format!(
+                "'{}' is a light/empty — it has no volume to combine",
+                tool_object.name
+            ));
+        }
+        if !tool_ids.contains(&tool) {
+            tool_ids.push(tool);
+        }
+    }
+    if tool_ids.is_empty() {
+        return Err("no tool objects given".to_string());
+    }
+
+    let target_world = scene.world_transform(target);
+    let target_object = scene.object(target).expect("checked above");
+    let target_name = target_object.name.clone();
+    let mut result = target_object.render_mesh();
+    for &tool in &tool_ids {
+        let tool_object = scene.object(tool).expect("checked above");
+        let tool_mesh = modeler_core::mesh_to_frame(
+            &tool_object.render_mesh(),
+            &scene.world_transform(tool),
+            &target_world,
+        );
+        result = modeler_core::mesh_boolean(&result, &tool_mesh, op);
+    }
+    if result.indices.is_empty() {
+        return Err(
+            "boolean result is empty (nothing would remain) — not applied".to_string()
+        );
+    }
+
+    for &tool in &tool_ids {
+        scene.remove_object(tool);
+    }
+    if let Some(object) = scene.object_mut(target) {
+        object.edited_mesh = Some(result);
+        object.mesh_revision += 1;
+    }
+    let count = tool_ids.len();
+    let plural = if count == 1 { "object" } else { "objects" };
+    Ok(match op {
+        modeler_core::BooleanOp::Union => {
+            format!("merged {count} {plural} into '{target_name}'")
+        }
+        modeler_core::BooleanOp::Subtract => {
+            format!("subtracted {count} {plural} from '{target_name}'")
+        }
+        modeler_core::BooleanOp::Intersect => {
+            format!("intersected '{target_name}' with {count} {plural}")
+        }
+    })
+}
+
 /// Break-into-bricks target count bounds: the UI slider range and the MCP
 /// clamp. 5,000 bricks step comfortably at 60 Hz (see
 /// Vibecoding/performance-plan.md — the old hard cap of 600 predates the
@@ -714,6 +832,106 @@ pub fn add_floor_for_walls(scene: &mut Scene, walls: &[ObjectId]) -> (ObjectId, 
     (id, message)
 }
 
+/// Default eave overhang (m) for Add ▸ Roof.
+pub const ROOF_OVERHANG: f32 = 0.3;
+/// Fallback footprint (m) when there are no walls to size the roof from.
+const ROOF_DEFAULT_SIZE: f32 = 4.0;
+
+/// Add ▸ Roof: a solid roof lid sitting on top of the selected walls (walls
+/// inside selected groups count too). Returns None when the selection holds
+/// no walls — the caller starts the draw-the-footprint tool instead.
+pub fn add_roof(
+    scene: &mut Scene,
+    selection: &mut Selection,
+    kind: modeler_core::RoofKind,
+) -> Option<String> {
+    let selected: std::collections::HashSet<ObjectId> =
+        selection.selected().iter().copied().collect();
+    // a wall counts as selected when it or any ancestor is in the selection
+    let in_selection = |mut id: ObjectId| loop {
+        if selected.contains(&id) {
+            return true;
+        }
+        match scene.object(id).and_then(|o| o.parent) {
+            Some(parent) => id = parent,
+            None => return false,
+        }
+    };
+    let walls: Vec<ObjectId> = scene
+        .objects()
+        .iter()
+        .filter(|o| matches!(o.primitive, Primitive::Wall { .. }) && in_selection(o.id))
+        .map(|o| o.id)
+        .collect();
+    if walls.is_empty() {
+        return None;
+    }
+    let (id, message) = add_roof_for_walls(scene, &walls, kind);
+    selection.set(vec![id], Some(id));
+    Some(message)
+}
+
+/// The wall-list core of [`add_roof`]; also driven directly by the control
+/// API (`add_roof` command). The roof covers the walls' world-space XY
+/// bounds (rotation/scale-safe) and stands on the tallest wall top; the
+/// ridge follows the longer side. With no walls it falls back to a
+/// `ROOF_DEFAULT_SIZE` square at the origin.
+pub fn add_roof_for_walls(
+    scene: &mut Scene,
+    walls: &[ObjectId],
+    kind: modeler_core::RoofKind,
+) -> (ObjectId, String) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &id in walls {
+        let Some(object) = scene.object(id) else { continue };
+        let Primitive::Wall { length, height, thickness } = object.primitive else {
+            continue;
+        };
+        let world = scene.world_transform(id);
+        for x in [0.0, length] {
+            for y in [-0.5 * thickness, 0.5 * thickness] {
+                for z in [0.0, height] {
+                    let p = world.transform_point(Vec3::new(x, y, z));
+                    min = min.min(p);
+                    max = max.max(p);
+                }
+            }
+        }
+    }
+
+    let (width, depth, location, message) = if min.x.is_finite() {
+        (
+            (max.x - min.x).max(0.1),
+            (max.y - min.y).max(0.1),
+            Vec3::new(0.5 * (min.x + max.x), 0.5 * (min.y + max.y), max.z),
+            format!(
+                "{} roof added over {} wall{}",
+                kind.label().to_lowercase(),
+                walls.len(),
+                if walls.len() == 1 { "" } else { "s" }
+            ),
+        )
+    } else {
+        (
+            ROOF_DEFAULT_SIZE,
+            ROOF_DEFAULT_SIZE,
+            Vec3::ZERO,
+            "roof added — no walls to size from, using a 4 m square".to_string(),
+        )
+    };
+    let primitive = Primitive::Roof {
+        kind,
+        width,
+        depth,
+        height: kind.default_height(width.min(depth)),
+        overhang: ROOF_OVERHANG,
+        ridge_x: width >= depth,
+    };
+    let id = scene.add_object(primitive, Transform { location, ..Transform::default() });
+    (id, message)
+}
+
 /// The world-space centerline polygon of the walls, when they chain
 /// end-to-end into ONE closed loop (each wall runs from its origin along
 /// local +X). Returns None for open runs, branches, disjoint loops or
@@ -1088,6 +1306,57 @@ mod tests {
     }
 
     #[test]
+    fn roof_covers_the_selected_walls_and_sits_on_their_tops() {
+        use modeler_core::RoofKind;
+        let mut scene = Scene::new();
+        let wall = Primitive::Wall { length: 4.0, height: 2.5, thickness: 0.2 };
+        let a = scene.add_object(wall, Transform::default());
+        // a taller wall along +Y from (4, 0): the roof rides its top edge
+        let tall = Primitive::Wall { length: 4.0, height: 3.0, thickness: 0.2 };
+        let mut t = Transform::default();
+        t.location = Vec3::new(4.0, 0.0, 0.0);
+        t.rotation = modeler_core::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let b = scene.add_object(tall, t);
+        // an unselected decoy far away
+        let mut far = Transform::default();
+        far.location = Vec3::new(50.0, 50.0, 0.0);
+        scene.add_object(wall, far);
+
+        let mut selection = Selection::default();
+        selection.set(vec![a, b], Some(a));
+        let message = add_roof(&mut scene, &mut selection, RoofKind::Gable)
+            .expect("walls are selected");
+        assert!(message.contains("2 walls"), "{message}");
+
+        let roof = selection.active().expect("roof selected");
+        let object = scene.object(roof).unwrap();
+        let Primitive::Roof { kind, width, depth, height, overhang, .. } = object.primitive
+        else {
+            panic!("expected a roof, got {:?}", object.primitive);
+        };
+        assert_eq!(kind, RoofKind::Gable);
+        // same bounds as the floor test: 4.1 × 4.1 around (2.05, 1.95)
+        assert!((width - 4.1).abs() < 1e-4, "width {width}");
+        assert!((depth - 4.1).abs() < 1e-4, "depth {depth}");
+        assert!(height > 0.0 && overhang > 0.0);
+        let loc = object.transform.location;
+        assert!((loc.x - 2.05).abs() < 1e-4, "center x {}", loc.x);
+        assert!((loc.y - 1.95).abs() < 1e-4, "center y {}", loc.y);
+        assert!((loc.z - 3.0).abs() < 1e-4, "roof base on the tallest wall top");
+
+        // survives save/load
+        let primitive = object.primitive;
+        let data = Scene::from_json(&scene.to_json()).expect("scene loads");
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        assert_eq!(restored.object(roof).unwrap().primitive, primitive);
+
+        // nothing selected → the caller must fall back to drawing
+        selection.set(Vec::new(), None);
+        assert!(add_roof(&mut scene, &mut selection, RoofKind::Hip).is_none());
+    }
+
+    #[test]
     fn place_on_ground_moves_selection_roots_as_one() {
         let mut scene = Scene::new();
         let mut at = |location: Vec3| {
@@ -1115,6 +1384,110 @@ mod tests {
         // the loose cube (below ground before) came UP to rest at z = 0
         let w = scene.world_transform(loose);
         assert!((w.location.z - 1.0).abs() < 1e-4, "{:?}", w.location);
+    }
+
+    /// Signed volume of a mesh (divergence theorem, outward winding).
+    fn mesh_volume(m: &modeler_core::MeshData) -> f32 {
+        m.indices
+            .chunks_exact(3)
+            .map(|tri| {
+                let a = m.positions[tri[0] as usize];
+                let b = m.positions[tri[1] as usize];
+                let c = m.positions[tri[2] as usize];
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn boolean_menu_adds_a_preview_modifier_then_apply_bakes_it() {
+        let mut scene = Scene::new();
+        let target = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        // a size-2 cube scaled to 0.5 → effectively a unit cube, shifted
+        // diagonally so a corner chunk (0.75³) overlaps the target
+        let tool = scene.add_object(
+            Primitive::Cube { size: 2.0 },
+            Transform {
+                location: Vec3::splat(0.25),
+                scale: Vec3::splat(0.5),
+                ..Transform::default()
+            },
+        );
+
+        let mut selection = Selection::default();
+        selection.set(vec![tool, target], Some(target));
+        let message =
+            boolean_selected(&mut scene, &mut selection, modeler_core::BooleanOp::Subtract);
+        assert!(message.contains("preview is live"), "{message}");
+        assert_eq!(selection.selected(), &[target], "the target stays selected");
+
+        // non-destructive so far: modifier on the target, tool hidden
+        let object = scene.object(target).unwrap();
+        assert_eq!(object.modifiers.len(), 1);
+        assert!(object.edited_mesh.is_none(), "nothing baked yet");
+        assert!(scene.object(tool).is_some());
+        assert!(!scene.object(tool).unwrap().visible, "tool hidden for preview");
+        let expected = 1.0 - 0.75f32.powi(3);
+        let preview = crate::modifiers::evaluate(&scene, target);
+        assert!((mesh_volume(&preview) - expected).abs() < 1e-3);
+
+        // applying bakes the preview and consumes the tool
+        crate::modifiers::apply(&mut scene, target, usize::MAX).unwrap();
+        assert!(scene.object(tool).is_none(), "tool consumed on apply");
+        let mesh = scene.object(target).unwrap().edited_mesh.as_ref().unwrap();
+        assert!((mesh_volume(mesh) - expected).abs() < 1e-3, "{}", mesh_volume(mesh));
+    }
+
+    #[test]
+    fn boolean_union_merges_several_tools() {
+        let mut scene = Scene::new();
+        let at = |scene: &mut Scene, location: Vec3| {
+            scene.add_object(
+                Primitive::Cube { size: 1.0 },
+                Transform { location, ..Transform::default() },
+            )
+        };
+        let target = at(&mut scene, Vec3::ZERO);
+        let near = at(&mut scene, Vec3::splat(0.25)); // overlaps 0.75³
+        let far = at(&mut scene, Vec3::new(5.0, 0.0, 0.0)); // disjoint
+
+        let message = boolean_apply(
+            &mut scene,
+            target,
+            &[near, far],
+            modeler_core::BooleanOp::Union,
+        )
+        .unwrap();
+        assert!(message.contains("merged 2 objects into 'Cube'"), "{message}");
+        assert!(scene.object(near).is_none() && scene.object(far).is_none());
+        let mesh = scene.object(target).unwrap().edited_mesh.as_ref().unwrap();
+        let expected = 3.0 - 0.75f32.powi(3);
+        assert!((mesh_volume(mesh) - expected).abs() < 1e-3, "{}", mesh_volume(mesh));
+    }
+
+    #[test]
+    fn boolean_rejects_bad_input_without_changing_the_scene() {
+        let mut scene = Scene::new();
+        let cube = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let light =
+            scene.add_object(Primitive::light_catalog()[0], Transform::default());
+        // lights have no volume, on either side
+        assert!(boolean_apply(&mut scene, cube, &[light], modeler_core::BooleanOp::Union)
+            .is_err());
+        assert!(boolean_apply(&mut scene, light, &[cube], modeler_core::BooleanOp::Union)
+            .is_err());
+        // target among the tools
+        assert!(boolean_apply(&mut scene, cube, &[cube], modeler_core::BooleanOp::Union)
+            .is_err());
+        // an empty result (tool swallows the target) must not apply
+        let big = scene.add_object(Primitive::Cube { size: 5.0 }, Transform::default());
+        assert!(
+            boolean_apply(&mut scene, cube, &[big], modeler_core::BooleanOp::Subtract)
+                .is_err()
+        );
+        assert!(scene.object(big).is_some(), "failed boolean consumes nothing");
+        assert!(scene.object(cube).unwrap().edited_mesh.is_none());
+        assert_eq!(scene.objects().len(), 3);
     }
 
     #[test]

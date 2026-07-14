@@ -21,16 +21,19 @@ mod grid;
 mod library;
 mod mesh_edit;
 mod modal;
+mod modifiers;
 mod net;
 mod object_ops;
 mod io;
 mod overlay;
+mod pdf;
 mod physics;
 mod pie;
 mod poke;
 mod preview;
 mod ref_image;
 mod ref_setup;
+mod roof_tool;
 mod scene_render;
 mod selection;
 mod settings;
@@ -175,6 +178,7 @@ pub fn main() {
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
     let mut wall_tool = wall_tool::WallTool::new();
+    let mut roof_tool = roof_tool::RoofTool::new();
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
@@ -240,7 +244,8 @@ pub fn main() {
             .status_line()
             .or_else(|| modal.status_line())
             .or_else(|| image_move.status_line())
-            .or_else(|| wall_tool.status_line(settings.unit));
+            .or_else(|| wall_tool.status_line(settings.unit))
+            .or_else(|| roof_tool.status_line(settings.unit));
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
         // edit-mode element selection, for "set pivot/anchor to selection"
@@ -282,6 +287,7 @@ pub fn main() {
                     edit_point,
                     edit_mode.active().then_some(&mut edit_mode),
                     &mut wall_tool,
+                    &mut roof_tool,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
@@ -313,6 +319,7 @@ pub fn main() {
                     && !modal.active()
                     && !edit_mode.active()
                     && !wall_tool.active()
+                    && !roof_tool.active()
                 {
                     cutout_handles.draw(
                         gui_context,
@@ -344,9 +351,14 @@ pub fn main() {
                         edit,
                     );
                 }
-                if let Some(message) =
-                    add_menu.ui(gui_context, &mut scene, &mut sel, &mut wall_tool, &settings)
-                {
+                if let Some(message) = add_menu.ui(
+                    gui_context,
+                    &mut scene,
+                    &mut sel,
+                    &mut wall_tool,
+                    &mut roof_tool,
+                    &settings,
+                ) {
                     ui_state.status_message = Some(message);
                 }
                 delete_tool.ui(gui_context, &mut scene, &mut sel);
@@ -650,11 +662,35 @@ pub fn main() {
             );
         }
 
+        // roof tool: same contract, drawing a roof footprint rectangle
+        if !physics.is_stopped() && roof_tool.active() {
+            roof_tool.abort(&mut scene); // simulation took over mid-draw
+        }
+        if roof_tool.active() && !edit_mode.active() && !modal.active() && !wall_tool.active()
+        {
+            roof_tool.handle_events(
+                &mut frame_input.events,
+                &camera,
+                frame_input.viewport,
+                &mut scene,
+                &mut sel,
+                egui_owns_keyboard,
+                pointer_over_ui,
+                snap_to_grid,
+                settings.grid_spacing,
+            );
+        }
+
         // right-click: context menu on the object (object mode) or the
         // vertex/edge/face (edit mode) under the cursor — set pivot/anchor
         // and common actions. On empty canvas (object mode) it opens the
         // Add wheel instead. Cancel-RMB during modal/grab stays theirs.
-        if physics.is_stopped() && !modal.active() && !edit_mode.grabbing() && !wall_tool.active() {
+        if physics.is_stopped()
+            && !modal.active()
+            && !edit_mode.grabbing()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
             for event in frame_input.events.iter_mut() {
                 if let Event::MousePress {
                     button: MouseButton::Right,
@@ -737,7 +773,8 @@ pub fn main() {
         );
 
         // Space = play/pause, Esc = stop (when not editing)
-        if !modal.active() && !edit_mode.active() && !wall_tool.active() {
+        if !modal.active() && !edit_mode.active() && !wall_tool.active() && !roof_tool.active()
+        {
             for event in frame_input.events.iter_mut() {
                 if let Event::KeyPress { kind, handled, .. } = event {
                     match kind {
@@ -761,7 +798,12 @@ pub fn main() {
         }
 
         // G on a selected reference image: move it (same gestures as objects)
-        if physics.is_stopped() && !edit_mode.active() && !modal.active() && !wall_tool.active() {
+        if physics.is_stopped()
+            && !edit_mode.active()
+            && !modal.active()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
             image_move.handle_events(
                 &mut frame_input.events,
                 &camera,
@@ -775,7 +817,12 @@ pub fn main() {
 
         // editing tools are disabled while the simulation owns the transforms
         // and while edit mode owns the object
-        if physics.is_stopped() && !edit_mode.active() && !image_move.active() && !wall_tool.active() {
+        if physics.is_stopped()
+            && !edit_mode.active()
+            && !image_move.active()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
             // modal transform operators get first claim on input after the UI
             modal.handle_events(
                 &mut frame_input.events,
@@ -793,7 +840,12 @@ pub fn main() {
 
         ui_state.handle_events(&mut frame_input.events, egui_owns_keyboard, pointer_over_ui);
 
-        if !modal.active() && physics.is_stopped() && !edit_mode.active() && !wall_tool.active() {
+        if !modal.active()
+            && physics.is_stopped()
+            && !edit_mode.active()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
             delete_tool.handle_events(
                 &mut frame_input.events,
                 frame_input.viewport,
@@ -826,7 +878,12 @@ pub fn main() {
         poke_tool.update(frame_input.elapsed_time as f32 / 1000.0, &physics);
 
         // wall opening handles: grab/drag doors & windows of selected walls
-        if !modal.active() && physics.is_stopped() && !edit_mode.active() && !wall_tool.active() {
+        if !modal.active()
+            && physics.is_stopped()
+            && !edit_mode.active()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
             cutout_handles.handle_events(
                 &mut frame_input.events,
                 &mut scene,
@@ -885,6 +942,7 @@ pub fn main() {
             modal.active()
                 || edit_mode.grabbing()
                 || wall_tool.drawing()
+                || roof_tool.drawing()
                 || cutout_handles.dragging()
                 || !physics.is_stopped(),
         );

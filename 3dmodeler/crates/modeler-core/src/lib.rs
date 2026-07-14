@@ -4,10 +4,12 @@
 //! the command/undo system and serialization. It knows nothing about
 //! rendering or physics — those live in `modeler-app`.
 
+pub mod boolean;
 pub mod library;
 pub mod mesh;
 
 use glam::{Quat, Vec2, Vec3};
+pub use boolean::{mesh_boolean, mesh_to_frame, BooleanOp};
 pub use glam;
 pub use library::{Library, LibraryAsset};
 pub use mesh::{MeshData, WallCutout};
@@ -114,6 +116,79 @@ impl LightKind {
     }
 }
 
+/// Roof shapes for `Primitive::Roof` (Add ▸ Roof).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoofKind {
+    /// Pyramid: four slopes meeting in a single point over the center.
+    Point,
+    /// Two slopes meeting at a ridge; vertical triangular gable ends.
+    Gable,
+    /// Four slopes: the ridge is pulled in from the ends so all sides pitch.
+    Hip,
+    /// A plain slab (the height is its thickness).
+    Flat,
+    /// One slope across the whole footprint, rising toward the high eave.
+    Shed,
+    /// Barn roof: each side breaks into a steep lower and a shallow upper
+    /// slope; vertical gable ends.
+    Gambrel,
+    /// Hip version of the gambrel: steep lower slopes all around, shallow
+    /// upper slopes, and a small flat top.
+    Mansard,
+}
+
+impl RoofKind {
+    pub const ALL: [RoofKind; 7] = [
+        RoofKind::Point,
+        RoofKind::Gable,
+        RoofKind::Hip,
+        RoofKind::Flat,
+        RoofKind::Shed,
+        RoofKind::Gambrel,
+        RoofKind::Mansard,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoofKind::Point => "Point",
+            RoofKind::Gable => "Gable",
+            RoofKind::Hip => "Hip",
+            RoofKind::Flat => "Flat",
+            RoofKind::Shed => "Shed",
+            RoofKind::Gambrel => "Gambrel",
+            RoofKind::Mansard => "Mansard",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<RoofKind> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.label().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// Sensible rise for a footprint whose shorter side is `span` — used
+    /// when a roof is created (the sidebar can change it afterwards).
+    pub fn default_height(self, span: f32) -> f32 {
+        match self {
+            RoofKind::Flat => 0.2,
+            RoofKind::Shed => (0.25 * span).max(0.3),
+            RoofKind::Gable | RoofKind::Hip => (0.35 * span).max(0.3),
+            RoofKind::Point | RoofKind::Gambrel | RoofKind::Mansard => {
+                (0.45 * span).max(0.3)
+            }
+        }
+    }
+
+    /// Whether the ridge / slope direction matters for this kind (Flat,
+    /// Point and Mansard are the same in both orientations).
+    pub fn oriented(self) -> bool {
+        matches!(
+            self,
+            RoofKind::Shed | RoofKind::Gable | RoofKind::Hip | RoofKind::Gambrel
+        )
+    }
+}
+
 /// Primitive shapes with their creation parameters. Defaults match Blender's
 /// Add > Mesh entries.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -136,6 +211,19 @@ pub enum Primitive {
     /// on the OBJECT (`Object::floor_outline`), not here — width/depth then
     /// only mirror the outline's bounds.
     Floor { width: f32, depth: f32, thickness: f32 },
+    /// Roof lid: a watertight solid standing on z = 0, centered on the
+    /// origin in XY, rising to z = `height`. `width` × `depth` is the
+    /// footprint it covers (the wall rectangle); `overhang` extends the
+    /// eaves past it on all four sides. For the oriented kinds the ridge
+    /// (shed: the high eave) runs along local X when `ridge_x`, else Y.
+    Roof {
+        kind: RoofKind,
+        width: f32,
+        depth: f32,
+        height: f32,
+        overhang: f32,
+        ridge_x: bool,
+    },
     /// Empty point (Blender's plain-axes empty): three thin axis lines
     /// crossing at the origin, ±`size` long. A marker / grouping parent —
     /// it never collides or simulates.
@@ -200,6 +288,7 @@ impl Primitive {
             Primitive::Torus { .. } => "Torus",
             Primitive::Wall { .. } => "Wall",
             Primitive::Floor { .. } => "Floor",
+            Primitive::Roof { .. } => "Roof",
             Primitive::Empty { .. } => "Empty",
             Primitive::Light { kind, .. } => kind.label(),
         }
@@ -225,6 +314,12 @@ impl Primitive {
             // origin at the bottom center: a top corner is farthest
             Primitive::Floor { width, depth, thickness } => {
                 (0.25 * (width * width + depth * depth) + thickness * thickness).sqrt()
+            }
+            // ditto, with the eaves extended by the overhang
+            Primitive::Roof { width, depth, height, overhang, .. } => {
+                let hx = 0.5 * width + overhang.max(0.0);
+                let hy = 0.5 * depth + overhang.max(0.0);
+                (hx * hx + hy * hy + height * height).sqrt()
             }
             Primitive::Empty { size } => size,
             // + 0.01: spoke corners stick out past the nominal extents
@@ -264,6 +359,11 @@ impl Primitive {
             Primitive::Floor { width, depth, thickness } => {
                 Vec3::new(width, depth, thickness)
             }
+            Primitive::Roof { width, depth, height, overhang, .. } => Vec3::new(
+                width + 2.0 * overhang.max(0.0),
+                depth + 2.0 * overhang.max(0.0),
+                height,
+            ),
             Primitive::Empty { size } => Vec3::splat(2.0 * size),
             Primitive::Light { kind, spot_angle_deg, .. } => match kind {
                 LightKind::Point => Vec3::splat(2.0 * mesh::POINT_GIZMO_EXTENT),
@@ -286,6 +386,7 @@ impl Primitive {
             Primitive::Torus { minor_radius, .. } => minor_radius,
             Primitive::Wall { .. } => 0.0, // stands on its own floor line
             Primitive::Floor { .. } => 0.0, // ditto
+            Primitive::Roof { .. } => 0.0, // sits on the wall tops
             Primitive::Empty { size } => size,
             Primitive::Light { kind, .. } => match kind {
                 LightKind::Point => mesh::POINT_GIZMO_EXTENT,
@@ -320,6 +421,9 @@ impl Primitive {
             Primitive::Floor { width, depth, thickness } => {
                 mesh::floor(width, depth, thickness)
             }
+            Primitive::Roof { kind, width, depth, height, overhang, ridge_x } => {
+                mesh::roof(kind, width, depth, height, overhang, ridge_x)
+            }
             Primitive::Empty { size } => mesh::empty_axes(size),
             Primitive::Light { .. } => unreachable!("handled above"),
         };
@@ -327,6 +431,50 @@ impl Primitive {
             m
         } else {
             m.into_flat()
+        }
+    }
+}
+
+/// One entry in an object's modifier stack: a non-destructive mesh effect,
+/// applied top to bottom at DISPLAY time (Blender's modifier system). The
+/// base mesh stays the editing cage and the collision shape until the user
+/// applies the stack, which bakes the result into `Object::edited_mesh`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Modifier {
+    /// Live in the viewport preview and included when applying. Disabled
+    /// modifiers stay in the stack but have no effect.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub kind: ModifierKind,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Modifier {
+    pub fn new(kind: ModifierKind) -> Self {
+        Self { enabled: true, kind }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ModifierKind {
+    /// Catmull-Clark subdivision surface (Blender's subsurf).
+    Subdivision { levels: u8 },
+    /// CSG against another scene object (the tool). The tool object stays
+    /// in the scene — it is usually hidden so the result is visible — and
+    /// the effect follows it live as it moves or is edited. A missing tool
+    /// (deleted, or a library asset placed into another scene) makes the
+    /// modifier a no-op.
+    Boolean { op: BooleanOp, object: ObjectId },
+}
+
+impl ModifierKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModifierKind::Subdivision { .. } => "Subdivision",
+            ModifierKind::Boolean { .. } => "Boolean",
         }
     }
 }
@@ -405,12 +553,17 @@ pub struct Object {
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
     pub edited_mesh: Option<MeshData>,
-    /// Subdivision-surface levels (Blender's subsurf modifier, 0 = off):
-    /// the viewport applies this many Catmull-Clark rounds on top of the
-    /// base mesh at render time. The base mesh stays the editing cage and
-    /// the collision shape.
+    /// LEGACY subdivision-surface levels: superseded by a
+    /// `ModifierKind::Subdivision` entry in `modifiers`. Old scene files
+    /// still carry it; `Scene::restore` migrates it into the stack and
+    /// zeroes it. Nothing reads it at display time anymore.
     #[serde(default)]
     pub subdivision: u8,
+    /// Modifier stack (Blender-style): non-destructive mesh effects applied
+    /// in order at display time. Editors must go through `object_mut` (or
+    /// bump the version another way) when changing it so previews resync.
+    #[serde(default)]
+    pub modifiers: Vec<Modifier>,
     /// Bumped on every mesh edit so caches (renderer, physics) resync.
     /// Not saved: a fresh session starts with fresh caches anyway.
     #[serde(skip)]
@@ -462,6 +615,30 @@ impl Object {
                 .fold(0.0f32, f32::max),
             None => self.primitive.bounding_radius(),
         }
+    }
+
+    /// Total enabled subdivision levels when the modifier stack contains
+    /// NOTHING but subdivision modifiers (Some(0) for an empty stack) —
+    /// such objects can still be drawn instanced. None when any other
+    /// enabled modifier is present (the mesh depends on other objects).
+    pub fn subdivision_only_levels(&self) -> Option<u8> {
+        let mut total: u8 = 0;
+        for modifier in self.modifiers.iter().filter(|m| m.enabled) {
+            match modifier.kind {
+                ModifierKind::Subdivision { levels } => {
+                    total = total.saturating_add(levels).min(6)
+                }
+                _ => return None,
+            }
+        }
+        Some(total)
+    }
+
+    /// True when any enabled modifier changes the displayed mesh.
+    pub fn has_enabled_modifiers(&self) -> bool {
+        self.modifiers.iter().any(|m| {
+            m.enabled && !matches!(m.kind, ModifierKind::Subdivision { levels: 0 })
+        })
     }
 
     /// Distance from the local origin to the lowest point (unscaled),
@@ -784,6 +961,7 @@ impl Scene {
             floor_outline: Vec::new(),
             edited_mesh: None,
             subdivision: 0,
+            modifiers: Vec::new(),
             mesh_revision: 0,
         });
         self.index.insert(id, self.objects.len() - 1);
@@ -793,13 +971,19 @@ impl Scene {
     /// Insert a pre-built object (e.g. from a library asset), assigning a
     /// fresh id and a unique name derived from the object's current name.
     /// Everything else (transform, material, edited mesh, …) is kept; the
-    /// caller is responsible for the parent link being valid.
+    /// caller is responsible for the parent link being valid. Boolean
+    /// modifiers are stripped — their tool ids belong to the scene the
+    /// object was captured in and would alias unrelated objects here.
     pub fn insert_object(&mut self, mut object: Object) -> ObjectId {
         self.next_id += 1;
         self.version += 1;
         object.id = ObjectId(self.next_id);
         object.name = self.unique_name(&object.name);
         object.mesh_revision = 0;
+        migrate_subdivision(&mut object);
+        object
+            .modifiers
+            .retain(|m| !matches!(m.kind, ModifierKind::Boolean { .. }));
         self.objects.push(object);
         self.index.insert(ObjectId(self.next_id), self.objects.len() - 1);
         ObjectId(self.next_id)
@@ -1281,6 +1465,9 @@ impl Scene {
 
     pub fn restore(&mut self, data: &SceneData) {
         self.objects = data.objects.clone();
+        for object in &mut self.objects {
+            migrate_subdivision(object);
+        }
         self.measurements = data.measurements.clone();
         self.reference_images = data.reference_images.clone();
         self.folders = data.folders.clone();
@@ -1298,16 +1485,37 @@ impl Scene {
     }
 }
 
+/// Pre-modifier scene files carry subdivision levels on the object; move
+/// them into the modifier stack so there is one source of truth.
+fn migrate_subdivision(object: &mut Object) {
+    if object.subdivision > 0 {
+        object.modifiers.push(Modifier::new(ModifierKind::Subdivision {
+            levels: object.subdivision.min(4),
+        }));
+        object.subdivision = 0;
+    }
+}
+
 /// Export all visible objects as a Wavefront OBJ string (world space,
-/// triangulated, with normals).
+/// triangulated, with normals), using each object's base mesh. Callers
+/// that can evaluate modifier stacks should use [`export_obj_with`].
 pub fn export_obj(scene: &Scene) -> String {
+    export_obj_with(scene, |_, object| object.render_mesh())
+}
+
+/// [`export_obj`] with the displayed mesh supplied per object — the app
+/// passes its modifier evaluation here so exports match the viewport.
+pub fn export_obj_with(
+    scene: &Scene,
+    mesh_for: impl Fn(&Scene, &Object) -> MeshData,
+) -> String {
     let mut out = String::from("# exported by 3dmodeler (box3d)\n");
     let mut vertex_offset: u32 = 1; // OBJ indices are 1-based
     for object in scene.objects() {
         if !object.visible {
             continue;
         }
-        let mesh = object.render_mesh();
+        let mesh = mesh_for(scene, object);
         let t = scene.world_transform(object.id);
         out.push_str(&format!("o {}\n", object.name.replace(' ', "_")));
         for p in &mesh.positions {
@@ -1380,6 +1588,91 @@ mod tests {
         // ids keep working after restore
         let new_id = restored.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
         assert!(new_id.0 > id.0, "next_id must survive the roundtrip");
+    }
+
+    #[test]
+    fn legacy_subdivision_migrates_into_the_modifier_stack() {
+        let mut scene = Scene::default_scene();
+        let id = scene.objects()[0].id;
+        scene.object_mut(id).unwrap().subdivision = 2;
+
+        // a save/load roundtrip turns the legacy field into a modifier
+        let data = Scene::from_json(&scene.to_json()).expect("parse");
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        let object = restored.object(id).unwrap();
+        assert_eq!(object.subdivision, 0, "legacy field cleared");
+        assert_eq!(
+            object.modifiers,
+            vec![Modifier::new(ModifierKind::Subdivision { levels: 2 })]
+        );
+        // idempotent: restoring the migrated snapshot adds nothing
+        let again = restored.snapshot();
+        restored.restore(&again);
+        assert_eq!(restored.object(id).unwrap().modifiers.len(), 1);
+    }
+
+    #[test]
+    fn modifiers_survive_json_and_gate_instancing() {
+        let mut scene = Scene::new();
+        let cube = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let tool = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        {
+            let object = scene.object_mut(cube).unwrap();
+            object.modifiers.push(Modifier::new(ModifierKind::Subdivision { levels: 2 }));
+            object.modifiers.push(Modifier::new(ModifierKind::Boolean {
+                op: BooleanOp::Subtract,
+                object: tool,
+            }));
+        }
+        let object = scene.object(cube).unwrap();
+        assert!(object.has_enabled_modifiers());
+        assert_eq!(object.subdivision_only_levels(), None, "boolean blocks instancing");
+
+        // disabling the boolean leaves a subdivision-only stack
+        let mut scene2 = Scene::new();
+        let id = scene2.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let o = scene2.object_mut(id).unwrap();
+        o.modifiers.push(Modifier::new(ModifierKind::Subdivision { levels: 1 }));
+        o.modifiers.push(Modifier {
+            enabled: false,
+            kind: ModifierKind::Boolean { op: BooleanOp::Union, object: ObjectId(99) },
+        });
+        assert_eq!(scene2.object(id).unwrap().subdivision_only_levels(), Some(1));
+
+        // the stack survives save/load
+        let data = Scene::from_json(&scene.to_json()).expect("parse");
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        assert_eq!(restored.object(cube).unwrap().modifiers.len(), 2);
+        assert_eq!(restored.snapshot(), scene.snapshot());
+    }
+
+    #[test]
+    fn insert_object_strips_foreign_boolean_modifiers() {
+        let mut scene = Scene::new();
+        let mut object = Scene::default_scene().objects()[0].clone();
+        object.subdivision = 3; // legacy field on a library asset
+        object.modifiers.push(Modifier::new(ModifierKind::Boolean {
+            op: BooleanOp::Union,
+            object: ObjectId(42), // an id from another scene
+        }));
+        let id = scene.insert_object(object);
+        let inserted = scene.object(id).unwrap();
+        assert_eq!(inserted.subdivision, 0);
+        assert_eq!(
+            inserted.modifiers,
+            vec![Modifier::new(ModifierKind::Subdivision { levels: 3 })],
+            "subdivision migrated, boolean stripped"
+        );
+    }
+
+    #[test]
+    fn obj_export_with_supplies_the_displayed_mesh() {
+        let scene = Scene::default_scene();
+        // stand-in for modifier evaluation: export a plane instead
+        let obj = export_obj_with(&scene, |_, _| mesh::plane(2.0));
+        assert_eq!(obj.matches("\nf ").count(), 2, "two triangles of the plane");
     }
 
     #[test]
