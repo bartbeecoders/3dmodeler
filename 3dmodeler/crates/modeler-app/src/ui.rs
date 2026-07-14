@@ -250,6 +250,42 @@ impl UiState {
                 Err(e) => self.status_message = Some(format!("save failed: {e}")),
             }
         }
+        // finished .blend conversions arrive here (native only)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(message) = crate::blend::poll_progress() {
+                self.status_message = Some(message);
+            }
+            if let Some(result) = crate::blend::poll_import() {
+                match result {
+                    Ok((path, data)) => {
+                        let ids = crate::blend::merge_into_scene(scene, &data);
+                        let active = ids.last().copied();
+                        let mut message = format!(
+                            "imported {} object{} from {}",
+                            ids.len(),
+                            if ids.len() == 1 { "" } else { "s" },
+                            io::display_name(&path),
+                        );
+                        let skipped: u32 = data.skipped.values().sum();
+                        if skipped > 0 {
+                            message.push_str(&format!(" ({skipped} unsupported skipped)"));
+                        }
+                        selection.set(ids, active);
+                        self.status_message = Some(message);
+                    }
+                    Err(e) => self.status_message = Some(format!("import .blend failed: {e}")),
+                }
+            }
+            if let Some(result) = crate::blend::poll_export() {
+                match result {
+                    Ok(path) => {
+                        self.status_message = Some(format!("exported {}", path.display()))
+                    }
+                    Err(e) => self.status_message = Some(format!("export .blend failed: {e}")),
+                }
+            }
+        }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
             wall_tool, roof_tool, snap_to_grid, shade_mode, lighting_mode, xray,
@@ -692,6 +728,30 @@ impl UiState {
         }
 
         ui.separator();
+        // .blend exchange drives a headless Blender install — native only
+        // (the browser can neither launch processes nor read local files)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if ui.button("Import .blend…").clicked() {
+                crate::blend::request_import(settings.save_dir());
+                self.status_message = Some("Import .blend: pick a file…".into());
+                close = true;
+            }
+            if ui.button("Export .blend…").clicked() {
+                // export what the viewport shows: modifier stacks evaluated
+                let payload = crate::blend::export_payload(scene, |s, o| {
+                    crate::modifiers::evaluate(s, o.id)
+                });
+                let default_name = self
+                    .current_file
+                    .as_ref()
+                    .and_then(|h| h.file_stem())
+                    .map(|stem| format!("{}.blend", stem.to_string_lossy()))
+                    .unwrap_or_else(|| "scene.blend".to_string());
+                crate::blend::request_export(payload, default_name, settings.save_dir());
+                close = true;
+            }
+        }
         if ui.button("Export .obj").clicked() {
             // export what the viewport shows: modifier stacks evaluated
             let obj = modeler_core::export_obj_with(scene, |s, o| {

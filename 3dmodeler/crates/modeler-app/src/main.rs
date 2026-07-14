@@ -7,6 +7,8 @@
 mod add_menu;
 mod ai;
 mod axis_widget;
+#[cfg(not(target_arch = "wasm32"))]
+mod blend;
 mod clipboard;
 mod commands;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1162,7 +1164,15 @@ pub fn main() {
                         gl.resize(**new_inner_size)
                     }
                     WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                    WindowEvent::DroppedFile(path) => ref_image::push_setup_file(path),
+                    WindowEvent::DroppedFile(path) => {
+                        // .blend drops import as scene objects; everything
+                        // else goes to the reference-image setup as before
+                        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("blend")) {
+                            blend::import_path(path.clone());
+                        } else {
+                            ref_image::push_setup_file(path);
+                        }
+                    }
                     _ => (),
                 }
             }
