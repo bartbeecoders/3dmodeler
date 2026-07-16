@@ -218,6 +218,15 @@ fn bake_into_primitive(primitive: &mut Primitive, s: Vec3) -> bool {
             *size *= s.abs().max_element();
             true
         }
+        Primitive::Rope {
+            length,
+            radius,
+            ..
+        } => {
+            *length *= s.x;
+            *radius *= s.y.abs().max(s.z.abs());
+            true
+        }
         _ => false,
     }
 }
@@ -429,13 +438,49 @@ pub fn boolean_apply(
     })
 }
 
-/// Break-into-bricks target count bounds: the UI slider range and the MCP
-/// clamp. 5,000 bricks step comfortably at 60 Hz (see
+/// Break-into-particles target count bounds: the UI slider range and the MCP
+/// clamp. 5,000 particles step comfortably at 60 Hz (see
 /// Vibecoding/performance-plan.md — the old hard cap of 600 predates the
 /// incremental physics mirror and threaded stepping).
 pub const MIN_BRICKS: usize = 100;
 pub const MAX_BRICKS: usize = 5000;
 pub const DEFAULT_BRICKS: usize = 1000;
+/// Same limits/default as bricks — particle count dialog reuses them.
+pub const MIN_PARTICLES: usize = MIN_BRICKS;
+pub const MAX_PARTICLES: usize = MAX_BRICKS;
+pub const DEFAULT_PARTICLES: usize = DEFAULT_BRICKS;
+
+/// How to shatter a solid object into dynamic particles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakKind {
+    /// Running-bond brick grid (cubes).
+    Bricks,
+    /// Cubic packing of spheres (balls).
+    Balls,
+}
+
+impl BreakKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            BreakKind::Bricks => "bricks",
+            BreakKind::Balls => "balls",
+        }
+    }
+
+    pub fn dialog_title(self) -> &'static str {
+        match self {
+            BreakKind::Bricks => "Break into Bricks",
+            BreakKind::Balls => "Break into Balls",
+        }
+    }
+
+    pub fn singular(self) -> &'static str {
+        match self {
+            BreakKind::Bricks => "brick",
+            BreakKind::Balls => "ball",
+        }
+    }
+}
 
 /// Replace a wall with individual DYNAMIC bricks in a running bond (odd
 /// courses start with a half brick), openings respected. The bricks keep the
@@ -514,30 +559,46 @@ pub fn break_wall_into_bricks(
     replace_with_bricks(scene, id, bricks)
 }
 
-/// Shared tail of the break-into-bricks operations: spawn one dynamic
-/// brick per transform (the source material with a subtle deterministic
-/// shade variation so the bond reads), file them in a "<name> bricks"
+/// Shared tail of the break-into-particles operations: spawn one dynamic
+/// particle per transform (the source material with a subtle deterministic
+/// shade variation so the pile reads), file them in a "<name> bricks|balls"
 /// folder that stores the original object for Rebuild, and remove the
-/// original. Returns None (changing nothing) when `bricks` is empty.
-fn replace_with_bricks(
+/// original. Returns None (changing nothing) when `parts` is empty.
+fn replace_with_particles(
     scene: &mut Scene,
     id: ObjectId,
-    bricks: Vec<Transform>,
+    parts: Vec<Transform>,
+    kind: BreakKind,
 ) -> Option<Vec<ObjectId>> {
-    if bricks.is_empty() {
+    if parts.is_empty() {
         return None;
     }
     let object = scene.object(id)?;
     let base_name = object.name.clone();
     let material = object.material;
     let density = object.density;
+    let word = kind.singular();
+    let folder_word = kind.label();
 
-    let mut ids = Vec::with_capacity(bricks.len());
-    let folder = scene.add_folder(&format!("{base_name} bricks"));
-    for (i, transform) in bricks.into_iter().enumerate() {
-        let brick = scene.add_object(Primitive::Cube { size: 1.0 }, transform);
-        if let Some(o) = scene.object_mut(brick) {
-            o.name = format!("{base_name} brick {}", i + 1);
+    // Bricks: unit cube. Balls: unit-diameter UV sphere (radius 0.5) so the
+    // transform scale is the world diameter, matching the cube convention.
+    // Low segment count keeps multi-thousand piles light; physics uses an
+    // exact sphere for uniform scale.
+    let primitive = match kind {
+        BreakKind::Bricks => Primitive::Cube { size: 1.0 },
+        BreakKind::Balls => Primitive::UvSphere {
+            segments: 12,
+            rings: 8,
+            radius: 0.5,
+        },
+    };
+
+    let mut ids = Vec::with_capacity(parts.len());
+    let folder = scene.add_folder(&format!("{base_name} {folder_word}"));
+    for (i, transform) in parts.into_iter().enumerate() {
+        let part = scene.add_object(primitive, transform);
+        if let Some(o) = scene.object_mut(part) {
+            o.name = format!("{base_name} {word} {}", i + 1);
             o.folder = Some(folder);
             o.dynamic = true;
             o.density = density;
@@ -547,7 +608,7 @@ fn replace_with_bricks(
                 *channel = (*channel * shade).clamp(0.0, 1.0);
             }
         }
-        ids.push(brick);
+        ids.push(part);
     }
     // keep the original object on the folder so it can be rebuilt later
     if let Some(original) = scene.remove_object(id) {
@@ -556,6 +617,14 @@ fn replace_with_bricks(
         }
     }
     Some(ids)
+}
+
+fn replace_with_bricks(
+    scene: &mut Scene,
+    id: ObjectId,
+    bricks: Vec<Transform>,
+) -> Option<Vec<ObjectId>> {
+    replace_with_particles(scene, id, bricks, BreakKind::Bricks)
 }
 
 /// Break ANY solid object into dynamic bricks: pristine walls keep their
@@ -642,6 +711,86 @@ pub fn break_into_bricks(
         }
     }
     replace_with_bricks(scene, id, bricks)
+}
+
+/// Break ANY solid object into dynamic balls (spheres): cubic packing in
+/// the object's local AABB, dropping cells whose center falls outside the
+/// mesh (walls keep openings, curved shapes get a stepped ball fill).
+/// `target_balls` sizes the diameter for roughly that many balls. Lights
+/// and empties have no volume: None.
+pub fn break_into_balls(
+    scene: &mut Scene,
+    id: ObjectId,
+    target_balls: usize,
+) -> Option<Vec<ObjectId>> {
+    let object = scene.object(id)?;
+    if object.primitive.is_light() || matches!(object.primitive, Primitive::Empty { .. }) {
+        return None;
+    }
+    let world = scene.world_transform(id);
+    let mesh = object.collision_mesh();
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    if !min.x.is_finite() {
+        return None;
+    }
+    let extent = max - min;
+
+    // diameter sized so a cubic grid yields roughly the requested count;
+    // never thinner than 2 cm
+    let mut cell = 0.3_f32;
+    let estimate = (extent.x / cell).max(1.0)
+        * (extent.y / cell).max(1.0)
+        * (extent.z / cell).max(1.0);
+    let target = target_balls.max(1) as f32;
+    let scale = (estimate / target).cbrt();
+    cell = (cell * scale).max(0.02);
+    const GAP: f32 = 0.006; // keeps packed spheres from overlapping
+
+    let cells = |e: f32, c: f32| ((e / c).round().max(1.0)) as i32;
+    let (nx, ny, nz) = (cells(extent.x, cell), cells(extent.y, cell), cells(extent.z, cell));
+    let cell = Vec3::new(extent.x / nx as f32, extent.y / ny as f32, extent.z / nz as f32);
+    // uniform diameter: tightest cell axis minus gap (fits the grid)
+    let diameter = (cell.x.min(cell.y).min(cell.z) - GAP).max(0.02);
+
+    let mut balls: Vec<Transform> = Vec::new();
+    for k in 0..nz {
+        let z = min.z + (k as f32 + 0.5) * cell.z;
+        for j in 0..ny {
+            let y = min.y + (j as f32 + 0.5) * cell.y;
+            for i in 0..nx {
+                let x = min.x + (i as f32 + 0.5) * cell.x;
+                let center = Vec3::new(x, y, z);
+                if !point_in_mesh(&mesh, center) {
+                    continue;
+                }
+                balls.push(Transform {
+                    location: world.transform_point(center),
+                    rotation: world.rotation,
+                    // uniform scale → exact sphere collider in the physics mirror
+                    scale: world.scale * Vec3::splat(diameter),
+                });
+            }
+        }
+    }
+    replace_with_particles(scene, id, balls, BreakKind::Balls)
+}
+
+/// Break via [`BreakKind`]: bricks (running bond) or balls (cubic pack).
+pub fn break_into(
+    scene: &mut Scene,
+    id: ObjectId,
+    kind: BreakKind,
+    target: usize,
+) -> Option<Vec<ObjectId>> {
+    match kind {
+        BreakKind::Bricks => break_into_bricks(scene, id, target),
+        BreakKind::Balls => break_into_balls(scene, id, target),
+    }
 }
 
 /// Point-in-mesh via ray-crossing parity — meaningful for closed meshes
@@ -1092,6 +1241,41 @@ mod tests {
             ball.primitive,
             Primitive::UvSphere { segments: 24, rings: 12, radius: 1.0 }
         );
+        assert_eq!(scene.objects().len(), 1);
+    }
+
+    #[test]
+    fn any_solid_object_breaks_into_balls_and_rebuilds() {
+        let mut scene = Scene::new();
+        let mut t = Transform::default();
+        t.location = Vec3::new(0.0, 0.0, 1.0);
+        let sphere = scene.add_object(
+            Primitive::UvSphere { segments: 24, rings: 12, radius: 1.0 },
+            t,
+        );
+        scene.object_mut(sphere).unwrap().name = "Ball".to_string();
+
+        let balls =
+            break_into_balls(&mut scene, sphere, DEFAULT_PARTICLES).expect("sphere breaks");
+        assert!(scene.object(sphere).is_none(), "the sphere is replaced");
+        assert!(balls.len() > 40, "got {} balls", balls.len());
+        for &id in &balls {
+            let o = scene.object(id).unwrap();
+            assert!(o.dynamic);
+            assert!(
+                matches!(o.primitive, Primitive::UvSphere { .. }),
+                "particles are spheres"
+            );
+            // uniform scale so physics can use an exact sphere
+            let s = o.transform.scale;
+            assert!((s.x - s.y).abs() < 1e-4 && (s.y - s.z).abs() < 1e-4);
+            let d = (o.transform.location - Vec3::new(0.0, 0.0, 1.0)).length();
+            assert!(d < 1.0 + 1e-3, "ball center {d} outside the sphere");
+        }
+
+        let folder = rebuildable_folder(&scene, balls[0]).expect("rebuildable");
+        let restored = rebuild_wall_from_folder(&mut scene, folder).unwrap();
+        assert_eq!(scene.object(restored).unwrap().name, "Ball");
         assert_eq!(scene.objects().len(), 1);
     }
 

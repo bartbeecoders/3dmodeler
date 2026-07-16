@@ -139,7 +139,9 @@ fn hash_transform(h: &mut DefaultHasher, t: &Transform) {
 }
 
 fn no_volume(object: &modeler_core::Object) -> bool {
-    object.primitive.is_light() || matches!(object.primitive, Primitive::Empty { .. })
+    object.primitive.is_light()
+        || matches!(object.primitive, Primitive::Empty { .. })
+        || object.primitive.is_rope()
 }
 
 /// True when any object's stack references `tool` as a boolean tool.

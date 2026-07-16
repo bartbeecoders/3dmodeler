@@ -23,6 +23,7 @@ enum PieItem {
     /// Gable by default; the other shapes live in the Add menu and the
     /// sidebar Type selector.
     Roof,
+    Rope,
 }
 
 /// Slot order around the wheel, starting north and going clockwise.
@@ -30,8 +31,6 @@ enum PieItem {
 fn pie_items() -> [(PieItem, &'static str); 12] {
     // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
     let c = Primitive::catalog();
-    // point light; other kinds via the properties panel or the Add menu
-    let light = Primitive::light_catalog()[0];
     [
         (PieItem::Primitive(c[1]), "Cube"),
         (PieItem::Primitive(c[2]), "UV Sphere"),
@@ -40,7 +39,7 @@ fn pie_items() -> [(PieItem, &'static str); 12] {
         (PieItem::Primitive(c[4]), "Cylinder"),
         (PieItem::Primitive(c[6]), "Torus"),
         (PieItem::Primitive(c[0]), "Plane"),
-        (PieItem::Primitive(light), "Light"),
+        (PieItem::Rope, "Rope"),
         (PieItem::Primitive(c[7]), "Empty"),
         (PieItem::Roof, "Roof"),
         (PieItem::Floor, "Floor"),
@@ -53,6 +52,7 @@ fn slot_icon(item: PieItem) -> PieIcon {
         PieItem::Wall => PieIcon::Wall,
         PieItem::Floor => PieIcon::Floor,
         PieItem::Roof => PieIcon::Roof,
+        PieItem::Rope => PieIcon::Rope,
         PieItem::Primitive(primitive) => pie::primitive_icon(&primitive),
     }
 }
@@ -203,6 +203,17 @@ impl AddMenu {
                             None => roof_tool.start(kind),
                         }
                     }
+                    PieItem::Rope => {
+                        let id = scene.add_object(
+                            Primitive::Rope {
+                                length: 2.0,
+                                radius: 0.03,
+                                segments: 12,
+                            },
+                            Transform::default(),
+                        );
+                        selection.set(vec![id], Some(id));
+                    }
                 }
             }
             self.open = false;
@@ -225,6 +236,20 @@ pub fn mesh_menu_buttons(ui: &mut egui::Ui) -> Option<Primitive> {
         if pie::icon_menu_button(ui, &pie::primitive_icon(&primitive), &label).clicked() {
             clicked = Some(primitive);
         }
+    }
+    let rope = Primitive::Rope {
+        length: 2.0,
+        radius: 0.03,
+        segments: 12,
+    };
+    if pie::icon_menu_button(ui, &pie::primitive_icon(&rope), "Rope")
+        .on_hover_text(
+            "Flexible rope with physics: set Start/End anchors on other \
+             objects in the properties panel, then press Play",
+        )
+        .clicked()
+    {
+        clicked = Some(rope);
     }
     clicked
 }

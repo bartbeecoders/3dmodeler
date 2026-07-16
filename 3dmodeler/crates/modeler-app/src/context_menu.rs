@@ -9,6 +9,11 @@
 //! right-clicking a vertex/edge/face offers "set as pivot / anchor" (same
 //! as the P/A keys).
 //!
+//! The object wheel is multi-level:
+//! - **Break** → Bricks / Balls (shatter into dynamic particles)
+//! - **Set material** → Color / Roughness / Metallic (opens a small editor)
+//! Esc / RMB on a sub-menu goes back to the root; on the root they dismiss.
+//!
 //! main.rs decides what was hit (physics ray in object mode, element pick in
 //! edit mode) and calls `open`; the wheel is drawn from UiState::draw. Like
 //! the Shift+A wheel, clicks are consumed in `handle_events` (runs after the
@@ -16,11 +21,11 @@
 
 use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
-use crate::object_ops;
+use crate::object_ops::{self, BreakKind};
 use crate::pie::{self, PieIcon, PieSlot};
 use crate::selection::Selection;
 use modeler_core::glam::Vec3;
-use modeler_core::{ObjectId, Primitive, Scene, WallCutout};
+use modeler_core::{Material, ObjectId, Primitive, Scene, WallCutout};
 use three_d::egui;
 use three_d::{Event, Key, MouseButton};
 
@@ -32,20 +37,56 @@ pub enum Target {
     Element { id: ObjectId, point: Vec3, label: &'static str },
 }
 
+/// Which ring of the object pie is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuLevel {
+    /// Main object operations.
+    Root,
+    /// Break → Bricks / Balls.
+    Break,
+    /// Set material → Color / Roughness / Metallic.
+    Material,
+}
+
+/// Material property being edited in the post-pie popup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaterialField {
+    Color,
+    Roughness,
+    Metallic,
+}
+
+/// Floating editor opened from Set material → …
+struct MaterialEditor {
+    id: ObjectId,
+    field: MaterialField,
+    /// Working values (all three kept so the object stays consistent).
+    material: Material,
+    /// Screen position for the popup (where the pie was).
+    pos: egui::Pos2,
+}
+
 /// What the westward slots offer: wall openings, brick→wall rebuild or
-/// group/attach actions.
+/// group/attach actions. Optional trailing slots are recorded by index so
+/// execute does not depend on how many extras were pushed.
 enum WheelKind {
     Object {
-        /// (length, height) when the object is a pristine wall.
         wall: Option<(f32, f32)>,
-        /// The bricks folder when the object came from a broken wall.
         rebuild: Option<u64>,
+        apply_slot: Option<usize>,
+        break_slot: Option<usize>,
+        material_slot: Option<usize>,
     },
+    BreakSub,
+    MaterialSub,
     Element,
 }
 
 pub struct ContextMenu {
     state: Option<(egui::Pos2, Target)>,
+    level: MenuLevel,
+    /// Popup after choosing Color / Roughness / Metallic.
+    material_edit: Option<MaterialEditor>,
     /// Guards event handling on the frame the menu opened (the opening RMB
     /// press is already in this frame's event list, marked handled).
     just_opened: bool,
@@ -59,6 +100,8 @@ impl ContextMenu {
     pub fn new() -> Self {
         Self {
             state: None,
+            level: MenuLevel::Root,
+            material_edit: None,
             just_opened: false,
             pending_click: false,
             anim: 0.0,
@@ -67,6 +110,8 @@ impl ContextMenu {
 
     pub fn open(&mut self, pos: egui::Pos2, target: Target) {
         self.state = Some((pos, target));
+        self.level = MenuLevel::Root;
+        self.material_edit = None;
         self.just_opened = true;
         self.pending_click = false;
         self.anim = 0.0;
@@ -74,20 +119,57 @@ impl ContextMenu {
 
     pub fn close(&mut self) {
         self.state = None;
+        self.level = MenuLevel::Root;
+        self.material_edit = None;
         self.pending_click = false;
+    }
+
+    /// True while the pie or a material property popup is up (blocks Tab for
+    /// edit mode, etc.).
+    pub fn is_open(&self) -> bool {
+        self.state.is_some() || self.material_edit.is_some()
+    }
+
+    fn go_back_or_close(&mut self) {
+        match self.level {
+            MenuLevel::Root => self.close(),
+            MenuLevel::Break | MenuLevel::Material => {
+                self.level = MenuLevel::Root;
+                self.anim = 0.0;
+                self.pending_click = false;
+            }
+        }
     }
 
     /// Consume clicks/Esc while the wheel is open so a commit click never
     /// falls through to viewport picking. Runs after the egui pass and
     /// after the RMB opener (see main.rs), hence the `just_opened` guard.
     pub fn handle_events(&mut self, events: &mut [Event]) {
+        // Material popup is normal egui UI — only Esc dismisses it here.
+        if self.material_edit.is_some() {
+            for event in events.iter_mut() {
+                if let Event::KeyPress {
+                    kind: Key::Escape,
+                    handled,
+                    ..
+                } = event
+                {
+                    if !*handled {
+                        self.material_edit = None;
+                        *handled = true;
+                    }
+                }
+            }
+            return;
+        }
+
         if self.state.is_none() || self.just_opened {
             return;
         }
         for event in events.iter_mut() {
             match event {
                 Event::KeyPress { kind: Key::Escape, handled, .. } if !*handled => {
-                    self.close();
+                    self.go_back_or_close();
                     *handled = true;
                 }
                 Event::MousePress { button, handled, .. } => {
@@ -99,7 +181,8 @@ impl ContextMenu {
                         if *button == MouseButton::Left {
                             self.pending_click = true;
                         } else {
-                            self.close(); // RMB / MMB cancels
+                            // RMB / MMB: back one level, or dismiss at root
+                            self.go_back_or_close();
                         }
                     }
                 }
@@ -108,7 +191,8 @@ impl ContextMenu {
         }
     }
 
-    /// Draw the wheel; returns a status-bar message when an action ran.
+    /// Draw the wheel or material popup; returns a status-bar message when
+    /// an action ran.
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -116,14 +200,34 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
-        brick_dialog: &mut Option<i32>,
+        break_dialog: &mut Option<(BreakKind, i32)>,
     ) -> Option<String> {
+        // Material property popup (pie already dismissed).
+        if self.material_edit.is_some() {
+            return self.draw_material_editor(ctx, scene);
+        }
+
         let Some((pos, target)) = self.state else { return None };
         let mut status = None;
 
-        // build the slot ring for the current target
-        let (kind, slots, hub) = match target {
-            Target::Object { id, .. } => {
+        // build the slot ring for the current target + menu level
+        let (kind, slots, hub) = match (self.level, target) {
+            (MenuLevel::Break, Target::Object { .. }) => {
+                let slots = vec![
+                    PieSlot::new("Bricks", PieIcon::Bricks),
+                    PieSlot::new("Balls", PieIcon::Balls),
+                ];
+                (WheelKind::BreakSub, slots, "Break".to_string())
+            }
+            (MenuLevel::Material, Target::Object { .. }) => {
+                let slots = vec![
+                    PieSlot::new("Color", PieIcon::MaterialColor),
+                    PieSlot::new("Roughness", PieIcon::MaterialRoughness),
+                    PieSlot::new("Metallic", PieIcon::MaterialMetallic),
+                ];
+                (WheelKind::MaterialSub, slots, "Material".to_string())
+            }
+            (_, Target::Object { id, .. }) => {
                 let Some(object) = scene.object(id) else {
                     self.close();
                     return None;
@@ -140,6 +244,7 @@ impl ContextMenu {
                 let rebuild = crate::object_ops::rebuildable_folder(scene, id);
                 let multi =
                     selection.selected().len() >= 2 && selection.active().is_some();
+                let has_modifiers = !object.modifiers.is_empty();
                 let mut slots = vec![
                     PieSlot::new("Duplicate", PieIcon::Duplicate), // N
                     PieSlot::new("Pivot here", PieIcon::Glyph("⌖")), // NE
@@ -161,15 +266,43 @@ impl ContextMenu {
                     slots.push(PieSlot::new("Group", PieIcon::Glyph("❐")).enabled(multi)); // W
                     slots.push(PieSlot::new("Attach", PieIcon::Attach).enabled(multi)); // NW
                 }
-                // slot 8: any solid object can shatter into dynamic bricks
-                let breakable = !object.primitive.is_light()
+                // Bake the non-destructive stack (same as the sidebar Apply).
+                let apply_slot = if has_modifiers {
+                    slots.push(PieSlot::new("Apply modifier", PieIcon::Glyph("✓")));
+                    Some(slots.len() - 1)
+                } else {
+                    None
+                };
+                // Material for solids (lights/empties have no surface material).
+                let has_material = !object.primitive.is_light()
                     && !matches!(object.primitive, Primitive::Empty { .. });
-                if breakable {
-                    slots.push(PieSlot::new("Bricks", PieIcon::Bricks));
-                }
-                (WheelKind::Object { wall, rebuild }, slots, hub_label(&object.name))
+                let material_slot = if has_material {
+                    slots.push(PieSlot::new("Set material", PieIcon::MaterialColor));
+                    Some(slots.len() - 1)
+                } else {
+                    None
+                };
+                // Any solid object can shatter into dynamic particles (not ropes).
+                let breakable = has_material && !object.primitive.is_rope();
+                let break_slot = if breakable {
+                    slots.push(PieSlot::new("Break", PieIcon::Bricks));
+                    Some(slots.len() - 1)
+                } else {
+                    None
+                };
+                (
+                    WheelKind::Object {
+                        wall,
+                        rebuild,
+                        apply_slot,
+                        break_slot,
+                        material_slot,
+                    },
+                    slots,
+                    hub_label(&object.name),
+                )
             }
-            Target::Element { label, .. } => {
+            (_, Target::Element { label, .. }) => {
                 let slots = vec![
                     PieSlot::new("Pivot  (P)", PieIcon::Glyph("⌖")), // N
                     PieSlot::new("Anchor  (A)", PieIcon::Anchor),    // S
@@ -178,19 +311,227 @@ impl ContextMenu {
             }
         };
 
-        let hovered = pie::draw(ctx, "context-pie", pos, &hub, &slots, &mut self.anim);
+        let pie_id = match self.level {
+            MenuLevel::Root => "context-pie",
+            MenuLevel::Break => "context-pie-break",
+            MenuLevel::Material => "context-pie-material",
+        };
+        let hovered = pie::draw(ctx, pie_id, pos, &hub, &slots, &mut self.anim);
 
         if self.pending_click {
             self.pending_click = false;
             if let Some(slot) = hovered {
+                // Parent slots: open a sub-menu instead of closing.
+                if let WheelKind::Object {
+                    break_slot,
+                    material_slot,
+                    ..
+                } = kind
+                {
+                    if break_slot == Some(slot) {
+                        self.level = MenuLevel::Break;
+                        self.anim = 0.0;
+                        self.just_opened = false;
+                        return None;
+                    }
+                    if material_slot == Some(slot) {
+                        self.level = MenuLevel::Material;
+                        self.anim = 0.0;
+                        self.just_opened = false;
+                        return None;
+                    }
+                }
+                // Material sub: open the property editor popup.
+                if matches!(kind, WheelKind::MaterialSub) {
+                    if let Target::Object { id, .. } = target {
+                        if let Some(material) = scene.object_material(id) {
+                            let field = match slot {
+                                0 => MaterialField::Color,
+                                1 => MaterialField::Roughness,
+                                _ => MaterialField::Metallic,
+                            };
+                            self.material_edit = Some(MaterialEditor {
+                                id,
+                                field,
+                                material,
+                                pos,
+                            });
+                            self.state = None;
+                            self.level = MenuLevel::Root;
+                            self.just_opened = false;
+                            return None;
+                        }
+                    }
+                }
                 status = self.execute(
-                    slot, kind, target, scene, selection, modal, library_panel, brick_dialog,
+                    slot,
+                    kind,
+                    target,
+                    scene,
+                    selection,
+                    modal,
+                    library_panel,
+                    break_dialog,
                 );
+                self.close();
+            } else {
+                // click on empty: dismiss
+                self.close();
             }
-            self.state = None;
         }
         self.just_opened = false;
         status
+    }
+
+    /// Color / roughness / metallic popup; live-updates the object.
+    fn draw_material_editor(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+    ) -> Option<String> {
+        // Object may have been deleted while the popup was open.
+        let still_there = self
+            .material_edit
+            .as_ref()
+            .is_some_and(|e| scene.object(e.id).is_some());
+        if self.material_edit.is_some() && !still_there {
+            self.material_edit = None;
+            return None;
+        }
+        let Some(edit) = self.material_edit.as_mut() else {
+            return None;
+        };
+
+        let title = match edit.field {
+            MaterialField::Color => "Base color",
+            MaterialField::Roughness => "Roughness",
+            MaterialField::Metallic => "Metallic",
+        };
+        let field = edit.field;
+        let id = edit.id;
+        let mut open = true;
+        let mut changed = false;
+        let mut done = false;
+
+        egui::Window::new(title)
+            .id(egui::Id::new("context-material-edit"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(edit.pos + egui::vec2(12.0, 12.0))
+            .show(ctx, |ui| {
+                match field {
+                    MaterialField::Color => {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            if ui
+                                .color_edit_button_rgb(&mut edit.material.base_color)
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                        // quick swatches for common materials
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Presets").weak().small());
+                        ui.horizontal(|ui| {
+                            for (label, rgb) in [
+                                ("Gray", [0.8, 0.8, 0.8]),
+                                ("White", [0.95, 0.95, 0.95]),
+                                ("Red", [0.75, 0.15, 0.12]),
+                                ("Brick", [0.55, 0.25, 0.18]),
+                                ("Wood", [0.45, 0.32, 0.18]),
+                                ("Metal", [0.7, 0.72, 0.75]),
+                            ] {
+                                let color = egui::Color32::from_rgb(
+                                    (rgb[0] * 255.0) as u8,
+                                    (rgb[1] * 255.0) as u8,
+                                    (rgb[2] * 255.0) as u8,
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new("")
+                                            .fill(color)
+                                            .min_size(egui::vec2(22.0, 18.0)),
+                                    )
+                                    .on_hover_text(label)
+                                    .clicked()
+                                {
+                                    edit.material.base_color = rgb;
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                    MaterialField::Roughness => {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut edit.material.roughness, 0.0..=1.0)
+                                    .text("Roughness"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.horizontal(|ui| {
+                            for (label, v) in [
+                                ("Matte", 1.0),
+                                ("0.7", 0.7),
+                                ("Satin", 0.4),
+                                ("Gloss", 0.15),
+                                ("Mirror", 0.0),
+                            ] {
+                                if ui.small_button(label).clicked() {
+                                    edit.material.roughness = v;
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                    MaterialField::Metallic => {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut edit.material.metallic, 0.0..=1.0)
+                                    .text("Metallic"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.horizontal(|ui| {
+                            for (label, v) in [
+                                ("Dielectric", 0.0),
+                                ("0.5", 0.5),
+                                ("Metal", 1.0),
+                            ] {
+                                if ui.small_button(label).clicked() {
+                                    edit.material.metallic = v;
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+                if ui.button("Done").clicked() {
+                    done = true;
+                }
+            });
+
+        if changed {
+            let mut next = scene.object_material(id).unwrap_or(edit.material);
+            match field {
+                MaterialField::Color => next.base_color = edit.material.base_color,
+                MaterialField::Roughness => next.roughness = edit.material.roughness,
+                MaterialField::Metallic => next.metallic = edit.material.metallic,
+            }
+            scene.set_object_material(id, next);
+        }
+
+        if done || !open {
+            self.material_edit = None;
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -203,11 +544,37 @@ impl ContextMenu {
         selection: &mut Selection,
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
-        brick_dialog: &mut Option<i32>,
+        break_dialog: &mut Option<(BreakKind, i32)>,
     ) -> Option<String> {
         match (kind, target) {
-            (WheelKind::Object { wall, rebuild }, Target::Object { id, hit_local }) => {
+            (WheelKind::BreakSub, Target::Object { .. }) => {
+                let kind = if slot == 0 {
+                    BreakKind::Bricks
+                } else {
+                    BreakKind::Balls
+                };
+                *break_dialog =
+                    Some((kind, crate::object_ops::DEFAULT_PARTICLES as i32));
+                None
+            }
+            (WheelKind::MaterialSub, _) => None, // handled before execute
+            (
+                WheelKind::Object {
+                    wall,
+                    rebuild,
+                    apply_slot,
+                    break_slot: _,
+                    material_slot: _,
+                },
+                Target::Object { id, hit_local },
+            ) => {
                 let name = scene.object(id).map(|o| o.name.clone()).unwrap_or_default();
+                if apply_slot == Some(slot) {
+                    return Some(
+                        crate::modifiers::apply(scene, id, usize::MAX)
+                            .unwrap_or_else(|e| e),
+                    );
+                }
                 match slot {
                     0 => {
                         if modal::duplicate_selection(scene, selection) {
@@ -243,7 +610,6 @@ impl ContextMenu {
                         None
                     }
                     6 | 7 => match wall {
-                        // wall wheel: cut an opening at the clicked point
                         Some((length, height)) => {
                             let (cutout, what) = if slot == 6 {
                                 (WallCutout::door(hit_local.x, length, height), "door")
@@ -264,8 +630,6 @@ impl ContextMenu {
                             }
                             Some(format!("{what} added to '{name}'"))
                         }
-                        // object wheel W: rebuild wall (bricks), else
-                        // group/ungroup
                         None if slot == 6 => {
                             if let Some(folder) = rebuild {
                                 return object_ops::rebuild_wall_from_folder(
@@ -305,11 +669,6 @@ impl ContextMenu {
                             None
                         }
                     },
-                    8 => {
-                        // opens the brick-count dialog; the break happens there
-                        *brick_dialog = Some(crate::object_ops::DEFAULT_BRICKS as i32);
-                        None
-                    }
                     _ => None,
                 }
             }

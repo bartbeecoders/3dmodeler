@@ -16,6 +16,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use three_d::*;
 
+/// Resolve the object's full render material (master + MPC + world effects).
+fn render_material(scene: &Scene, id: ObjectId) -> Material {
+    scene
+        .object_material_for_render(id)
+        .unwrap_or_default()
+}
+
 /// Viewport shading mode (Blender's Z pie, reduced).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ShadeMode {
@@ -39,8 +46,11 @@ pub enum LightingMode {
 
 // Blender's outline colors: light orange for the active object, darker
 // orange for other selected objects; red warns about overlaps while placing.
+// Purple marks a non-empty (unapplied) modifier stack on the selected mesh.
 const ACTIVE_OUTLINE: Srgba = Srgba::new(255, 170, 64, 255);
 const SELECTED_OUTLINE: Srgba = Srgba::new(230, 110, 20, 255);
+const ACTIVE_MODIFIER_OUTLINE: Srgba = Srgba::new(200, 140, 255, 255);
+const SELECTED_MODIFIER_OUTLINE: Srgba = Srgba::new(150, 80, 230, 255);
 const OVERLAP_OUTLINE: Srgba = Srgba::new(235, 60, 50, 255);
 const OUTLINE_SCALE: f32 = 1.015;
 
@@ -66,28 +76,45 @@ enum OutlineTier {
     None,
     Selected,
     Active,
+    /// Selected, with a non-empty unapplied modifier stack.
+    SelectedModifier,
+    /// Active selection, with a non-empty unapplied modifier stack.
+    ActiveModifier,
     Overlap,
 }
 
 impl OutlineTier {
-    fn of(id: ObjectId, selection: &Selection, overlaps: &HashSet<ObjectId>) -> Self {
+    fn of(
+        id: ObjectId,
+        selection: &Selection,
+        overlaps: &HashSet<ObjectId>,
+        has_modifiers: bool,
+    ) -> Self {
         if !selection.is_selected(id) {
             Self::None
         } else if overlaps.contains(&id) {
             Self::Overlap
         } else if selection.active() == Some(id) {
-            Self::Active
+            if has_modifiers {
+                Self::ActiveModifier
+            } else {
+                Self::Active
+            }
+        } else if has_modifiers {
+            Self::SelectedModifier
         } else {
             Self::Selected
         }
     }
 
-    // outline: overlap warning > active > selected
+    // outline: overlap warning > active/selected (+ purple when modifiers)
     fn color(self) -> Option<Srgba> {
         match self {
             Self::None => None,
             Self::Selected => Some(SELECTED_OUTLINE),
             Self::Active => Some(ACTIVE_OUTLINE),
+            Self::SelectedModifier => Some(SELECTED_MODIFIER_OUTLINE),
+            Self::ActiveModifier => Some(ACTIVE_MODIFIER_OUTLINE),
             Self::Overlap => Some(OVERLAP_OUTLINE),
         }
     }
@@ -105,6 +132,8 @@ struct GroupKey {
     /// object materials entirely (so any-material duplicates group there).
     roughness: f32,
     metallic: f32,
+    alpha: f32,
+    emissive: [f32; 3],
     mode: ShadeMode,
     xray: bool,
     tier: OutlineTier,
@@ -117,6 +146,10 @@ fn group_hash(key: &GroupKey) -> u64 {
     key.subdivision.hash(&mut h);
     hash_f32(&mut h, key.roughness);
     hash_f32(&mut h, key.metallic);
+    hash_f32(&mut h, key.alpha);
+    hash_f32(&mut h, key.emissive[0]);
+    hash_f32(&mut h, key.emissive[1]);
+    hash_f32(&mut h, key.emissive[2]);
     key.mode.hash(&mut h);
     key.xray.hash(&mut h);
     key.tier.hash(&mut h);
@@ -138,12 +171,17 @@ fn group_mesh_hash(key: &GroupKey) -> u64 {
 /// unique (edited meshes, walls with cutouts, shaped floors) or it is a
 /// light gizmo (colored by its primitive; excluded from shadow casters).
 fn instance_key(
+    scene: &Scene,
     object: &modeler_core::Object,
     tier: OutlineTier,
     mode: ShadeMode,
     xray: bool,
 ) -> Option<(u64, GroupKey)> {
     if object.edited_mesh.is_some() || object.primitive.is_light() {
+        return None;
+    }
+    // live draped ropes rebuild every frame — not instanceable
+    if object.rope_nodes.is_some() {
         return None;
     }
     if matches!(object.primitive, Primitive::Wall { .. }) && !object.cutouts.is_empty() {
@@ -154,9 +192,15 @@ fn instance_key(
     }
     // boolean modifiers make the mesh depend on other objects: unique
     let subdivision = object.subdivision_only_levels()?;
-    let (roughness, metallic) = match mode {
-        ShadeMode::Solid => (0.0, 0.0),
-        _ => (object.material.roughness, object.material.metallic),
+    let mat = render_material(scene, object.id);
+    // Transparent / emissive materials skip instancing so alpha blend and
+    // glow stay correct per object.
+    if mat.alpha < 0.999 || mat.emissive_rgb().iter().any(|&c| c > 1e-4) {
+        return None;
+    }
+    let (roughness, metallic, alpha, emissive) = match mode {
+        ShadeMode::Solid => (0.0, 0.0, 1.0, [0.0, 0.0, 0.0]),
+        _ => (mat.roughness, mat.metallic, mat.alpha, mat.emissive_rgb()),
     };
     let key = GroupKey {
         primitive: object.primitive,
@@ -164,6 +208,8 @@ fn instance_key(
         subdivision,
         roughness,
         metallic,
+        alpha,
+        emissive,
         mode,
         xray,
         tier,
@@ -228,11 +274,15 @@ fn physical_material(
     mode: ShadeMode,
     xray: bool,
 ) -> PhysicalMaterial {
-    let alpha = if xray { 110 } else { 255 };
+    let mat_alpha = if xray {
+        110
+    } else {
+        (material.alpha.clamp(0.0, 1.0) * 255.0) as u8
+    };
     let cpu = if let Primitive::Light { color, .. } = primitive {
         // light gizmos glow in their own color, in every shading mode
         CpuMaterial {
-            albedo: Srgba::new(25, 25, 25, alpha),
+            albedo: Srgba::new(25, 25, 25, mat_alpha),
             emissive: srgb(*color, 255),
             roughness: 1.0,
             metallic: 0.0,
@@ -240,19 +290,32 @@ fn physical_material(
         }
     } else {
         // Solid ignores the object material for a uniform studio look
-        let ([r, g, b], roughness, metallic) = match mode {
-            ShadeMode::Solid => ([0.72, 0.72, 0.75], 0.85, 0.0),
-            _ => (material.base_color, material.roughness, material.metallic),
+        let ([r, g, b], roughness, metallic, emissive) = match mode {
+            ShadeMode::Solid => ([0.72, 0.72, 0.75], 0.85, 0.0, [0.0, 0.0, 0.0]),
+            _ => (
+                material.base_color,
+                material.roughness,
+                material.metallic,
+                material.emissive_rgb(),
+            ),
         };
+        // Encode HDR-ish emissive into 8-bit by clamping; strength already applied
+        let em = [
+            emissive[0].clamp(0.0, 1.0),
+            emissive[1].clamp(0.0, 1.0),
+            emissive[2].clamp(0.0, 1.0),
+        ];
         CpuMaterial {
-            albedo: srgb([r, g, b], alpha),
+            albedo: srgb([r, g, b], mat_alpha),
             roughness,
             metallic,
+            emissive: srgb(em, 255),
+            occlusion_strength: material.occlusion.clamp(0.0, 1.0),
             ..Default::default()
         }
     };
-    if xray {
-        // see-through: alpha blend both faces
+    let transparent = xray || (mode != ShadeMode::Solid && material.alpha < 0.999);
+    if transparent {
         let mut m = PhysicalMaterial::new_transparent(context, &cpu);
         m.render_states.cull = Cull::None;
         m
@@ -261,12 +324,11 @@ fn physical_material(
     }
 }
 
-/// Per-instance color: the object's base color in Shaded mode (multiplied
-/// onto the group's white albedo); white in Solid, whose gray albedo lives
-/// on the material.
-fn instance_color(object: &modeler_core::Object, mode: ShadeMode) -> Srgba {
+/// Per-instance color: the object's resolved base color in Shaded mode
+/// (multiplied onto the group's white albedo); white in Solid.
+fn instance_color(scene: &Scene, id: ObjectId, mode: ShadeMode) -> Srgba {
     match mode {
-        ShadeMode::Shaded => srgb(object.material.base_color, 255),
+        ShadeMode::Shaded => srgb(render_material(scene, id).base_color, 255),
         _ => Srgba::WHITE,
     }
 }
@@ -313,13 +375,20 @@ impl SceneRender {
             }
             let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
             let transformation = transform_mat(&world);
-            let tier = OutlineTier::of(object.id, selection, overlaps);
-            match instance_key(object, tier, mode, xray) {
+            let tier = OutlineTier::of(
+                object.id,
+                selection,
+                overlaps,
+                !object.modifiers.is_empty(),
+            );
+            match instance_key(scene, object, tier, mode, xray) {
                 Some((hash, key)) => match buckets.entry(hash) {
                     Entry::Occupied(mut e) if e.get().key == key => {
-                        e.get_mut()
-                            .members
-                            .push((object.id, transformation, instance_color(object, mode)));
+                        e.get_mut().members.push((
+                            object.id,
+                            transformation,
+                            instance_color(scene, object.id, mode),
+                        ));
                     }
                     // different key hashed to the same bucket: draw solo
                     Entry::Occupied(_) => singles.push((object.id, transformation, tier)),
@@ -330,7 +399,7 @@ impl SceneRender {
                             members: vec![(
                                 object.id,
                                 transformation,
-                                instance_color(object, mode),
+                                instance_color(scene, object.id, mode),
                             )],
                         });
                     }
@@ -436,6 +505,10 @@ impl SceneRender {
                         base_color: [1.0, 1.0, 1.0],
                         roughness: key.roughness,
                         metallic: key.metallic,
+                        alpha: key.alpha,
+                        emissive: key.emissive,
+                        emissive_strength: 1.0,
+                        ..Default::default()
                     },
                     &key.primitive,
                     mode,
@@ -479,6 +552,7 @@ impl SceneRender {
         xray: bool,
     ) {
         let modifier_stamp = crate::modifiers::stamp(scene, object.id);
+        let mat = render_material(scene, object.id);
         let rebuild_mesh = match self.cache.get(&object.id) {
             Some(cached) => {
                 cached.primitive != object.primitive
@@ -490,9 +564,7 @@ impl SceneRender {
         };
         let rebuild_material = match self.cache.get(&object.id) {
             Some(cached) => {
-                cached.material != object.material
-                    || cached.mode != mode
-                    || cached.xray != xray
+                cached.material != mat || cached.mode != mode || cached.xray != xray
             }
             None => true,
         };
@@ -540,7 +612,7 @@ impl SceneRender {
                 let cpu_mesh = to_cpu_mesh(&new_mesh);
                 let model = Gm::new(
                     Mesh::new(context, &cpu_mesh),
-                    physical_material(context, &object.material, &object.primitive, mode, xray),
+                    physical_material(context, &mat, &object.primitive, mode, xray),
                 );
                 self.cache.insert(
                     object.id,
@@ -551,20 +623,27 @@ impl SceneRender {
                         modifier_stamp,
                         mode,
                         xray,
-                        material: object.material,
+                        material: mat,
                         cpu_mesh,
                         model,
                         outline: None,
                     },
                 );
+            } else if rebuild_material {
+                let cached = self.cache.get_mut(&object.id).unwrap();
+                cached.material = mat;
+                cached.mode = mode;
+                cached.xray = xray;
+                cached.model.material =
+                    physical_material(context, &mat, &object.primitive, mode, xray);
             }
         } else if rebuild_material {
             let cached = self.cache.get_mut(&object.id).unwrap();
-            cached.material = object.material;
+            cached.material = mat;
             cached.mode = mode;
             cached.xray = xray;
             cached.model.material =
-                physical_material(context, &object.material, &object.primitive, mode, xray);
+                physical_material(context, &mat, &object.primitive, mode, xray);
         }
 
         let cached = self.cache.get_mut(&object.id).unwrap();
@@ -747,6 +826,16 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             hash_f32(h, spot_angle_deg);
             shadows.hash(h);
         }
+        Primitive::Rope {
+            length,
+            radius,
+            segments,
+        } => {
+            12u8.hash(h);
+            hash_f32(h, length);
+            hash_f32(h, radius);
+            segments.hash(h);
+        }
     }
 }
 
@@ -904,7 +993,7 @@ pub struct WireframeCache {
 }
 
 /// One wireframe segment in world space; tier: 0 = normal, 1 = selected,
-/// 2 = active object.
+/// 2 = active, 3 = selected with modifiers, 4 = active with modifiers.
 pub type WireSegment = (glam::Vec3, glam::Vec3, u8);
 
 impl WireframeCache {
@@ -939,10 +1028,11 @@ impl WireframeCache {
                     .insert(object.id, (object.primitive, object.smooth, stamp, edges));
             }
             let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
+            let has_mod = !object.modifiers.is_empty();
             let tier = if selection.active() == Some(object.id) {
-                2
+                if has_mod { 4 } else { 2 }
             } else if selection.is_selected(object.id) {
-                1
+                if has_mod { 3 } else { 1 }
             } else {
                 0
             };
@@ -972,7 +1062,7 @@ mod tests {
         tier: OutlineTier,
         mode: ShadeMode,
     ) -> Option<(u64, GroupKey)> {
-        instance_key(scene.object(id).unwrap(), tier, mode, false)
+        instance_key(scene, scene.object(id).unwrap(), tier, mode, false)
     }
 
     #[test]
@@ -1000,6 +1090,40 @@ mod tests {
         let solid_a = key_of(&scene, a, OutlineTier::None, ShadeMode::Solid).unwrap();
         let solid_b = key_of(&scene, b, OutlineTier::None, ShadeMode::Solid).unwrap();
         assert_eq!(solid_a.1, solid_b.1, "Solid ignores materials entirely");
+    }
+
+    #[test]
+    fn modifier_stack_uses_purple_outline_tiers() {
+        use crate::selection::Selection;
+        use std::collections::HashSet;
+
+        let (mut scene, a) = scene_with_cube();
+        let mut selection = Selection::default();
+        selection.set(vec![a], Some(a));
+        let empty = HashSet::new();
+
+        assert_eq!(
+            OutlineTier::of(a, &selection, &empty, false),
+            OutlineTier::Active
+        );
+        assert_eq!(
+            OutlineTier::of(a, &selection, &empty, true).color(),
+            Some(ACTIVE_MODIFIER_OUTLINE)
+        );
+
+        let b = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        selection.set(vec![a, b], Some(a));
+        assert_eq!(
+            OutlineTier::of(b, &selection, &empty, true).color(),
+            Some(SELECTED_MODIFIER_OUTLINE)
+        );
+        // overlap still wins over the modifier color
+        let mut overlaps = HashSet::new();
+        overlaps.insert(a);
+        assert_eq!(
+            OutlineTier::of(a, &selection, &overlaps, true),
+            OutlineTier::Overlap
+        );
     }
 
     #[test]

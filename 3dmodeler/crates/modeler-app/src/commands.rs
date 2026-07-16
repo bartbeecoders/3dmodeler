@@ -101,6 +101,11 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "modifiers": modifiers,
         "dynamic": object.dynamic,
         "density": object.density,
+        "initial_force": [
+            object.initial_force.x,
+            object.initial_force.y,
+            object.initial_force.z
+        ],
         "color": object.material.base_color,
         "show_label": object.show_label,
         "show_dimensions": object.show_dimensions,
@@ -129,6 +134,17 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             })
             .collect();
     }
+    if object.primitive.is_rope() {
+        let end_json = |end: modeler_core::RopeEnd| {
+            json!({
+                "object": end.object.map(|id| id.0),
+                "object_name": end.object.and_then(|id| scene.object(id).map(|o| o.name.clone())),
+                "local_point": [end.local_point.x, end.local_point.y, end.local_point.z],
+            })
+        };
+        json["rope_start"] = end_json(object.rope_start);
+        json["rope_end"] = end_json(object.rope_end);
+    }
     json
 }
 
@@ -153,6 +169,11 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
             ridge_x: true,
         }),
         "empty" => Some(catalog[7]),
+        "rope" => Some(Primitive::Rope {
+            length: 2.0,
+            radius: 0.03,
+            segments: 12,
+        }),
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
         "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
@@ -198,135 +219,261 @@ fn apply_object_params(
                 .collect()
         });
 
-    let object = scene.object_mut(id).ok_or("object vanished")?;
-    // wall dimensions (walls only; ignored elsewhere)
-    if let Primitive::Wall { length, height, thickness } = object.primitive {
-        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
-        let (l, h, t) = (get("length"), get("height"), get("thickness"));
-        if l.is_some() || h.is_some() || t.is_some() {
-            object.primitive = Primitive::Wall {
-                length: l.unwrap_or(length).max(0.01),
-                height: h.unwrap_or(height).max(0.01),
-                thickness: t.unwrap_or(thickness).max(0.002),
+    // rope attach params (applied after the main mut block so resolve can
+    // look up targets without a second mut borrow)
+    let rope_start_ref = params.get("rope_start").cloned();
+    let rope_end_ref = params.get("rope_end").cloned();
+    let rope_start_pt = match params.get("rope_start_point") {
+        Some(v) => Some(vec3_from(v).ok_or("rope_start_point must be [x, y, z]")?),
+        None => None,
+    };
+    let rope_end_pt = match params.get("rope_end_point") {
+        Some(v) => Some(vec3_from(v).ok_or("rope_end_point must be [x, y, z]")?),
+        None => None,
+    };
+
+    {
+        let object = scene.object_mut(id).ok_or("object vanished")?;
+        // wall dimensions (walls only; ignored elsewhere)
+        if let Primitive::Wall { length, height, thickness } = object.primitive {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let (l, h, t) = (get("length"), get("height"), get("thickness"));
+            if l.is_some() || h.is_some() || t.is_some() {
+                object.primitive = Primitive::Wall {
+                    length: l.unwrap_or(length).max(0.01),
+                    height: h.unwrap_or(height).max(0.01),
+                    thickness: t.unwrap_or(thickness).max(0.002),
+                };
+            }
+        }
+        // roof shape (roofs only; ignored elsewhere)
+        if let Primitive::Roof { kind, width, depth, height, overhang, ridge_x } =
+            object.primitive
+        {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let kind = match params.get("roof_kind").and_then(Value::as_str) {
+                Some(s) => modeler_core::RoofKind::from_name(s).ok_or_else(|| {
+                    format!("unknown roof_kind '{s}' (point|gable|hip|flat|shed|gambrel|mansard)")
+                })?,
+                None => kind,
+            };
+            object.primitive = Primitive::Roof {
+                kind,
+                width: get("width").unwrap_or(width).max(0.1),
+                depth: get("depth").unwrap_or(depth).max(0.1),
+                height: get("height").unwrap_or(height).max(0.02),
+                overhang: get("overhang").unwrap_or(overhang).max(0.0),
+                ridge_x: params
+                    .get("ridge_x")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(ridge_x),
             };
         }
-    }
-    // roof shape (roofs only; ignored elsewhere)
-    if let Primitive::Roof { kind, width, depth, height, overhang, ridge_x } =
-        object.primitive
-    {
-        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
-        let kind = match params.get("roof_kind").and_then(Value::as_str) {
-            Some(s) => modeler_core::RoofKind::from_name(s).ok_or_else(|| {
-                format!("unknown roof_kind '{s}' (point|gable|hip|flat|shed|gambrel|mansard)")
-            })?,
-            None => kind,
-        };
-        object.primitive = Primitive::Roof {
-            kind,
-            width: get("width").unwrap_or(width).max(0.1),
-            depth: get("depth").unwrap_or(depth).max(0.1),
-            height: get("height").unwrap_or(height).max(0.02),
-            overhang: get("overhang").unwrap_or(overhang).max(0.0),
-            ridge_x: params
-                .get("ridge_x")
-                .and_then(Value::as_bool)
-                .unwrap_or(ridge_x),
-        };
-    }
-    if let Some(cutouts) = cutouts {
-        object.cutouts = cutouts?;
-        object.mesh_revision += 1; // render/physics caches key on it
-    }
-    if let Some(location) = location {
-        object.transform.location = location?;
-    }
-    if let Some(rotation) = rotation {
-        let r = rotation?;
-        object.transform.rotation = Quat::from_euler(
-            EulerRot::XYZ,
-            r.x.to_radians(),
-            r.y.to_radians(),
-            r.z.to_radians(),
-        );
-    }
-    if let Some(scale) = scale {
-        object.transform.scale = scale?;
-    }
-    if let Some(pivot) = pivot {
-        object.pivot = pivot?;
-    }
-    if let Some(anchor) = anchor {
-        object.anchor = anchor?;
-    }
-    // light parameters (light objects only; "color" sets the LIGHT color)
-    if let Primitive::Light { kind, color: lcolor, intensity, spot_angle_deg, shadows } =
-        object.primitive
-    {
-        let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
-        let kind = match params.get("light_kind").and_then(Value::as_str) {
-            Some(s) => match s.to_ascii_lowercase().as_str() {
-                "point" => modeler_core::LightKind::Point,
-                "sun" => modeler_core::LightKind::Sun,
-                "spot" => modeler_core::LightKind::Spot,
-                other => return Err(format!("unknown light_kind '{other}' (point|sun|spot)")),
-            },
-            None => kind,
-        };
-        let lcolor = match color {
-            Some(c) => {
-                let c = c?;
-                [c.x, c.y, c.z]
+        // rope parameters (ropes only)
+        if let Primitive::Rope {
+            length,
+            radius,
+            segments,
+        } = object.primitive
+        {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let (l, r, s) = (
+                get("length"),
+                get("radius"),
+                params.get("segments").and_then(Value::as_u64).map(|v| v as u32),
+            );
+            if l.is_some() || r.is_some() || s.is_some() {
+                object.primitive = Primitive::Rope {
+                    length: l.unwrap_or(length).max(0.05),
+                    radius: r.unwrap_or(radius).max(0.001),
+                    segments: s.unwrap_or(segments).clamp(2, 64),
+                };
             }
-            None => lcolor,
-        };
-        object.primitive = Primitive::Light {
-            kind,
-            color: lcolor,
-            intensity: get("intensity").unwrap_or(intensity).max(0.0),
-            spot_angle_deg: get("spot_angle_deg")
-                .unwrap_or(spot_angle_deg)
-                .clamp(1.0, 160.0),
-            shadows: params
-                .get("shadows")
-                .and_then(Value::as_bool)
-                .unwrap_or(shadows),
-        };
-    } else if let Some(color) = color {
-        let c = color?;
-        object.material.base_color = [c.x, c.y, c.z];
-    }
-    if let Some(v) = params.get("smooth").and_then(Value::as_bool) {
-        object.smooth = v;
-    }
-    if let Some(v) = params.get("subdivision").and_then(Value::as_u64) {
-        // compatibility: maps onto the subdivision modifier in the stack
-        crate::modifiers::set_subdivision_on(object, v.min(4) as u8);
-    }
-    if let Some(v) = params.get("visible").and_then(Value::as_bool) {
-        object.visible = v;
-    }
-    if let Some(v) = params.get("dynamic").and_then(Value::as_bool) {
-        object.dynamic = v;
-    }
-    if let Some(v) = params.get("density").and_then(Value::as_f64) {
-        object.density = v as f32;
-    }
-    if let Some(v) = params.get("show_label").and_then(Value::as_bool) {
-        object.show_label = v;
-    }
-    if let Some(v) = params.get("show_dimensions").and_then(Value::as_bool) {
-        object.show_dimensions = v;
-    }
-    if let Some(v) = params.get("group").and_then(Value::as_bool) {
-        object.group = v;
-    }
-    if let Some(v) = params.get("new_name").and_then(Value::as_str) {
-        if !v.trim().is_empty() {
-            object.name = v.trim().to_string();
+        }
+        if let Some(cutouts) = cutouts {
+            object.cutouts = cutouts?;
+            object.mesh_revision += 1; // render/physics caches key on it
+        }
+        if let Some(location) = location {
+            object.transform.location = location?;
+        }
+        if let Some(rotation) = rotation {
+            let r = rotation?;
+            object.transform.rotation = Quat::from_euler(
+                EulerRot::XYZ,
+                r.x.to_radians(),
+                r.y.to_radians(),
+                r.z.to_radians(),
+            );
+        }
+        if let Some(scale) = scale {
+            object.transform.scale = scale?;
+        }
+        if let Some(pivot) = pivot {
+            object.pivot = pivot?;
+        }
+        if let Some(anchor) = anchor {
+            object.anchor = anchor?;
+        }
+        // light parameters (light objects only; "color" sets the LIGHT color)
+        if let Primitive::Light { kind, color: lcolor, intensity, spot_angle_deg, shadows } =
+            object.primitive
+        {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let kind = match params.get("light_kind").and_then(Value::as_str) {
+                Some(s) => match s.to_ascii_lowercase().as_str() {
+                    "point" => modeler_core::LightKind::Point,
+                    "sun" => modeler_core::LightKind::Sun,
+                    "spot" => modeler_core::LightKind::Spot,
+                    other => return Err(format!("unknown light_kind '{other}' (point|sun|spot)")),
+                },
+                None => kind,
+            };
+            let lcolor = match color {
+                Some(c) => {
+                    let c = c?;
+                    [c.x, c.y, c.z]
+                }
+                None => lcolor,
+            };
+            object.primitive = Primitive::Light {
+                kind,
+                color: lcolor,
+                intensity: get("intensity").unwrap_or(intensity).max(0.0),
+                spot_angle_deg: get("spot_angle_deg")
+                    .unwrap_or(spot_angle_deg)
+                    .clamp(1.0, 160.0),
+                shadows: params
+                    .get("shadows")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(shadows),
+            };
+        } else if let Some(color) = color {
+            let c = color?;
+            object.material.base_color = [c.x, c.y, c.z];
+        }
+        if let Some(v) = params.get("smooth").and_then(Value::as_bool) {
+            object.smooth = v;
+        }
+        if let Some(v) = params.get("subdivision").and_then(Value::as_u64) {
+            // compatibility: maps onto the subdivision modifier in the stack
+            crate::modifiers::set_subdivision_on(object, v.min(4) as u8);
+        }
+        if let Some(v) = params.get("visible").and_then(Value::as_bool) {
+            object.visible = v;
+        }
+        if let Some(v) = params.get("dynamic").and_then(Value::as_bool) {
+            object.dynamic = v;
+        }
+        if let Some(v) = params.get("density").and_then(Value::as_f64) {
+            object.density = v as f32;
+        }
+        if let Some(force) = params.get("initial_force") {
+            object.initial_force =
+                vec3_from(force).ok_or("initial_force must be [x, y, z]")?;
+        }
+        if let Some(v) = params.get("show_label").and_then(Value::as_bool) {
+            object.show_label = v;
+        }
+        if let Some(v) = params.get("show_dimensions").and_then(Value::as_bool) {
+            object.show_dimensions = v;
+        }
+        if let Some(v) = params.get("group").and_then(Value::as_bool) {
+            object.group = v;
+        }
+        if let Some(v) = params.get("new_name").and_then(Value::as_str) {
+            if !v.trim().is_empty() {
+                object.name = v.trim().to_string();
+            }
+        }
+    } // object mut borrow ends here
+
+    let is_rope = scene
+        .object(id)
+        .map(|o| o.primitive.is_rope())
+        .unwrap_or(false);
+    let mut rope_attach_changed = false;
+    if is_rope {
+        if let Some(v) = rope_start_ref {
+            let end = resolve_rope_end(scene, id, &v, rope_start_pt)?;
+            if let Some(object) = scene.object_mut(id) {
+                object.rope_start = end;
+            }
+            rope_attach_changed = true;
+        } else if let Some(pt) = rope_start_pt {
+            if let Some(object) = scene.object_mut(id) {
+                object.rope_start.local_point = pt;
+            }
+            rope_attach_changed = true;
+        }
+        if let Some(v) = rope_end_ref {
+            let end = resolve_rope_end(scene, id, &v, rope_end_pt)?;
+            if let Some(object) = scene.object_mut(id) {
+                object.rope_end = end;
+            }
+            rope_attach_changed = true;
+        } else if let Some(pt) = rope_end_pt {
+            if let Some(object) = scene.object_mut(id) {
+                object.rope_end.local_point = pt;
+            }
+            rope_attach_changed = true;
+        }
+        if rope_attach_changed {
+            // design-mode: place the cord on the new pins immediately
+            crate::rope_handles::snap_rope_rest_pose(scene, id);
         }
     }
     Ok(())
+}
+
+/// Resolve a rope-end attach target: `null` / `""` = free, otherwise an
+/// object name or id. Optional local point defaults to the target's anchor.
+fn resolve_rope_end(
+    scene: &Scene,
+    rope_id: ObjectId,
+    value: &Value,
+    local_point: Option<Vec3>,
+) -> Result<modeler_core::RopeEnd, String> {
+    if value.is_null() {
+        return Ok(modeler_core::RopeEnd::default());
+    }
+    if let Some(s) = value.as_str() {
+        if s.is_empty() || s.eq_ignore_ascii_case("free") || s.eq_ignore_ascii_case("none") {
+            return Ok(modeler_core::RopeEnd::default());
+        }
+        let target = resolve(scene, value)?;
+        if target == rope_id {
+            return Err("rope cannot anchor to itself".into());
+        }
+        let point = local_point.unwrap_or_else(|| {
+            scene
+                .object(target)
+                .map(|o| o.anchor)
+                .unwrap_or(Vec3::ZERO)
+        });
+        return Ok(modeler_core::RopeEnd {
+            object: Some(target),
+            local_point: point,
+        });
+    }
+    // numeric id
+    if value.as_u64().is_some() || value.as_i64().is_some() {
+        let target = resolve(scene, value)?;
+        if target == rope_id {
+            return Err("rope cannot anchor to itself".into());
+        }
+        let point = local_point.unwrap_or_else(|| {
+            scene
+                .object(target)
+                .map(|o| o.anchor)
+                .unwrap_or(Vec3::ZERO)
+        });
+        return Ok(modeler_core::RopeEnd {
+            object: Some(target),
+            local_point: point,
+        });
+    }
+    Err("rope_start / rope_end must be an object name/id, or null for free".into())
 }
 
 /// Resolve a reference-image reference: numeric id or (unique) name.
@@ -799,20 +946,34 @@ fn execute_inner(
             let object = scene.object(id).unwrap();
             Ok(json!({"id": id.0, "name": object.name, "status": message}))
         }
-        "break_into_bricks" => {
+        "break_into_bricks" | "break_into_balls" => {
             let id = resolve(scene, &command["object"])?;
+            let kind = if command["cmd"] == "break_into_balls" {
+                crate::object_ops::BreakKind::Balls
+            } else {
+                crate::object_ops::BreakKind::Bricks
+            };
             // optional target count, clamped to the UI slider range
-            let target = command["bricks"]
+            let count_key = if kind == crate::object_ops::BreakKind::Balls {
+                "balls"
+            } else {
+                "bricks"
+            };
+            let target = command[count_key]
                 .as_u64()
+                .or_else(|| command["count"].as_u64())
                 .map(|n| {
-                    (n as usize)
-                        .clamp(crate::object_ops::MIN_BRICKS, crate::object_ops::MAX_BRICKS)
+                    (n as usize).clamp(
+                        crate::object_ops::MIN_PARTICLES,
+                        crate::object_ops::MAX_PARTICLES,
+                    )
                 })
-                .unwrap_or(crate::object_ops::DEFAULT_BRICKS);
-            let bricks = crate::object_ops::break_into_bricks(scene, id, target)
-                .ok_or("this object cannot break into bricks (no volume)")?;
+                .unwrap_or(crate::object_ops::DEFAULT_PARTICLES);
+            let parts = crate::object_ops::break_into(scene, id, kind, target).ok_or_else(|| {
+                format!("this object cannot break into {} (no volume)", kind.label())
+            })?;
             selection.retain_existing(|i| scene.object(i).is_some());
-            Ok(json!({"count": bricks.len()}))
+            Ok(json!({"count": parts.len(), "kind": kind.label()}))
         }
         "boolean_objects" => {
             let op = command["op"]

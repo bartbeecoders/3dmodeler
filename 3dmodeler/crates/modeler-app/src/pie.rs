@@ -27,6 +27,7 @@ pub enum PieIcon {
     Floor,
     Roof,
     Empty,
+    Rope,
     LightPoint,
     LightSun,
     LightSpot,
@@ -38,6 +39,22 @@ pub enum PieIcon {
     Door,
     Window,
     Bricks,
+    /// Cluster of spheres (break-into-balls).
+    Balls,
+    /// Material color (palette chip).
+    MaterialColor,
+    /// Roughness (matte ↔ gloss arcs).
+    MaterialRoughness,
+    /// Metallic (shiny disc).
+    MaterialMetallic,
+    /// Properties tab: object transform (axes + move arrows).
+    Transform,
+    /// Properties tab: mesh / data block.
+    Data,
+    /// Properties tab: modifier stack (wrench).
+    Modifier,
+    /// Properties tab: physics (falling ball).
+    Physics,
 }
 
 /// The icon matching a primitive (shared by the pie and the Add dropdown).
@@ -55,6 +72,7 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Floor { .. } => PieIcon::Floor,
         P::Roof { .. } => PieIcon::Roof,
         P::Empty { .. } => PieIcon::Empty,
+        P::Rope { .. } => PieIcon::Rope,
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
             modeler_core::LightKind::Sun => PieIcon::LightSun,
@@ -256,8 +274,8 @@ pub fn draw(
     hovered
 }
 
-/// Tiny line-art icon (or glyph) inside a chip.
-fn draw_icon(
+/// Tiny line-art icon (or glyph) — shared by pie chips and property tabs.
+pub fn draw_icon(
     painter: &egui::Painter,
     icon: &PieIcon,
     c: egui::Pos2,
@@ -366,6 +384,51 @@ fn draw_icon(
             painter.add(brick(p(-0.45, -0.05), 0.0));
             painter.add(brick(p(0.62, 0.4), -0.55));
         }
+        // Balls: three packed circles
+        PieIcon::Balls => {
+            painter.circle_stroke(p(-0.45, 0.35), 0.55 * s, stroke);
+            painter.circle_stroke(p(0.5, 0.3), 0.5 * s, stroke);
+            painter.circle_stroke(p(0.0, -0.45), 0.55 * s, stroke);
+        }
+        // Material color: three overlapping color chips
+        PieIcon::MaterialColor => {
+            let chip = |center: egui::Pos2, fill: egui::Color32| {
+                let r = egui::Rect::from_center_size(center, egui::vec2(0.85 * s, 0.85 * s));
+                painter.rect_filled(r, 2.0, fill);
+                painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
+            };
+            chip(p(-0.35, 0.25), egui::Color32::from_rgb(200, 70, 60));
+            chip(p(0.25, 0.15), egui::Color32::from_rgb(70, 140, 210));
+            chip(p(-0.05, -0.35), egui::Color32::from_rgb(230, 200, 80));
+        }
+        // Roughness: disc with a soft vs hard highlight wedge
+        PieIcon::MaterialRoughness => {
+            painter.circle_stroke(c, s, stroke);
+            painter.line_segment([p(-0.7, 0.2), p(0.7, -0.35)], stroke);
+            painter.line_segment([p(-0.5, 0.55), p(0.55, -0.1)], stroke);
+        }
+        // Metallic: disc with a specular sparkle
+        PieIcon::MaterialMetallic => {
+            painter.circle_stroke(c, s, stroke);
+            painter.circle_filled(p(-0.25, -0.3), 0.22 * s, stroke.color);
+            painter.line_segment([p(0.15, -0.55), p(0.55, -0.15)], stroke);
+            painter.line_segment([p(0.05, -0.2), p(0.65, 0.05)], stroke);
+        }
+        // Rope: hanging catenary with thickness ticks
+        PieIcon::Rope => {
+            let curve = [
+                p(-1.0, -0.55),
+                p(-0.5, 0.15),
+                p(0.0, 0.45),
+                p(0.5, 0.15),
+                p(1.0, -0.55),
+            ];
+            for w in curve.windows(2) {
+                painter.line_segment([w[0], w[1]], stroke);
+            }
+            painter.circle_filled(curve[0], 0.12 * s, stroke.color);
+            painter.circle_filled(curve[4], 0.12 * s, stroke.color);
+        }
         // Floor: flat slab — parallelogram top with a visible thickness
         PieIcon::Floor => {
             let top = [p(-1.0, -0.1), p(-0.35, -0.85), p(1.0, -0.85), p(0.35, -0.1)];
@@ -470,6 +533,43 @@ fn draw_icon(
             painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
             painter.line_segment([p(-0.8, 0.0), p(0.8, 0.0)], stroke);
             painter.line_segment([p(0.0, -0.8), p(0.0, 0.8)], stroke);
+        }
+        // Transform: three axes with arrow tips
+        PieIcon::Transform => {
+            painter.line_segment([p(0.0, 0.85), p(0.0, -0.85)], stroke);
+            painter.line_segment([p(-0.85, 0.0), p(0.85, 0.0)], stroke);
+            painter.line_segment([p(-0.45, 0.45), p(0.55, -0.55)], stroke);
+            // +Z tip
+            painter.line_segment([p(0.0, -0.85), p(-0.25, -0.55)], stroke);
+            painter.line_segment([p(0.0, -0.85), p(0.25, -0.55)], stroke);
+            // +X tip
+            painter.line_segment([p(0.85, 0.0), p(0.55, -0.25)], stroke);
+            painter.line_segment([p(0.85, 0.0), p(0.55, 0.25)], stroke);
+        }
+        // Data: document with mesh grid
+        PieIcon::Data => {
+            let rect = egui::Rect::from_two_pos(p(-0.7, -0.9), p(0.7, 0.9));
+            painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
+            painter.line_segment([p(-0.7, -0.25), p(0.7, -0.25)], stroke);
+            painter.line_segment([p(-0.7, 0.25), p(0.7, 0.25)], stroke);
+            painter.line_segment([p(-0.25, -0.9), p(-0.25, 0.9)], stroke);
+            painter.line_segment([p(0.25, -0.9), p(0.25, 0.9)], stroke);
+        }
+        // Modifier: wrench
+        PieIcon::Modifier => {
+            painter.circle_stroke(p(-0.35, -0.45), 0.4 * s, stroke);
+            painter.line_segment([p(-0.1, -0.2), p(0.75, 0.75)], stroke);
+            painter.line_segment([p(0.45, 0.45), p(0.75, 0.45)], stroke);
+            painter.line_segment([p(0.45, 0.45), p(0.45, 0.75)], stroke);
+            painter.line_segment([p(-0.55, -0.7), p(-0.15, -0.2)], stroke);
+        }
+        // Physics: ball falling toward a ground line
+        PieIcon::Physics => {
+            painter.circle_stroke(p(0.0, -0.35), 0.55 * s, stroke);
+            painter.line_segment([p(-1.0, 0.85), p(1.0, 0.85)], stroke);
+            painter.line_segment([p(0.0, 0.25), p(0.0, 0.7)], stroke);
+            painter.line_segment([p(-0.2, 0.5), p(0.0, 0.7)], stroke);
+            painter.line_segment([p(0.2, 0.5), p(0.0, 0.7)], stroke);
         }
     }
 }

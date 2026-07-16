@@ -22,9 +22,19 @@ use crate::settings::{Settings, SettingsWindow};
 use crate::theme::{self, Theme};
 use modeler_core::glam::{EulerRot, Quat, Vec3};
 use modeler_core::{ImagePlane, MarkerKind};
-use modeler_core::{Library, ObjectId, Primitive, Scene, Transform};
+use modeler_core::{
+    Library, Material, MaterialFunction, ObjectId, Primitive, Scene, Transform,
+    WorldPositionEffect,
+};
 use three_d::egui;
 use three_d::Event;
+
+/// Master-material actions queued while the properties panel draws.
+enum MasterAction {
+    CreateFromObject,
+    Assign(modeler_core::MaterialId),
+    MakeUnique,
+}
 
 /// Pending outliner mutations, collected while the rows draw and applied
 /// afterwards (the rows only hold shared borrows of the scene).
@@ -81,10 +91,12 @@ pub struct UiState {
     about_texture: Option<egui::TextureHandle>,
     import_open: bool,
     import_buffer: String,
-    /// Break-into-Bricks dialog: Some(target count) while open. Set by the
-    /// Object menu, the properties panel and the context wheel; the window
-    /// itself lives in `brick_dialog_window`.
-    brick_dialog: Option<i32>,
+    /// Break-into-particles dialog: Some((kind, target count)) while open.
+    /// Set by the Object menu, the properties panel and the context wheel;
+    /// the window itself lives in `break_dialog_window`.
+    break_dialog: Option<(object_ops::BreakKind, i32)>,
+    /// Active Properties panel tab (Blender-style icon tabs).
+    properties_tab: PropertiesTab,
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
     /// Scene version at the last save/load/new (None until the first frame
@@ -139,7 +151,8 @@ impl UiState {
             about_texture: None,
             import_open: false,
             import_buffer: String::new(),
-            brick_dialog: None,
+            break_dialog: None,
+            properties_tab: PropertiesTab::Transform,
             status_message: None,
             current_file: None,
             saved_version: None,
@@ -312,7 +325,7 @@ impl UiState {
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
         self.confirm_new_window(ctx, scene, selection, undo);
-        self.brick_dialog_window(ctx, scene, selection);
+        self.break_dialog_window(ctx, scene, selection);
         self.settings_window.ui(ctx, settings);
         calibrate_window(ctx, scene, calibrate, settings);
         if let Some(message) = marker_window(ctx, scene, marker_tool) {
@@ -330,7 +343,7 @@ impl UiState {
             selection,
             modal,
             &mut self.library_panel,
-            &mut self.brick_dialog,
+            &mut self.break_dialog,
         ) {
             self.status_message = Some(message);
         }
@@ -426,7 +439,7 @@ impl UiState {
                                 Menu::Object => object_menu(
                                     ui, scene, selection, modal, physics,
                                     &mut self.library_panel, &mut self.status_message,
-                                    &mut self.brick_dialog,
+                                    &mut self.break_dialog,
                                 ),
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
@@ -935,20 +948,20 @@ impl UiState {
     #[cfg(not(target_arch = "wasm32"))]
     fn save_as_window(&mut self, _ctx: &egui::Context, _scene: &Scene, _settings: &Settings) {}
 
-    /// Break-into-Bricks dialog: slider for the target brick count (100 to
+    /// Break-into-particles dialog: slider for the target count (100 to
     /// 5000 — 100 floor, then steps of 200 — default 1000), then break the
-    /// active object on confirm.
-    fn brick_dialog_window(
+    /// active object into bricks or balls on confirm.
+    fn break_dialog_window(
         &mut self,
         ctx: &egui::Context,
         scene: &mut Scene,
         selection: &mut Selection,
     ) {
-        let Some(mut value) = self.brick_dialog else { return };
+        let Some((kind, mut value)) = self.break_dialog else { return };
         let mut open = true;
         let mut do_break = false;
         let mut cancel = false;
-        egui::Window::new("Break into Bricks")
+        egui::Window::new(kind.dialog_title())
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -963,13 +976,13 @@ impl UiState {
                 ui.add(
                     egui::Slider::new(
                         &mut value,
-                        object_ops::MIN_BRICKS as i32..=object_ops::MAX_BRICKS as i32,
+                        object_ops::MIN_PARTICLES as i32..=object_ops::MAX_PARTICLES as i32,
                     )
-                    .text("bricks"),
+                    .text(kind.label()),
                 );
                 // snap: 100 at the floor, multiples of 200 above it
-                value = if value < 150 { 100 } else { ( value + 100 ) / 200 * 200 };
-                ui.small("Openings, curvature and course rounding vary the exact count.");
+                value = if value < 150 { 100 } else { (value + 100) / 200 * 200 };
+                ui.small("Openings, curvature and packing vary the exact count.");
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Break").clicked() {
@@ -989,22 +1002,23 @@ impl UiState {
 
         if do_break {
             if let Some(id) = selection.active() {
-                if let Some(bricks) =
-                    object_ops::break_into_bricks(scene, id, value.max(1) as usize)
+                if let Some(parts) =
+                    object_ops::break_into(scene, id, kind, value.max(1) as usize)
                 {
                     self.status_message = Some(format!(
-                        "broken into {} bricks — Space simulates",
-                        bricks.len()
+                        "broken into {} {} — Space simulates",
+                        parts.len(),
+                        kind.label()
                     ));
-                    let active = bricks.first().copied();
-                    selection.set(bricks, active);
+                    let active = parts.first().copied();
+                    selection.set(parts, active);
                 }
             }
-            self.brick_dialog = None;
+            self.break_dialog = None;
         } else if cancel || !open {
-            self.brick_dialog = None;
+            self.break_dialog = None;
         } else {
-            self.brick_dialog = Some(value);
+            self.break_dialog = Some((kind, value));
         }
     }
 
@@ -1300,9 +1314,15 @@ impl UiState {
                     }
                     ui.separator();
                 }
-                if let Some(message) =
-                    properties(ui, scene, selection, settings, edit_point, &mut self.brick_dialog)
-                {
+                if let Some(message) = properties(
+                    ui,
+                    scene,
+                    selection,
+                    settings,
+                    edit_point,
+                    &mut self.break_dialog,
+                    &mut self.properties_tab,
+                ) {
                     self.status_message = Some(message);
                 }
             });
@@ -1907,10 +1927,11 @@ impl UiState {
             || self.show_about
             || self.import_open
             || save_as
-            || self.brick_dialog.is_some()
+            || self.break_dialog.is_some()
             || self.settings_window.open
             || self.ref_setup.open
             || self.library_panel.dialog_open()
+            || self.context_menu.is_open()
     }
 }
 
@@ -2064,7 +2085,7 @@ fn object_menu(
     physics: &mut PhysicsMirror,
     library_panel: &mut LibraryPanel,
     status: &mut Option<String>,
-    brick_dialog: &mut Option<i32>,
+    break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
 ) -> bool {
     let has_selection = !selection.is_empty();
     let mut close = false;
@@ -2167,30 +2188,53 @@ fn object_menu(
         .is_some_and(|o| {
             !o.primitive.is_light() && !matches!(o.primitive, Primitive::Empty { .. })
         });
-    if ui
-        .add_enabled(breakable_active, egui::Button::new("Break into Bricks…"))
-        .on_hover_text(
-            "Replace the active object with individual dynamic bricks \
-             (running bond; walls keep their openings, curved shapes get a \
-             stepped approximation) that collide and tumble when the \
-             simulation plays (Space). Opens a dialog to pick the brick count",
-        )
-        .clicked()
-    {
-        *brick_dialog = Some(object_ops::DEFAULT_BRICKS as i32);
-        close = true;
-    }
+    ui.menu_button("Break into…", |ui| {
+        if ui
+            .add_enabled(breakable_active, egui::Button::new("Bricks…"))
+            .on_hover_text(
+                "Replace the active object with individual dynamic bricks \
+                 (running bond; walls keep their openings, curved shapes get a \
+                 stepped approximation) that collide and tumble when the \
+                 simulation plays (Space). Opens a dialog to pick the count",
+            )
+            .clicked()
+        {
+            *break_dialog = Some((
+                object_ops::BreakKind::Bricks,
+                object_ops::DEFAULT_PARTICLES as i32,
+            ));
+            close = true;
+            ui.close();
+        }
+        if ui
+            .add_enabled(breakable_active, egui::Button::new("Balls…"))
+            .on_hover_text(
+                "Replace the active object with individual dynamic balls \
+                 (cubic packing; walls keep openings, curved shapes get a \
+                 stepped ball fill) that collide and tumble when the \
+                 simulation plays (Space). Opens a dialog to pick the count",
+            )
+            .clicked()
+        {
+            *break_dialog = Some((
+                object_ops::BreakKind::Balls,
+                object_ops::DEFAULT_PARTICLES as i32,
+            ));
+            close = true;
+            ui.close();
+        }
+    });
     let rebuild_folder = selection
         .active()
         .and_then(|id| object_ops::rebuildable_folder(scene, id));
     if ui
         .add_enabled(
             rebuild_folder.is_some(),
-            egui::Button::new("Rebuild from Bricks"),
+            egui::Button::new("Rebuild from Particles"),
         )
         .on_hover_text(
-            "Remove the bricks (wherever they tumbled) and restore the \
-             original wall object",
+            "Remove the bricks or balls (wherever they tumbled) and restore \
+             the original object",
         )
         .clicked()
     {
@@ -2851,13 +2895,277 @@ fn calibrate_window(
 
 // --- properties (N panel) ----------------------------------------------------
 
+/// Blender-style properties editor tabs (icon strip above the active page).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PropertiesTab {
+    Transform,
+    Data,
+    Modifiers,
+    Material,
+    Physics,
+}
+
+impl PropertiesTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Transform => "Transform",
+            Self::Data => "Object Data",
+            Self::Modifiers => "Modifiers",
+            Self::Material => "Material",
+            Self::Physics => "Physics",
+        }
+    }
+
+    fn icon(self) -> crate::pie::PieIcon {
+        use crate::pie::PieIcon;
+        match self {
+            Self::Transform => PieIcon::Transform,
+            Self::Data => PieIcon::Data,
+            Self::Modifiers => PieIcon::Modifier,
+            Self::Material => PieIcon::MaterialColor,
+            Self::Physics => PieIcon::Physics,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Transform => "Location, rotation, scale, pivot & anchor",
+            Self::Data => "Primitive / mesh / light parameters",
+            Self::Modifiers => "Modifier stack (subdivision, boolean)",
+            Self::Material => "PBR material, masters, world effects & MPC",
+            Self::Physics => "Dynamic body, density, initial force",
+        }
+    }
+}
+
+/// Icon-only tab button (Blender properties strip).
+fn prop_tab_button(ui: &mut egui::Ui, tab: PropertiesTab, selected: bool) -> egui::Response {
+    let size = egui::vec2(28.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, selected);
+    let painter = ui.painter();
+    if selected || response.hovered() {
+        painter.rect_filled(rect, 4.0, visuals.bg_fill);
+    }
+    if selected {
+        let accent = ui.visuals().hyperlink_color;
+        let y = rect.bottom() - 2.0;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 4.0, y),
+                egui::pos2(rect.right() - 4.0, y),
+            ],
+            egui::Stroke::new(2.0, accent),
+        );
+    }
+    let color = if selected {
+        ui.visuals().hyperlink_color
+    } else {
+        visuals.fg_stroke.color
+    };
+    crate::pie::draw_icon(
+        painter,
+        &tab.icon(),
+        rect.center(),
+        7.0,
+        egui::Stroke::new(1.5, color),
+    );
+    response.on_hover_text(format!("{} — {}", tab.label(), tab.tooltip()))
+}
+
+fn properties_tab_bar(ui: &mut egui::Ui, tab: &mut PropertiesTab, available: &[PropertiesTab]) {
+    if !available.iter().any(|t| *t == *tab) {
+        *tab = available
+            .first()
+            .copied()
+            .unwrap_or(PropertiesTab::Transform);
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for &t in available {
+            if prop_tab_button(ui, t, *tab == t).clicked() {
+                *tab = t;
+            }
+        }
+    });
+    ui.label(egui::RichText::new(tab.label()).strong().size(12.0));
+    ui.add_space(2.0);
+    ui.separator();
+}
+
+/// Which properties the user touched this frame. Only dirty fields are written
+/// back — and when several objects are selected, each dirty field is applied
+/// to every selected object (not just the active one).
+#[derive(Default, Clone, Copy)]
+struct PropDirty {
+    location: bool,
+    rotation: bool,
+    scale: bool,
+    pivot: bool,
+    anchor: bool,
+    primitive: bool,
+    smooth: bool,
+    material_color: bool,
+    material_roughness: bool,
+    material_metallic: bool,
+    material_specular: bool,
+    material_alpha: bool,
+    material_coat: bool,
+    material_sheen: bool,
+    material_occlusion: bool,
+    material_emissive: bool,
+    material_world: bool,
+    dynamic: bool,
+    density: bool,
+    force: bool,
+    adorn_label: bool,
+    adorn_dims: bool,
+}
+
+impl PropDirty {
+    fn any(self) -> bool {
+        self.location
+            || self.rotation
+            || self.scale
+            || self.pivot
+            || self.anchor
+            || self.primitive
+            || self.smooth
+            || self.material_any()
+            || self.dynamic
+            || self.density
+            || self.force
+            || self.adorn_label
+            || self.adorn_dims
+    }
+
+    fn material_any(self) -> bool {
+        self.material_color
+            || self.material_roughness
+            || self.material_metallic
+            || self.material_specular
+            || self.material_alpha
+            || self.material_coat
+            || self.material_sheen
+            || self.material_occlusion
+            || self.material_emissive
+            || self.material_world
+    }
+}
+
+/// Apply only the dirty property fields to every object in `targets`.
+/// Primitive edits only land on objects with the same primitive variant as
+/// the active value; material / physics / smooth skip lights.
+fn apply_prop_dirty(
+    scene: &mut Scene,
+    targets: &[ObjectId],
+    dirty: PropDirty,
+    transform: &Transform,
+    primitive: Primitive,
+    material: &Material,
+    smooth: bool,
+    phys: (bool, f32, Vec3),
+    adorn: (bool, bool),
+    pivot: Vec3,
+    anchor: Vec3,
+) {
+    let active_disc = std::mem::discriminant(&primitive);
+    // Material merges through resolve/set so master instances keep correct overrides.
+    if dirty.material_any() {
+        let ids: Vec<ObjectId> = targets.to_vec();
+        for id in ids {
+            if scene.object(id).is_some_and(|o| o.primitive.is_light()) {
+                continue;
+            }
+            let Some(mut m) = scene.object_material(id) else {
+                continue;
+            };
+            if dirty.material_color {
+                m.base_color = material.base_color;
+            }
+            if dirty.material_roughness {
+                m.roughness = material.roughness;
+            }
+            if dirty.material_metallic {
+                m.metallic = material.metallic;
+            }
+            if dirty.material_specular {
+                m.specular = material.specular;
+            }
+            if dirty.material_alpha {
+                m.alpha = material.alpha;
+            }
+            if dirty.material_coat {
+                m.coat = material.coat;
+                m.coat_roughness = material.coat_roughness;
+            }
+            if dirty.material_sheen {
+                m.sheen = material.sheen;
+            }
+            if dirty.material_occlusion {
+                m.occlusion = material.occlusion;
+            }
+            if dirty.material_emissive {
+                m.emissive = material.emissive;
+                m.emissive_strength = material.emissive_strength;
+            }
+            if dirty.material_world {
+                m.world_effect = material.world_effect;
+            }
+            scene.set_object_material(id, m);
+        }
+    }
+    for &id in targets {
+        let Some(object) = scene.object_mut(id) else {
+            continue;
+        };
+        if dirty.location {
+            object.transform.location = transform.location;
+        }
+        if dirty.rotation {
+            object.transform.rotation = transform.rotation;
+        }
+        if dirty.scale {
+            object.transform.scale = transform.scale;
+        }
+        if dirty.pivot {
+            object.pivot = pivot;
+        }
+        if dirty.anchor {
+            object.anchor = anchor;
+        }
+        if dirty.primitive && std::mem::discriminant(&object.primitive) == active_disc {
+            object.primitive = primitive;
+        }
+        if dirty.smooth && !object.primitive.is_light() {
+            object.smooth = smooth;
+        }
+        if dirty.dynamic && !object.primitive.is_light() {
+            object.dynamic = phys.0;
+        }
+        if dirty.density && !object.primitive.is_light() {
+            object.density = phys.1;
+        }
+        if dirty.force && !object.primitive.is_light() && object.dynamic {
+            object.initial_force = phys.2;
+        }
+        if dirty.adorn_label {
+            object.show_label = adorn.0;
+        }
+        if dirty.adorn_dims {
+            object.show_dimensions = adorn.1;
+        }
+    }
+}
+
 fn properties(
     ui: &mut egui::Ui,
     scene: &mut Scene,
     selection: &mut Selection,
     settings: &Settings,
     edit_point: Option<(ObjectId, Vec3)>,
-    brick_dialog: &mut Option<i32>,
+    break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
+    tab: &mut PropertiesTab,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
         ui.weak("No active object");
@@ -2867,7 +3175,20 @@ fn properties(
         return None;
     };
 
-    // editable object name (also renamable by double-click in the outliner)
+    theme::section_header(ui, "Properties");
+
+    let multi_count = selection.selected().len();
+    if multi_count > 1 {
+        ui.label(
+            egui::RichText::new(format!(
+                "Editing {multi_count} selected objects — changes apply to all"
+            ))
+            .weak()
+            .size(11.0),
+        );
+    }
+
+    // Name is always active-only (names must stay unique).
     let mut name = object.name.clone();
     ui.horizontal(|ui| {
         ui.label("Name");
@@ -2889,26 +3210,47 @@ fn properties(
         }
     }
 
-    // edit copies; write back only when something changed (writes bump the
-    // scene version and trigger rebuilds)
+    // Which tabs apply to this object (lights/empties hide material, physics, …)
+    let is_light = object.primitive.is_light();
+    let is_empty = matches!(object.primitive, Primitive::Empty { .. });
+    let solid = !is_light && !is_empty;
+    let mut available = vec![PropertiesTab::Transform, PropertiesTab::Data];
+    if solid {
+        available.push(PropertiesTab::Modifiers);
+        available.push(PropertiesTab::Material);
+        available.push(PropertiesTab::Physics);
+    } else if !is_light {
+        // empties: no material/physics/modifiers
+    }
+    properties_tab_bar(ui, tab, &available);
+
+    // edit copies; write back only dirty fields (and to every selected object)
     let mut transform = object.transform;
     let mut primitive = object.primitive;
-    let mut material = object.material;
+    let mut material = scene
+        .object_material(active_id)
+        .unwrap_or(object.material);
+    let material_master = object.material_master;
     let mut smooth = object.smooth;
-    let mut phys = (object.dynamic, object.density);
+    let mut phys = (object.dynamic, object.density, object.initial_force);
     let mut adorn = (object.show_label, object.show_dimensions);
     let mut pivot = object.pivot;
     let mut anchor = object.anchor;
-    let mut changed = false;
+    let mut dirty = PropDirty::default();
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
-    let mut break_bricks = false;
+    let mut break_kind: Option<object_ops::BreakKind> = None;
+    let mut master_action: Option<MasterAction> = None;
+    let mut apply_function: Option<MaterialFunction> = None;
+    let mut revert_mesh = false;
+    let mut modifier_edits: Vec<(usize, modeler_core::Modifier)> = Vec::new();
+    let mut modifier_add: Option<modeler_core::ModifierKind> = None;
+    let mut modifier_remove: Option<usize> = None;
+    let mut modifier_apply: Option<usize> = None;
 
-    egui::CollapsingHeader::new("Transform")
-        .default_open(true)
-        .show(ui, |ui| {
-            changed |= vec3_row(ui, "Location", &mut transform.location, 0.05);
+    match *tab {
+        PropertiesTab::Transform => {
+            dirty.location |= vec3_row(ui, "Location", &mut transform.location, 0.05);
 
-            // display rotation as XYZ Euler degrees like Blender
             let (rx, ry, rz) = transform.rotation.to_euler(EulerRot::XYZ);
             let mut degrees = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
             let mut rot_changed = false;
@@ -2927,25 +3269,21 @@ fn properties(
                     degrees[1].to_radians(),
                     degrees[2].to_radians(),
                 );
-                changed = true;
+                dirty.rotation = true;
             }
 
-            changed |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
-        });
+            dirty.scale |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
 
-    egui::CollapsingHeader::new("Pivot & Anchor")
-        .default_open(false)
-        .show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Pivot & Anchor").strong());
             ui.label(
                 egui::RichText::new("Local-space points; markers show in the viewport.")
                     .weak()
                     .size(11.0),
             );
-            changed |= vec3_row(ui, "Pivot (rotation center, R)", &mut pivot, 0.05);
-            changed |= vec3_row(ui, "Anchor (attachment point)", &mut anchor, 0.05);
+            dirty.pivot |= vec3_row(ui, "Pivot (rotation center, R)", &mut pivot, 0.05);
+            dirty.anchor |= vec3_row(ui, "Anchor (attachment point)", &mut anchor, 0.05);
 
-            // edit mode (Tab) with an element selected on THIS object: one
-            // click makes that vertex/edge/face the pivot or anchor
             match edit_point {
                 Some((edit_id, point)) if edit_id == active_id => {
                     ui.add_space(2.0);
@@ -2959,7 +3297,7 @@ fn properties(
                             .clicked()
                         {
                             pivot = point;
-                            changed = true;
+                            dirty.pivot = true;
                         }
                         if ui
                             .button("Anchor = selection")
@@ -2970,7 +3308,7 @@ fn properties(
                             .clicked()
                         {
                             anchor = point;
-                            changed = true;
+                            dirty.anchor = true;
                         }
                     });
                 }
@@ -2985,14 +3323,21 @@ fn properties(
                     );
                 }
             }
-        });
 
-    let mut revert_mesh = false;
-    if let Some(mesh) = &object.edited_mesh {
-        let (verts, tris) = (mesh.positions.len(), mesh.indices.len() / 3);
-        egui::CollapsingHeader::new("Mesh (edited)")
-            .default_open(true)
-            .show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Display").strong());
+            dirty.adorn_label |= ui.checkbox(&mut adorn.0, "Show name label").changed();
+            dirty.adorn_dims |= ui
+                .checkbox(
+                    &mut adorn.1,
+                    format!("Show dimensions ({})", settings.unit.suffix()),
+                )
+                .changed();
+        }
+
+        PropertiesTab::Data => {
+            if let Some(mesh) = &object.edited_mesh {
+                let (verts, tris) = (mesh.positions.len(), mesh.indices.len() / 3);
                 ui.label(
                     egui::RichText::new(format!("{verts} vertices · {tris} triangles"))
                         .weak()
@@ -3002,266 +3347,526 @@ fn properties(
                     .button("Revert to primitive")
                     .on_hover_text("Discard all mesh edits and restore the parametric shape")
                     .clicked();
-            });
-    } else {
-        let header = if primitive.is_light() { "Light" } else { "Primitive" };
-        egui::CollapsingHeader::new(header)
-            .default_open(true)
-            .show(ui, |ui| {
-                changed |=
-                    primitive_params(ui, &mut primitive, !object.floor_outline.is_empty());
+            } else {
+                dirty.primitive |= primitive_params(
+                    ui,
+                    &mut primitive,
+                    !object.floor_outline.is_empty(),
+                    Some((scene, active_id)),
+                );
                 if !primitive.is_light() {
-                    changed |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+                    dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
                 }
-            });
 
-        // wall openings (doors & windows) — cutout edits regenerate the mesh
-        if let Primitive::Wall { length, height, .. } = primitive {
-            let mut cutouts = object.cutouts.clone();
-            let mut cut_changed = false;
-            egui::CollapsingHeader::new("Openings (doors & windows)")
-                .default_open(true)
-                .show(ui, |ui| {
-                    cut_changed = wall_cutout_rows(ui, &mut cutouts, length, height);
-                });
-            if cut_changed {
-                edited_cutouts = Some(cutouts);
-            }
-        }
-    }
-
-    // modifier stack (Blender-style): the viewport previews the enabled
-    // stack live — nothing is baked until Apply; edit mode and physics
-    // keep using the base mesh (the cage)
-    let mut modifier_edits: Vec<(usize, modeler_core::Modifier)> = Vec::new();
-    let mut modifier_add: Option<modeler_core::ModifierKind> = None;
-    let mut modifier_remove: Option<usize> = None;
-    let mut modifier_apply: Option<usize> = None;
-    if !primitive.is_light() && !matches!(primitive, Primitive::Empty { .. }) {
-        egui::CollapsingHeader::new("Modifiers")
-            .default_open(!object.modifiers.is_empty())
-            .show(ui, |ui| {
-                for (index, modifier) in object.modifiers.iter().enumerate() {
-                    let mut edited = *modifier;
-                    let mut row_changed = false;
-                    ui.horizontal(|ui| {
-                        row_changed |= ui
-                            .checkbox(&mut edited.enabled, "")
-                            .on_hover_text(
-                                "Preview this modifier in the viewport and \
-                                 include it when applying",
-                            )
-                            .changed();
-                        ui.label(egui::RichText::new(edited.kind.label()).strong());
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button("✖")
-                                    .on_hover_text(
-                                        "Remove this modifier (a boolean's hidden \
-                                         tool object is shown again)",
-                                    )
-                                    .clicked()
-                                {
-                                    modifier_remove = Some(index);
-                                }
-                                if ui
-                                    .small_button("Apply")
-                                    .on_hover_text(
-                                        "Bake this modifier and everything above it \
-                                         into the mesh. Boolean tool objects are \
-                                         removed once nothing references them",
-                                    )
-                                    .clicked()
-                                {
-                                    modifier_apply = Some(index);
-                                }
-                            },
-                        );
-                    });
-                    ui.indent(("modifier", index), |ui| match &mut edited.kind {
-                        modeler_core::ModifierKind::Subdivision { levels } => {
-                            let mut value = *levels as u32;
-                            if int_row(ui, "Levels", &mut value, 1..=4) {
-                                *levels = value as u8;
-                                row_changed = true;
-                            }
-                        }
-                        modeler_core::ModifierKind::Boolean { op, object: tool } => {
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt(("modifier-op", index))
-                                    .selected_text(op.label())
-                                    .width(90.0)
-                                    .show_ui(ui, |ui| {
-                                        for candidate in modeler_core::BooleanOp::ALL {
-                                            if ui
-                                                .selectable_label(
-                                                    *op == candidate,
-                                                    candidate.label(),
-                                                )
-                                                .clicked()
-                                                && *op != candidate
-                                            {
-                                                *op = candidate;
-                                                row_changed = true;
-                                            }
-                                        }
-                                    });
-                                let current = scene
-                                    .object(*tool)
-                                    .map(|o| o.name.clone())
-                                    .unwrap_or_else(|| "pick object…".to_string());
-                                egui::ComboBox::from_id_salt(("modifier-tool", index))
-                                    .selected_text(current)
-                                    .show_ui(ui, |ui| {
-                                        for candidate in scene.objects() {
-                                            if candidate.id == active_id
-                                                || candidate.primitive.is_light()
-                                                || matches!(
-                                                    candidate.primitive,
-                                                    Primitive::Empty { .. }
-                                                )
-                                            {
-                                                continue;
-                                            }
-                                            if ui
-                                                .selectable_label(
-                                                    *tool == candidate.id,
-                                                    &candidate.name,
-                                                )
-                                                .clicked()
-                                                && *tool != candidate.id
-                                            {
-                                                *tool = candidate.id;
-                                                row_changed = true;
-                                            }
-                                        }
-                                    });
-                            });
-                        }
-                    });
-                    if row_changed {
-                        modifier_edits.push((index, edited));
+                if let Primitive::Wall { length, height, .. } = primitive {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Openings (doors & windows)").strong());
+                    let mut cutouts = object.cutouts.clone();
+                    if wall_cutout_rows(ui, &mut cutouts, length, height) {
+                        edited_cutouts = Some(cutouts);
                     }
                 }
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("+ Subdivision")
-                        .on_hover_text(
-                            "Catmull-Clark subdivision surface (Blender's subsurf): \
-                             smooths the viewport mesh, live",
-                        )
-                        .clicked()
-                    {
-                        modifier_add = Some(modeler_core::ModifierKind::Subdivision {
-                            levels: 1,
-                        });
-                    }
-                    if ui
-                        .button("+ Boolean")
-                        .on_hover_text(
-                            "Union / subtract / intersect another object, previewed \
-                             live — pick the tool object in the dropdown, or use \
-                             Object ▸ Boolean with two objects selected",
-                        )
-                        .clicked()
-                    {
-                        modifier_add = Some(modeler_core::ModifierKind::Boolean {
-                            op: modeler_core::BooleanOp::Subtract,
-                            object: ObjectId(0),
-                        });
-                    }
-                });
-                if !object.modifiers.is_empty() {
+
+                if primitive.is_rope() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Anchors").strong());
                     ui.label(
                         egui::RichText::new(
-                            "live preview — editing and physics use the base \
-                             shape until applied",
+                            "Drag the green/blue handles onto an object to \
+                             pin that end (or use the menus below). Drop on \
+                             empty space to free the end. The rope updates \
+                             immediately in design mode.",
                         )
                         .weak()
                         .size(11.0),
                     );
+                    let mut start = object.rope_start;
+                    let mut end = object.rope_end;
+                    let mut rope_dirty = false;
+                    rope_dirty |= rope_end_row(ui, scene, active_id, "Start", &mut start);
+                    rope_dirty |= rope_end_row(ui, scene, active_id, "End", &mut end);
+                    if rope_dirty {
+                        if let Some(object) = scene.object_mut(active_id) {
+                            object.rope_start = start;
+                            object.rope_end = end;
+                        }
+                        // jump the rest-pose mesh to the new pins right away
+                        // (design mode — don't wait for Play)
+                        crate::rope_handles::snap_rope_rest_pose(scene, active_id);
+                    }
                 }
-            });
-    }
+            }
 
-    // any solid object can shatter; lights and empties have no volume
-    let breakable = !object.primitive.is_light()
-        && !matches!(object.primitive, Primitive::Empty { .. });
-    if breakable
-        && ui
-            .button("Break into bricks")
-            .on_hover_text(
-                "Replace this object with individual dynamic bricks (running \
-                 bond; walls keep their openings, curved shapes get a stepped \
-                 approximation). They collide and can tumble when the \
-                 simulation plays (Space)",
-            )
-            .clicked()
-    {
-        break_bricks = true;
-    }
-
-    egui::CollapsingHeader::new("Adornments")
-        .default_open(false)
-        .show(ui, |ui| {
-            changed |= ui.checkbox(&mut adorn.0, "Show name label").changed();
-            changed |= ui
-                .checkbox(
-                    &mut adorn.1,
-                    format!("Show dimensions ({})", settings.unit.suffix()),
-                )
-                .changed();
-        });
-
-    // lights neither simulate nor have a surface material
-    if !primitive.is_light() {
-        egui::CollapsingHeader::new("Physics")
-            .default_open(true)
-            .show(ui, |ui| {
-                let mut dynamic = object.dynamic;
-                let mut density = object.density;
-                if ui
-                    .checkbox(&mut dynamic, "Dynamic")
-                    .on_hover_text("Falls and collides during simulation (▶)")
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.add_enabled_ui(dynamic, |ui| {
-                    if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
-                        changed = true;
+            let breakable = solid && !primitive.is_rope();
+            if breakable {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Shatter").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Break into bricks")
+                        .on_hover_text(
+                            "Replace this object with individual dynamic bricks (running \
+                             bond; walls keep their openings, curved shapes get a stepped \
+                             approximation). They collide and can tumble when the \
+                             simulation plays (Space)",
+                        )
+                        .clicked()
+                    {
+                        break_kind = Some(object_ops::BreakKind::Bricks);
+                    }
+                    if ui
+                        .button("Break into balls")
+                        .on_hover_text(
+                            "Replace this object with individual dynamic balls (cubic \
+                             packing; walls keep openings, curved shapes get a stepped \
+                             ball fill). They collide and can tumble when the \
+                             simulation plays (Space)",
+                        )
+                        .clicked()
+                    {
+                        break_kind = Some(object_ops::BreakKind::Balls);
                     }
                 });
-                phys = (dynamic, density);
+            }
+        }
+
+        PropertiesTab::Modifiers => {
+            for (index, modifier) in object.modifiers.iter().enumerate() {
+                let mut edited = *modifier;
+                let mut row_changed = false;
+                ui.horizontal(|ui| {
+                    row_changed |= ui
+                        .checkbox(&mut edited.enabled, "")
+                        .on_hover_text(
+                            "Preview this modifier in the viewport and \
+                             include it when applying",
+                        )
+                        .changed();
+                    ui.label(egui::RichText::new(edited.kind.label()).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text(
+                                "Remove this modifier (a boolean's hidden \
+                                 tool object is shown again)",
+                            )
+                            .clicked()
+                        {
+                            modifier_remove = Some(index);
+                        }
+                        if ui
+                            .small_button("Apply")
+                            .on_hover_text(
+                                "Bake this modifier and everything above it \
+                                 into the mesh. Boolean tool objects are \
+                                 removed once nothing references them",
+                            )
+                            .clicked()
+                        {
+                            modifier_apply = Some(index);
+                        }
+                    });
+                });
+                ui.indent(("modifier", index), |ui| match &mut edited.kind {
+                    modeler_core::ModifierKind::Subdivision { levels } => {
+                        let mut value = *levels as u32;
+                        if int_row(ui, "Levels", &mut value, 1..=4) {
+                            *levels = value as u8;
+                            row_changed = true;
+                        }
+                    }
+                    modeler_core::ModifierKind::Boolean { op, object: tool } => {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("modifier-op", index))
+                                .selected_text(op.label())
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for candidate in modeler_core::BooleanOp::ALL {
+                                        if ui
+                                            .selectable_label(*op == candidate, candidate.label())
+                                            .clicked()
+                                            && *op != candidate
+                                        {
+                                            *op = candidate;
+                                            row_changed = true;
+                                        }
+                                    }
+                                });
+                            let current = scene
+                                .object(*tool)
+                                .map(|o| o.name.clone())
+                                .unwrap_or_else(|| "pick object…".to_string());
+                            egui::ComboBox::from_id_salt(("modifier-tool", index))
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    for candidate in scene.objects() {
+                                        if candidate.id == active_id
+                                            || candidate.primitive.is_light()
+                                            || matches!(
+                                                candidate.primitive,
+                                                Primitive::Empty { .. }
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                *tool == candidate.id,
+                                                &candidate.name,
+                                            )
+                                            .clicked()
+                                            && *tool != candidate.id
+                                        {
+                                            *tool = candidate.id;
+                                            row_changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                });
+                if row_changed {
+                    modifier_edits.push((index, edited));
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("+ Subdivision")
+                    .on_hover_text(
+                        "Catmull-Clark subdivision surface (Blender's subsurf): \
+                         smooths the viewport mesh, live",
+                    )
+                    .clicked()
+                {
+                    modifier_add = Some(modeler_core::ModifierKind::Subdivision { levels: 1 });
+                }
+                if ui
+                    .button("+ Boolean")
+                    .on_hover_text(
+                        "Union / subtract / intersect another object, previewed \
+                         live — pick the tool object in the dropdown, or use \
+                         Object ▸ Boolean with two objects selected",
+                    )
+                    .clicked()
+                {
+                    modifier_add = Some(modeler_core::ModifierKind::Boolean {
+                        op: modeler_core::BooleanOp::Subtract,
+                        object: ObjectId(0),
+                    });
+                }
+            });
+            if !object.modifiers.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "live preview — editing and physics use the base \
+                         shape until applied",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("No modifiers on this object.")
+                        .weak()
+                        .size(11.0),
+                );
+            }
+        }
+
+        PropertiesTab::Material => {
+            ui.horizontal(|ui| {
+                ui.label("Master");
+                if let Some(mid) = material_master {
+                    let name = scene
+                        .master(mid)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| format!("#{mid:?}"));
+                    ui.strong(name);
+                    if ui
+                        .small_button("Unique")
+                        .on_hover_text("Break instance link — keep current values as local")
+                        .clicked()
+                    {
+                        master_action = Some(MasterAction::MakeUnique);
+                    }
+                } else {
+                    ui.weak("Local");
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("New master")
+                    .on_hover_text(
+                        "Create a master material from this object and rebind as instance",
+                    )
+                    .clicked()
+                {
+                    master_action = Some(MasterAction::CreateFromObject);
+                }
+                egui::ComboBox::from_id_salt("assign_master")
+                    .selected_text("Assign…")
+                    .show_ui(ui, |ui| {
+                        for m in scene.masters() {
+                            if ui.selectable_label(false, &m.name).clicked() {
+                                master_action = Some(MasterAction::Assign(m.id));
+                            }
+                        }
+                    });
             });
 
-        egui::CollapsingHeader::new("Material")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Base color");
-                    changed |= ui.color_edit_button_rgb(&mut material.base_color).changed();
+            egui::ComboBox::from_id_salt("mat_function")
+                .selected_text("Apply function…")
+                .show_ui(ui, |ui| {
+                    for f in MaterialFunction::ALL {
+                        if ui.selectable_label(false, f.label()).clicked() {
+                            apply_function = Some(*f);
+                        }
+                    }
                 });
-                changed |= slider_row(ui, "Roughness", &mut material.roughness, 0.0..=1.0);
-                changed |= slider_row(ui, "Metallic", &mut material.metallic, 0.0..=1.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Base color");
+                dirty.material_color |=
+                    ui.color_edit_button_rgb(&mut material.base_color).changed();
             });
+            dirty.material_roughness |=
+                slider_row(ui, "Roughness", &mut material.roughness, 0.0..=1.0);
+            dirty.material_metallic |=
+                slider_row(ui, "Metallic", &mut material.metallic, 0.0..=1.0);
+            dirty.material_specular |=
+                slider_row(ui, "Specular", &mut material.specular, 0.0..=1.0);
+            dirty.material_alpha |= slider_row(ui, "Alpha", &mut material.alpha, 0.0..=1.0);
+            dirty.material_coat |= slider_row(ui, "Coat", &mut material.coat, 0.0..=1.0);
+            if material.coat > 1e-3 {
+                dirty.material_coat |=
+                    slider_row(ui, "Coat rough", &mut material.coat_roughness, 0.0..=1.0);
+            }
+            dirty.material_sheen |= slider_row(ui, "Sheen", &mut material.sheen, 0.0..=1.0);
+            dirty.material_occlusion |=
+                slider_row(ui, "Occlusion", &mut material.occlusion, 0.0..=1.0);
+            ui.horizontal(|ui| {
+                ui.label("Emissive");
+                dirty.material_emissive |=
+                    ui.color_edit_button_rgb(&mut material.emissive).changed();
+            });
+            dirty.material_emissive |= slider_row(
+                ui,
+                "Emit strength",
+                &mut material.emissive_strength,
+                0.0..=10.0,
+            );
+
+            ui.separator();
+            ui.label("World effect");
+            let effect_label = material.world_effect.label();
+            egui::ComboBox::from_id_salt("world_effect")
+                .selected_text(effect_label)
+                .show_ui(ui, |ui| {
+                    let choices = [
+                        WorldPositionEffect::None,
+                        WorldPositionEffect::HeightSnow {
+                            start: 0.0,
+                            end: 3.0,
+                            color: [0.92, 0.95, 1.0],
+                        },
+                        WorldPositionEffect::HeightGradient {
+                            bottom: [0.25, 0.22, 0.18],
+                            top: [0.7, 0.75, 0.8],
+                            min_z: 0.0,
+                            max_z: 4.0,
+                        },
+                        WorldPositionEffect::WorldUpTint {
+                            amount: 0.7,
+                            color: [0.92, 0.95, 1.0],
+                        },
+                        WorldPositionEffect::RadialFade {
+                            inner: 2.0,
+                            outer: 12.0,
+                            color: [0.15, 0.15, 0.18],
+                        },
+                    ];
+                    for choice in choices {
+                        if ui
+                            .selectable_label(
+                                std::mem::discriminant(&material.world_effect)
+                                    == std::mem::discriminant(&choice),
+                                choice.label(),
+                            )
+                            .clicked()
+                        {
+                            material.world_effect = choice;
+                            dirty.material_world = true;
+                        }
+                    }
+                });
+            match &mut material.world_effect {
+                WorldPositionEffect::HeightSnow { start, end, color } => {
+                    dirty.material_world |= slider_row(ui, "Snow start Z", start, -10.0..=50.0);
+                    dirty.material_world |= slider_row(ui, "Snow end Z", end, -10.0..=50.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Snow color");
+                        dirty.material_world |= ui.color_edit_button_rgb(color).changed();
+                    });
+                }
+                WorldPositionEffect::HeightGradient {
+                    bottom,
+                    top,
+                    min_z,
+                    max_z,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Bottom");
+                        dirty.material_world |= ui.color_edit_button_rgb(bottom).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Top");
+                        dirty.material_world |= ui.color_edit_button_rgb(top).changed();
+                    });
+                    dirty.material_world |= slider_row(ui, "Min Z", min_z, -20.0..=50.0);
+                    dirty.material_world |= slider_row(ui, "Max Z", max_z, -20.0..=50.0);
+                }
+                WorldPositionEffect::WorldUpTint { amount, color } => {
+                    dirty.material_world |= slider_row(ui, "Amount", amount, 0.0..=1.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Tint");
+                        dirty.material_world |= ui.color_edit_button_rgb(color).changed();
+                    });
+                }
+                WorldPositionEffect::RadialFade { inner, outer, color } => {
+                    dirty.material_world |= slider_row(ui, "Inner", inner, 0.0..=50.0);
+                    dirty.material_world |= slider_row(ui, "Outer", outer, 0.0..=100.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Fade to");
+                        dirty.material_world |= ui.color_edit_button_rgb(color).changed();
+                    });
+                }
+                WorldPositionEffect::None => {}
+            }
+
+            // Scene-global Material Parameter Collection
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Material globals (MPC)").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Shared parameters applied to every material at resolve time \
+                     (like UE Material Parameter Collections).",
+                )
+                .weak()
+                .size(11.0),
+            );
+            let mut mpc = *scene.mpc();
+            let mut mpc_dirty = false;
+            mpc_dirty |= slider_row(ui, "Wetness", &mut mpc.wetness, 0.0..=1.0);
+            mpc_dirty |= slider_row(ui, "Snow amount", &mut mpc.snow_amount, 0.0..=1.0);
+            mpc_dirty |= slider_row(ui, "Snow height Z", &mut mpc.snow_height, -5.0..=50.0);
+            mpc_dirty |= slider_row(ui, "Emissive boost", &mut mpc.emissive_boost, 0.0..=4.0);
+            ui.horizontal(|ui| {
+                ui.label("Global tint");
+                mpc_dirty |= ui.color_edit_button_rgb(&mut mpc.global_tint).changed();
+            });
+            if mpc_dirty {
+                scene.set_mpc(mpc);
+            }
+        }
+
+        PropertiesTab::Physics => {
+            let mut dynamic = object.dynamic;
+            let mut density = object.density;
+            let mut force = object.initial_force;
+            if ui
+                .checkbox(&mut dynamic, "Dynamic")
+                .on_hover_text("Falls and collides during simulation (▶)")
+                .changed()
+            {
+                dirty.dynamic = true;
+            }
+            ui.add_enabled_ui(dynamic, |ui| {
+                if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
+                    dirty.density = true;
+                }
+                ui.add_space(4.0);
+                ui.label("Initial force").on_hover_text(
+                    "World-space impulse (N·s) applied once when simulation \
+                     starts. Drawn as an orange arrow; Shift+drag the tip in \
+                     the viewport to aim it",
+                );
+                if vec3_row(ui, "  XYZ", &mut force, 0.5) {
+                    dirty.force = true;
+                }
+                let mut mag = force.length();
+                ui.horizontal(|ui| {
+                    ui.label("  Amount");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut mag)
+                                .speed(0.5)
+                                .range(0.0..=10_000.0),
+                        )
+                        .changed()
+                    {
+                        if mag < 1e-6 {
+                            force = Vec3::ZERO;
+                        } else if force.length_squared() < 1e-12 {
+                            force = Vec3::new(mag, 0.0, 0.0);
+                        } else {
+                            force = force.normalize() * mag;
+                        }
+                        dirty.force = true;
+                    }
+                    if ui
+                        .small_button("Clear")
+                        .on_hover_text("Set initial force to zero")
+                        .clicked()
+                    {
+                        force = Vec3::ZERO;
+                        dirty.force = true;
+                    }
+                });
+            });
+            phys = (dynamic, density, force);
+        }
     }
 
-    if changed {
-        if let Some(object) = scene.object_mut(active_id) {
-            object.transform = transform;
-            object.primitive = primitive;
-            object.material = material;
-            object.smooth = smooth;
-            object.dynamic = phys.0;
-            object.density = phys.1;
-            object.show_label = adorn.0;
-            object.show_dimensions = adorn.1;
-            object.pivot = pivot;
-            object.anchor = anchor;
+    if let Some(action) = master_action {
+        match action {
+            MasterAction::CreateFromObject => {
+                let _ = scene.create_master_from_object(active_id, "Material");
+            }
+            MasterAction::Assign(id) => {
+                for &oid in selection.selected() {
+                    scene.assign_master(oid, id);
+                }
+            }
+            MasterAction::MakeUnique => {
+                for &oid in selection.selected() {
+                    scene.make_material_unique(oid);
+                }
+            }
         }
+    }
+    if let Some(func) = apply_function {
+        for &oid in selection.selected() {
+            scene.apply_material_function(oid, func);
+        }
+    }
+
+    if dirty.any() {
+        // Multi-select: only dirty fields are applied, to every selected
+        // object. Name / modifiers / cutouts stay active-only.
+        apply_prop_dirty(
+            scene,
+            selection.selected(),
+            dirty,
+            &transform,
+            primitive,
+            &material,
+            smooth,
+            phys,
+            adorn,
+            pivot,
+            anchor,
+        );
     }
     if let Some(cutouts) = edited_cutouts {
         if let Some(object) = scene.object_mut(active_id) {
@@ -3298,8 +3903,8 @@ fn properties(
             object.mesh_revision += 1;
         }
     }
-    if break_bricks {
-        *brick_dialog = Some(object_ops::DEFAULT_BRICKS as i32);
+    if let Some(kind) = break_kind {
+        *break_dialog = Some((kind, object_ops::DEFAULT_PARTICLES as i32));
     }
     status
 }
@@ -3387,7 +3992,75 @@ fn float_row(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64) -> boo
     .inner
 }
 
-fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive, shaped: bool) -> bool {
+/// Combo for pinning a rope end to another scene object (or free).
+fn rope_end_row(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    rope_id: ObjectId,
+    label: &str,
+    end: &mut modeler_core::RopeEnd,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let current = end
+            .object
+            .and_then(|id| scene.object(id).map(|o| o.name.as_str()))
+            .unwrap_or("(free)");
+        egui::ComboBox::from_id_salt(format!("rope-{label}-{}", rope_id.0))
+            .selected_text(current)
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(end.object.is_none(), "(free)")
+                    .clicked()
+                {
+                    end.object = None;
+                    end.local_point = Vec3::ZERO;
+                    changed = true;
+                }
+                for object in scene.objects() {
+                    if object.id == rope_id || object.primitive.is_rope() {
+                        continue; // don't self-pin or pin rope-to-rope (cycles)
+                    }
+                    let selected = end.object == Some(object.id);
+                    if ui.selectable_label(selected, &object.name).clicked() && !selected {
+                        end.object = Some(object.id);
+                        // land on the target's anchor by default
+                        end.local_point = object.anchor;
+                        changed = true;
+                    }
+                }
+            });
+    });
+    if end.object.is_some() {
+        ui.horizontal(|ui| {
+            ui.label(format!("  {label} point"));
+            for (axis, v) in [
+                ("X", &mut end.local_point.x),
+                ("Y", &mut end.local_point.y),
+                ("Z", &mut end.local_point.z),
+            ] {
+                ui.label(axis);
+                if ui
+                    .add(egui::DragValue::new(v).speed(0.05))
+                    .changed()
+                {
+                    changed = true;
+                }
+            }
+        });
+    }
+    changed
+}
+
+/// `rope_ctx` is scene + object id for rope helpers (Adjust length from pin span).
+fn primitive_params(
+    ui: &mut egui::Ui,
+    primitive: &mut Primitive,
+    shaped: bool,
+    rope_ctx: Option<(&Scene, ObjectId)>,
+) -> bool {
     let mut changed = false;
     match primitive {
         Primitive::Plane { size } | Primitive::Cube { size } => {
@@ -3485,6 +4158,62 @@ fn primitive_params(ui: &mut egui::Ui, primitive: &mut Primitive, shaped: bool) 
             ui.label(
                 egui::RichText::new(
                     "A marker / grouping parent — never collides or simulates.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Rope {
+            length,
+            radius,
+            segments,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Length");
+                changed |= ui
+                    .add(egui::DragValue::new(length).speed(0.02).range(0.05..=1000.0))
+                    .changed();
+                // When both ends are pinned, snap design length to the pin span.
+                let both_pinned = rope_ctx.is_some_and(|(scene, id)| {
+                    scene.object(id).is_some_and(|o| {
+                        o.rope_start.object.is_some() && o.rope_end.object.is_some()
+                    })
+                });
+                let pin_span = rope_ctx.and_then(|(scene, id)| {
+                    if !both_pinned {
+                        return None;
+                    }
+                    let a = scene.rope_end_world(id, true);
+                    let b = scene.rope_end_world(id, false);
+                    Some((b - a).length().max(0.05))
+                });
+                let btn = ui
+                    .add_enabled(both_pinned, egui::Button::new("Adjust length"))
+                    .on_hover_text(if both_pinned {
+                        format!(
+                            "Set length to the distance between the two pins \
+                             ({:.3} m)",
+                            pin_span.unwrap_or(*length)
+                        )
+                    } else {
+                        "Pin both Start and End to objects first".into()
+                    });
+                if btn.clicked() {
+                    if let Some(span) = pin_span {
+                        *length = span;
+                        changed = true;
+                    }
+                }
+            });
+            changed |= float_row(ui, "Radius", radius, 0.002);
+            changed |= int_row(ui, "Segments", segments, 2..=64);
+            ui.label(
+                egui::RichText::new(
+                    "Drag the green (start) and blue (end) handles in the \
+                     viewport to place the ends. Anchor each end to another \
+                     object below, then press Play — the rope sags and \
+                     swings under gravity. Use Adjust length when both ends \
+                     are pinned to match the pin-to-pin distance.",
                 )
                 .weak()
                 .size(11.0),
@@ -3601,4 +4330,172 @@ fn wall_cutout_rows(
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod multi_prop_tests {
+    use super::*;
+    use modeler_core::glam::Vec3;
+
+    fn add_cube(scene: &mut Scene) -> ObjectId {
+        scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default())
+    }
+
+    #[test]
+    fn color_change_applies_to_all_selected() {
+        let mut scene = Scene::new();
+        let a = add_cube(&mut scene);
+        let b = add_cube(&mut scene);
+        let c = add_cube(&mut scene);
+        scene.object_mut(a).unwrap().material.base_color = [1.0, 0.0, 0.0];
+        scene.object_mut(b).unwrap().material.base_color = [0.0, 1.0, 0.0];
+        scene.object_mut(c).unwrap().material.base_color = [0.0, 0.0, 1.0];
+
+        let mut material = Material::default();
+        material.base_color = [0.2, 0.4, 0.8];
+        let dirty = PropDirty {
+            material_color: true,
+            ..PropDirty::default()
+        };
+        apply_prop_dirty(
+            &mut scene,
+            &[a, b, c],
+            dirty,
+            &Transform::default(),
+            Primitive::Cube { size: 1.0 },
+            &material,
+            false,
+            (false, 1.0, Vec3::ZERO),
+            (false, false),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+
+        for id in [a, b, c] {
+            assert_eq!(
+                scene.object_material(id).unwrap().base_color,
+                [0.2, 0.4, 0.8]
+            );
+        }
+        // roughness left untouched (only base color was dirty)
+        assert!((scene.object_material(a).unwrap().roughness - 0.7).abs() < 1e-5);
+    }
+
+    #[test]
+    fn color_change_skips_lights() {
+        let mut scene = Scene::new();
+        let cube = add_cube(&mut scene);
+        let light = scene.add_object(
+            Primitive::Light {
+                kind: modeler_core::LightKind::Point,
+                color: [1.0, 1.0, 1.0],
+                intensity: 3.0,
+                spot_angle_deg: 45.0,
+                shadows: false,
+            },
+            Transform::default(),
+        );
+        let mut material = Material::default();
+        material.base_color = [1.0, 0.0, 0.0];
+        apply_prop_dirty(
+            &mut scene,
+            &[cube, light],
+            PropDirty {
+                material_color: true,
+                ..PropDirty::default()
+            },
+            &Transform::default(),
+            Primitive::Cube { size: 1.0 },
+            &material,
+            false,
+            (false, 1.0, Vec3::ZERO),
+            (false, false),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        assert_eq!(
+            scene.object_material(cube).unwrap().base_color,
+            [1.0, 0.0, 0.0]
+        );
+        // light material is unused; ensure we didn't panic and light still exists
+        assert!(scene.object(light).unwrap().primitive.is_light());
+    }
+
+    #[test]
+    fn location_change_does_not_overwrite_scale() {
+        let mut scene = Scene::new();
+        let a = add_cube(&mut scene);
+        let b = add_cube(&mut scene);
+        scene.object_mut(a).unwrap().transform.scale = Vec3::splat(2.0);
+        scene.object_mut(b).unwrap().transform.scale = Vec3::splat(3.0);
+        scene.object_mut(a).unwrap().transform.location = Vec3::new(1.0, 0.0, 0.0);
+        scene.object_mut(b).unwrap().transform.location = Vec3::new(2.0, 0.0, 0.0);
+
+        let mut transform = Transform::default();
+        transform.location = Vec3::new(5.0, 5.0, 5.0);
+        transform.scale = Vec3::splat(99.0); // must NOT be applied
+        apply_prop_dirty(
+            &mut scene,
+            &[a, b],
+            PropDirty {
+                location: true,
+                ..PropDirty::default()
+            },
+            &transform,
+            Primitive::Cube { size: 1.0 },
+            &Material::default(),
+            false,
+            (false, 1.0, Vec3::ZERO),
+            (false, false),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        assert_eq!(
+            scene.object(a).unwrap().transform.location,
+            Vec3::new(5.0, 5.0, 5.0)
+        );
+        assert_eq!(
+            scene.object(b).unwrap().transform.location,
+            Vec3::new(5.0, 5.0, 5.0)
+        );
+        assert_eq!(scene.object(a).unwrap().transform.scale, Vec3::splat(2.0));
+        assert_eq!(scene.object(b).unwrap().transform.scale, Vec3::splat(3.0));
+    }
+
+    #[test]
+    fn primitive_edit_only_same_variant() {
+        let mut scene = Scene::new();
+        let cube = add_cube(&mut scene);
+        let sphere = scene.add_object(
+            Primitive::IcoSphere {
+                subdivisions: 1,
+                radius: 1.0,
+            },
+            Transform::default(),
+        );
+        apply_prop_dirty(
+            &mut scene,
+            &[cube, sphere],
+            PropDirty {
+                primitive: true,
+                ..PropDirty::default()
+            },
+            &Transform::default(),
+            Primitive::Cube { size: 2.5 },
+            &Material::default(),
+            false,
+            (false, 1.0, Vec3::ZERO),
+            (false, false),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        match scene.object(cube).unwrap().primitive {
+            Primitive::Cube { size } => assert!((size - 2.5).abs() < 1e-5),
+            other => panic!("expected cube, got {other:?}"),
+        }
+        match scene.object(sphere).unwrap().primitive {
+            Primitive::IcoSphere { radius, .. } => assert!((radius - 1.0).abs() < 1e-5),
+            other => panic!("expected sphere, got {other:?}"),
+        }
+    }
 }

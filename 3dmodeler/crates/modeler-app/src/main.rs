@@ -16,6 +16,8 @@ mod control;
 mod camera;
 mod context_menu;
 mod cutout_handles;
+mod force_handles;
+mod rope_handles;
 mod edit_mode;
 #[cfg(not(target_arch = "wasm32"))]
 mod gl_window;
@@ -170,6 +172,8 @@ pub fn main() {
     let mut modal = modal::ModalTransform::new();
     let mut delete_tool = object_ops::DeleteTool::new();
     let mut cutout_handles = cutout_handles::CutoutHandles::new();
+    let mut force_handles = force_handles::ForceHandles::new();
+    let mut rope_handles = rope_handles::RopeHandles::new();
     let mut poke_tool = poke::PokeTool::new();
     let mut ui_state = ui::UiState::new();
     // dev/test hook: start with the AI panel open (used by UI verification)
@@ -331,6 +335,27 @@ pub fn main() {
                         frame_input.viewport,
                         frame_input.device_pixel_ratio,
                         settings.unit,
+                    );
+                }
+                // initial-force arrows (edit-time; hidden while simulating)
+                if physics.is_stopped() && !edit_mode.active() {
+                    force_handles.draw(
+                        gui_context,
+                        &scene,
+                        &sel,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        overlay_clip,
+                    );
+                    rope_handles.draw(
+                        gui_context,
+                        &scene,
+                        &sel,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        overlay_clip,
                     );
                 }
                 if let Some(guides) = &modal_guides {
@@ -895,8 +920,29 @@ pub fn main() {
                 frame_input.device_pixel_ratio,
                 pointer_over_ui,
             );
+            force_handles.handle_events(
+                &mut frame_input.events,
+                &mut scene,
+                &sel,
+                &camera,
+                frame_input.viewport,
+                frame_input.device_pixel_ratio,
+                pointer_over_ui,
+            );
+            rope_handles.handle_events(
+                &mut frame_input.events,
+                &mut scene,
+                &sel,
+                &physics,
+                &camera,
+                frame_input.viewport,
+                frame_input.device_pixel_ratio,
+                pointer_over_ui,
+            );
         } else {
             cutout_handles.cancel();
+            force_handles.cancel();
+            rope_handles.cancel();
         }
 
         // external control API (MCP): execute queued agent commands
@@ -928,6 +974,12 @@ pub fn main() {
         // step the simulation (writes transforms back into the scene)
         physics.update(&mut scene, frame_input.elapsed_time as f32 / 1000.0);
 
+        // design-mode: keep attached rope ends on their targets when those
+        // objects move (skip while dragging a rope handle or simulating)
+        if physics.is_stopped() && !rope_handles.dragging() && !modal.active() {
+            rope_handles::sync_attached_ropes(&mut scene);
+        }
+
         // physics mirror must be current before picking (no-op while playing)
         physics.sync(&scene);
         sel.retain_existing(|id| scene.object(id).is_some());
@@ -946,6 +998,8 @@ pub fn main() {
                 || wall_tool.drawing()
                 || roof_tool.drawing()
                 || cutout_handles.dragging()
+                || force_handles.dragging()
+                || rope_handles.dragging()
                 || !physics.is_stopped(),
         );
 

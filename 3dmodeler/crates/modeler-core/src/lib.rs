@@ -6,12 +6,17 @@
 
 pub mod boolean;
 pub mod library;
+pub mod material;
 pub mod mesh;
 
 use glam::{Quat, Vec2, Vec3};
 pub use boolean::{mesh_boolean, mesh_to_frame, BooleanOp};
 pub use glam;
 pub use library::{Library, LibraryAsset};
+pub use material::{
+    resolve_authored, resolve_for_render, MasterMaterial, Material, MaterialFunction,
+    MaterialId, MaterialOverrides, MaterialParameterCollection, WorldPositionEffect,
+};
 pub use mesh::{MeshData, WallCutout};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -239,6 +244,33 @@ pub enum Primitive {
         spot_angle_deg: f32,
         shadows: bool,
     },
+    /// Physical rope: a flexible chain of segment bodies between two ends.
+    /// In local space the rope runs along +X from the origin to
+    /// `(length, 0, 0)`. Each end can be anchored to another object via
+    /// `Object::rope_start` / `Object::rope_end`. When the simulation plays,
+    /// the rope sags, swings and collides under gravity.
+    Rope {
+        /// Rest / maximum length in meters (sum of segment max lengths).
+        length: f32,
+        /// Visual and collision radius of the cord.
+        radius: f32,
+        /// Number of physics links (nodes = segments + 1). Clamped 2..=64.
+        segments: u32,
+    },
+}
+
+/// One end of a `Primitive::Rope`: free, or pinned to a point on another object.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct RopeEnd {
+    /// Object this end is pinned to. `None` = free (the end sits at the
+    /// rope's own local start/end and moves with the rope body).
+    #[serde(default)]
+    pub object: Option<ObjectId>,
+    /// Attachment point in the target object's local space. Ignored when
+    /// `object` is `None`. Defaults to the origin; set to the target's
+    /// `anchor` when attaching "to its anchor point".
+    #[serde(default)]
+    pub local_point: Vec3,
 }
 
 impl Primitive {
@@ -276,6 +308,10 @@ impl Primitive {
         matches!(self, Primitive::Light { .. })
     }
 
+    pub fn is_rope(&self) -> bool {
+        matches!(self, Primitive::Rope { .. })
+    }
+
     /// Base object name, matching Blender's naming.
     pub fn base_name(&self) -> &'static str {
         match self {
@@ -291,6 +327,7 @@ impl Primitive {
             Primitive::Roof { .. } => "Roof",
             Primitive::Empty { .. } => "Empty",
             Primitive::Light { kind, .. } => kind.label(),
+            Primitive::Rope { .. } => "Rope",
         }
     }
 
@@ -331,6 +368,10 @@ impl Primitive {
                     (mesh::SPOT_GIZMO_LENGTH * mesh::SPOT_GIZMO_LENGTH + r * r).sqrt() + 0.01
                 }
             },
+            // origin at the start; far end + radius is the farthest point
+            Primitive::Rope { length, radius, .. } => {
+                ((length * length) + 2.0 * radius * radius).sqrt()
+            }
         }
     }
 
@@ -373,6 +414,9 @@ impl Primitive {
                     Vec3::new(2.0 * r, 2.0 * r, mesh::SPOT_GIZMO_LENGTH)
                 }
             },
+            Primitive::Rope { length, radius, .. } => {
+                Vec3::new(length, 2.0 * radius, 2.0 * radius)
+            }
         }
     }
 
@@ -393,6 +437,7 @@ impl Primitive {
                 LightKind::Sun => mesh::SUN_GIZMO_EXTENT,
                 LightKind::Spot => mesh::SPOT_GIZMO_LENGTH,
             },
+            Primitive::Rope { radius, .. } => radius,
         }
     }
 
@@ -426,6 +471,7 @@ impl Primitive {
             }
             Primitive::Empty { size } => mesh::empty_axes(size),
             Primitive::Light { .. } => unreachable!("handled above"),
+            Primitive::Rope { length, radius, .. } => mesh::rope(length, radius),
         };
         if smooth {
             m
@@ -479,25 +525,6 @@ impl ModifierKind {
     }
 }
 
-/// Simple PBR-ish material.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Material {
-    pub base_color: [f32; 3],
-    pub roughness: f32,
-    pub metallic: f32,
-}
-
-impl Default for Material {
-    fn default() -> Self {
-        // Blender's default material gray
-        Self {
-            base_color: [0.8, 0.8, 0.8],
-            roughness: 0.7,
-            metallic: 0.0,
-        }
-    }
-}
-
 /// One object in the scene.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Object {
@@ -507,10 +534,22 @@ pub struct Object {
     pub primitive: Primitive,
     pub smooth: bool,
     pub visible: bool,
+    /// Inline material, or snapshot used when a master is missing.
     pub material: Material,
+    /// When set, this object is a **material instance** of the named master
+    /// (UE-style MI). Overrides layer on top; see `material_overrides`.
+    #[serde(default)]
+    pub material_master: Option<MaterialId>,
+    /// Per-instance parameter overrides (only fields that diverge from master).
+    #[serde(default)]
+    pub material_overrides: MaterialOverrides,
     /// Physics simulation: dynamic bodies fall and collide when playing.
     pub dynamic: bool,
     pub density: f32,
+    /// World-space linear impulse (N·s) applied once when simulation starts.
+    /// Only used for dynamic bodies; ignored (and not drawn) when static.
+    #[serde(default)]
+    pub initial_force: Vec3,
     /// Hierarchy: this object follows its parent's transform.
     #[serde(default)]
     pub parent: Option<ObjectId>,
@@ -568,11 +607,24 @@ pub struct Object {
     /// Not saved: a fresh session starts with fresh caches anyway.
     #[serde(skip)]
     pub mesh_revision: u64,
+    /// Rope start end (pin target). Only meaningful for `Primitive::Rope`.
+    #[serde(default)]
+    pub rope_start: RopeEnd,
+    /// Rope end end (pin target). Only meaningful for `Primitive::Rope`.
+    #[serde(default)]
+    pub rope_end: RopeEnd,
+    /// Live world-space node positions while the rope is simulating.
+    /// Not saved; the renderer uses these to draw the draped cord.
+    #[serde(skip)]
+    pub rope_nodes: Option<Vec<Vec3>>,
 }
 
 impl Object {
     /// The mesh to draw: the edited mesh if any, else the primitive (walls
-    /// include their door/window cutouts).
+    /// include their door/window cutouts). While a rope is simulating,
+    /// `rope_nodes` (world space) overrides the straight rest pose — callers
+    /// that apply the object transform should use `render_mesh_world` or
+    /// draw nodes in world space.
     pub fn render_mesh(&self) -> MeshData {
         match (&self.edited_mesh, self.primitive) {
             (Some(mesh), _) => mesh.clone(),
@@ -583,6 +635,18 @@ impl Object {
                 if !self.floor_outline.is_empty() =>
             {
                 mesh::floor_polygon(&self.floor_outline, thickness)
+            }
+            // live draped rope: nodes are world-space; return a LOCAL mesh
+            // centered on the first node by expressing points relative to it
+            // so the usual object transform (updated to that first node)
+            // places them correctly
+            (None, Primitive::Rope { radius, .. }) => {
+                if let Some(nodes) = self.rope_nodes.as_ref().filter(|n| n.len() >= 2) {
+                    let origin = nodes[0];
+                    let local: Vec<Vec3> = nodes.iter().map(|p| *p - origin).collect();
+                    return mesh::rope_polyline(&local, radius);
+                }
+                self.primitive.generate(self.smooth)
             }
             (None, primitive) => primitive.generate(self.smooth),
         }
@@ -886,7 +950,12 @@ pub struct Scene {
     measurements: Vec<Measurement>,
     reference_images: Vec<ReferenceImage>,
     folders: Vec<Folder>,
+    /// Master material library (UE-style parent materials).
+    masters: Vec<MasterMaterial>,
+    /// Global material parameters (wetness, snow, tint, …).
+    mpc: MaterialParameterCollection,
     next_id: u64,
+    next_material_id: u64,
     version: u64,
     /// Process-unique id of this Scene value. Editors use it to notice the
     /// document being REPLACED (File ▸ New, control new_scene) — object ids
@@ -904,7 +973,10 @@ impl Default for Scene {
             measurements: Vec::new(),
             reference_images: Vec::new(),
             folders: Vec::new(),
+            masters: Vec::new(),
+            mpc: MaterialParameterCollection::default(),
             next_id: 0,
+            next_material_id: 0,
             version: 0,
             instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -948,8 +1020,11 @@ impl Scene {
             smooth: false, // Blender adds meshes flat-shaded
             visible: true,
             material: Material::default(),
+            material_master: None,
+            material_overrides: MaterialOverrides::default(),
             dynamic: false,
             density: 1.0,
+            initial_force: Vec3::ZERO,
             parent: None,
             folder: None,
             show_label: false,
@@ -963,7 +1038,19 @@ impl Scene {
             subdivision: 0,
             modifiers: Vec::new(),
             mesh_revision: 0,
+            rope_start: RopeEnd::default(),
+            rope_end: RopeEnd::default(),
+            rope_nodes: None,
         });
+        // Ropes are physical by default — they only do something useful under gravity.
+        if primitive.is_rope() {
+            if let Some(object) = self.objects.last_mut() {
+                object.dynamic = true;
+                object.smooth = true;
+                // brown cord
+                object.material.base_color = [0.45, 0.28, 0.12];
+            }
+        }
         self.index.insert(id, self.objects.len() - 1);
         id
     }
@@ -1047,6 +1134,164 @@ impl Scene {
         let removed = self.objects.remove(index);
         self.rebuild_index();
         Some(removed)
+    }
+
+    // --- materials (masters, MPC, resolve) --------------------------------
+
+    pub fn masters(&self) -> &[MasterMaterial] {
+        &self.masters
+    }
+
+    pub fn master(&self, id: MaterialId) -> Option<&MasterMaterial> {
+        self.masters.iter().find(|m| m.id == id)
+    }
+
+    pub fn master_mut(&mut self, id: MaterialId) -> Option<&mut MasterMaterial> {
+        self.version += 1;
+        self.masters.iter_mut().find(|m| m.id == id)
+    }
+
+    pub fn mpc(&self) -> &MaterialParameterCollection {
+        &self.mpc
+    }
+
+    pub fn mpc_mut(&mut self) -> &mut MaterialParameterCollection {
+        self.version += 1;
+        &mut self.mpc
+    }
+
+    pub fn set_mpc(&mut self, mpc: MaterialParameterCollection) {
+        self.mpc = mpc;
+        self.version += 1;
+    }
+
+    /// Create a master material from a template (copies `material`).
+    pub fn add_master(&mut self, name: &str, material: Material) -> MaterialId {
+        self.next_material_id += 1;
+        self.version += 1;
+        let id = MaterialId(self.next_material_id);
+        let name = self.unique_master_name(name);
+        self.masters.push(MasterMaterial {
+            id,
+            name,
+            material: material.clamped(),
+        });
+        id
+    }
+
+    /// Promote an object's current resolved material into a new master and
+    /// rebind the object as an instance (no overrides).
+    pub fn create_master_from_object(&mut self, object_id: ObjectId, name: &str) -> Option<MaterialId> {
+        let mat = self.object_material(object_id)?;
+        let id = self.add_master(name, mat);
+        if let Some(object) = self.object_mut(object_id) {
+            object.material = mat;
+            object.material_master = Some(id);
+            object.material_overrides = MaterialOverrides::default();
+        }
+        Some(id)
+    }
+
+    /// Bind `object_id` as an instance of `master_id`, clearing overrides.
+    pub fn assign_master(&mut self, object_id: ObjectId, master_id: MaterialId) -> bool {
+        let Some(master) = self.master(master_id).map(|m| m.material) else {
+            return false;
+        };
+        let Some(object) = self.object_mut(object_id) else {
+            return false;
+        };
+        object.material = master;
+        object.material_master = Some(master_id);
+        object.material_overrides = MaterialOverrides::default();
+        true
+    }
+
+    /// Make the object's material fully local (break instance link).
+    pub fn make_material_unique(&mut self, object_id: ObjectId) -> bool {
+        let mat = match self.object_material(object_id) {
+            Some(m) => m,
+            None => return false,
+        };
+        let Some(object) = self.object_mut(object_id) else {
+            return false;
+        };
+        object.material = mat;
+        object.material_master = None;
+        object.material_overrides = MaterialOverrides::default();
+        true
+    }
+
+    /// Authored material (master + overrides), no MPC / world effects.
+    pub fn object_material(&self, id: ObjectId) -> Option<Material> {
+        let object = self.object(id)?;
+        Some(resolve_authored(
+            &object.material,
+            object.material_master,
+            &object.material_overrides,
+            &self.masters,
+        ))
+    }
+
+    /// Full render-ready material for an object at its current world transform.
+    pub fn object_material_for_render(&self, id: ObjectId) -> Option<Material> {
+        let object = self.object(id)?;
+        let world = self.world_transform(id);
+        let world_up = world.rotation * Vec3::Z;
+        Some(resolve_for_render(
+            &object.material,
+            object.material_master,
+            &object.material_overrides,
+            &self.masters,
+            &self.mpc,
+            world.location,
+            world_up,
+        ))
+    }
+
+    /// Write an edited material back onto the object. If the object is an
+    /// instance, only the differing fields become overrides; the inline
+    /// snapshot is kept in sync for orphan fallback / library capture.
+    pub fn set_object_material(&mut self, id: ObjectId, edited: Material) -> bool {
+        let edited = edited.clamped();
+        let master_id = self.object(id).and_then(|o| o.material_master);
+        let overrides = if let Some(mid) = master_id {
+            if let Some(master) = self.master(mid) {
+                MaterialOverrides::from_diff(&master.material, &edited)
+            } else {
+                MaterialOverrides::default()
+            }
+        } else {
+            MaterialOverrides::default()
+        };
+        let Some(object) = self.object_mut(id) else {
+            return false;
+        };
+        object.material = edited;
+        if object.material_master.is_some() {
+            object.material_overrides = overrides;
+        }
+        true
+    }
+
+    /// Apply a material function to an object (preserves master link via overrides).
+    pub fn apply_material_function(&mut self, id: ObjectId, func: MaterialFunction) -> bool {
+        let Some(base) = self.object_material(id) else {
+            return false;
+        };
+        self.set_object_material(id, func.apply(&base))
+    }
+
+    fn unique_master_name(&self, base: &str) -> String {
+        if !self.masters.iter().any(|m| m.name == base) {
+            return base.to_string();
+        }
+        for i in 1..1000 {
+            let candidate = format!("{base}.{i:03}");
+            if !self.masters.iter().any(|m| m.name == candidate) {
+                return candidate;
+            }
+        }
+        format!("{base}.{}", self.next_material_id)
     }
 
     // --- outliner folders ---------------------------------------------------
@@ -1259,6 +1504,37 @@ impl Scene {
         self.world_transform(id).transform_point(anchor)
     }
 
+    /// World-space position of a rope end. When the end is attached, uses the
+    /// target object's transform × local_point; otherwise uses the rope's
+    /// own local start (origin) or end `(length, 0, 0)`.
+    pub fn rope_end_world(&self, rope_id: ObjectId, start: bool) -> Vec3 {
+        let Some(object) = self.object(rope_id) else {
+            return Vec3::ZERO;
+        };
+        let end = if start {
+            object.rope_start
+        } else {
+            object.rope_end
+        };
+        if let Some(target) = end.object {
+            if self.object(target).is_some() {
+                return self
+                    .world_transform(target)
+                    .transform_point(end.local_point);
+            }
+        }
+        let length = match object.primitive {
+            Primitive::Rope { length, .. } => length.max(0.01),
+            _ => 1.0,
+        };
+        let local = if start {
+            Vec3::ZERO
+        } else {
+            Vec3::new(length, 0.0, 0.0)
+        };
+        self.world_transform(rope_id).transform_point(local)
+    }
+
     /// Attach `child` to `parent`: move the child so its anchor point lands
     /// on `at` (world space; defaults to the parent's anchor point), then
     /// parent it there. Rejects cycles like `set_parent`.
@@ -1449,7 +1725,13 @@ pub struct SceneData {
     pub reference_images: Vec<ReferenceImage>,
     #[serde(default)]
     pub folders: Vec<Folder>,
+    #[serde(default)]
+    pub masters: Vec<MasterMaterial>,
+    #[serde(default)]
+    pub mpc: MaterialParameterCollection,
     pub next_id: u64,
+    #[serde(default)]
+    pub next_material_id: u64,
 }
 
 impl Scene {
@@ -1459,7 +1741,10 @@ impl Scene {
             measurements: self.measurements.clone(),
             reference_images: self.reference_images.clone(),
             folders: self.folders.clone(),
+            masters: self.masters.clone(),
+            mpc: self.mpc,
             next_id: self.next_id,
+            next_material_id: self.next_material_id,
         }
     }
 
@@ -1471,7 +1756,10 @@ impl Scene {
         self.measurements = data.measurements.clone();
         self.reference_images = data.reference_images.clone();
         self.folders = data.folders.clone();
+        self.masters = data.masters.clone();
+        self.mpc = data.mpc;
         self.next_id = data.next_id;
+        self.next_material_id = data.next_material_id;
         self.version += 1;
         self.rebuild_index();
     }
@@ -1551,6 +1839,79 @@ mod tests {
         assert_eq!(scene.object(id).unwrap().name, "Cube");
         scene.remove_object(id);
         assert!(scene.object(id).is_none());
+    }
+
+    #[test]
+    fn master_instance_and_mpc_resolve() {
+        let mut scene = Scene::new();
+        let a = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let b = scene.add_object(
+            Primitive::Cube { size: 1.0 },
+            Transform {
+                location: Vec3::new(0.0, 0.0, 5.0),
+                ..Default::default()
+            },
+        );
+        scene.object_mut(a).unwrap().material.base_color = [1.0, 0.0, 0.0];
+        let mid = scene.create_master_from_object(a, "RedPlastic").unwrap();
+        assert!(scene.assign_master(b, mid));
+
+        // Instance inherits master color
+        assert_eq!(scene.object_material(b).unwrap().base_color, [1.0, 0.0, 0.0]);
+
+        // Override roughness on b only
+        scene.set_object_material(
+            b,
+            Material {
+                base_color: [1.0, 0.0, 0.0],
+                roughness: 0.1,
+                ..Default::default()
+            },
+        );
+        assert!((scene.object_material(b).unwrap().roughness - 0.1).abs() < 1e-5);
+        assert!((scene.object_material(a).unwrap().roughness - 0.7).abs() < 1e-5);
+
+        // Edit master → instance without that override field still follows
+        scene.master_mut(mid).unwrap().material.base_color = [0.0, 1.0, 0.0];
+        assert_eq!(scene.object_material(a).unwrap().base_color, [0.0, 1.0, 0.0]);
+        // b overrode only roughness, so base_color follows master
+        assert_eq!(scene.object_material(b).unwrap().base_color, [0.0, 1.0, 0.0]);
+        assert!((scene.object_material(b).unwrap().roughness - 0.1).abs() < 1e-5);
+
+        // MPC wetness affects render resolve
+        scene.set_mpc(MaterialParameterCollection {
+            wetness: 1.0,
+            ..Default::default()
+        });
+        let dry_r = 0.1;
+        let wet = scene.object_material_for_render(b).unwrap();
+        assert!(wet.roughness < dry_r);
+
+        // Material function
+        assert!(scene.apply_material_function(a, MaterialFunction::Metal));
+        assert!((scene.object_material(a).unwrap().metallic - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scene_json_roundtrip_keeps_masters_and_mpc() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let mid = scene.create_master_from_object(id, "MasterA").unwrap();
+        scene.set_mpc(MaterialParameterCollection {
+            wetness: 0.4,
+            snow_amount: 0.2,
+            snow_height: 3.0,
+            global_tint: [0.9, 0.95, 1.0],
+            emissive_boost: 1.5,
+        });
+        let json = scene.to_json();
+        let data = Scene::from_json(&json).unwrap();
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        assert_eq!(restored.masters().len(), 1);
+        assert_eq!(restored.masters()[0].id, mid);
+        assert!((restored.mpc().wetness - 0.4).abs() < 1e-5);
+        assert_eq!(restored.object(id).unwrap().material_master, Some(mid));
     }
 
     #[test]
@@ -1849,6 +2210,60 @@ mod tests {
         let data = Scene::from_json(&scene.to_json()).unwrap();
         assert_eq!(data.objects[0].primitive, empty);
     }
+
+    #[test]
+    fn rope_primitive_has_mesh_and_anchors() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(
+            Primitive::Rope {
+                length: 3.0,
+                radius: 0.05,
+                segments: 8,
+            },
+            Transform::default(),
+        );
+        let object = scene.object(id).unwrap();
+        assert!(object.dynamic, "ropes are dynamic by default");
+        assert_eq!(object.primitive.base_name(), "Rope");
+        let mesh = object.render_mesh();
+        assert!(mesh.positions.len() >= 8);
+        assert!(mesh.indices.len() >= 6);
+        // anchor both ends to a cube
+        let cube = scene.add_object(Primitive::Cube { size: 1.0 }, Transform {
+            location: Vec3::new(0.0, 0.0, 2.0),
+            ..Default::default()
+        });
+        let weight = scene.add_object(Primitive::Cube { size: 0.5 }, Transform {
+            location: Vec3::new(2.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        {
+            let o = scene.object_mut(id).unwrap();
+            o.rope_start = RopeEnd {
+                object: Some(cube),
+                local_point: Vec3::ZERO,
+            };
+            o.rope_end = RopeEnd {
+                object: Some(weight),
+                local_point: Vec3::ZERO,
+            };
+        }
+        let start = scene.rope_end_world(id, true);
+        let end = scene.rope_end_world(id, false);
+        assert!((start - Vec3::new(0.0, 0.0, 2.0)).length() < 1e-4);
+        assert!((end - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-4);
+        // roundtrip
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        let o = data
+            .objects
+            .iter()
+            .find(|o| o.id == id)
+            .expect("rope restored");
+        assert!(matches!(o.primitive, Primitive::Rope { length, .. } if (length - 3.0).abs() < 1e-5));
+        assert_eq!(o.rope_start.object, Some(cube));
+        assert_eq!(o.rope_end.object, Some(weight));
+    }
+
 
     #[test]
     fn lights_have_gizmos_and_survive_json() {

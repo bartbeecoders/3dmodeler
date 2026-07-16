@@ -96,6 +96,18 @@ struct BodyEntry {
     rotation: Quat,
 }
 
+/// Simulated rope: a chain of segment bodies + distance joints, not a
+/// single mirrored body. Segment positions drive `Object::rope_nodes`.
+struct RopeSim {
+    object_id: ObjectId,
+    /// First `node_count` entries are the dynamic segment nodes; any further
+    /// bodies are static pin anchors created when the attach target has no
+    /// physics body of its own.
+    bodies: Vec<ffi::b3BodyId>,
+    node_count: usize,
+    joints: Vec<ffi::b3JointId>,
+}
+
 /// Destroy a mirrored body and free the mesh data its shapes referenced.
 unsafe fn destroy_entry(entry: &mut BodyEntry) {
     ffi::b3DestroyBody(entry.body);
@@ -104,11 +116,27 @@ unsafe fn destroy_entry(entry: &mut BodyEntry) {
     }
 }
 
+unsafe fn destroy_rope(rope: &mut RopeSim) {
+    for joint in rope.joints.drain(..) {
+        if ffi::b3Joint_IsValid(joint) {
+            ffi::b3DestroyJoint(joint, false);
+        }
+    }
+    for body in rope.bodies.drain(..) {
+        if ffi::b3Body_IsValid(body) {
+            ffi::b3DestroyBody(body);
+        }
+    }
+    rope.node_count = 0;
+}
+
 pub struct PhysicsMirror {
     world: ffi::b3WorldId,
     worker_count: u32,
     synced_version: Option<u64>,
     entries: HashMap<ObjectId, BodyEntry>,
+    /// Active rope simulations (play mode only).
+    ropes: HashMap<ObjectId, RopeSim>,
     /// Simulate-mode ground plane (never has an ObjectId).
     ground: Option<ffi::b3BodyId>,
     /// Dynamic bodies in parent-before-child order for the per-step
@@ -116,7 +144,11 @@ pub struct PhysicsMirror {
     sim_order: Vec<ObjectId>,
     sim: SimState,
     pub ground_plane: bool,
+    /// Transforms at play; restored on stop.
     snapshot: Vec<(ObjectId, Transform)>,
+    /// Rope design lengths at play; restored on stop so sim never shortens
+    /// a sagging cord to its current span.
+    rope_length_snapshot: Vec<(ObjectId, f32)>,
     accumulator: f32,
 }
 
@@ -131,11 +163,13 @@ impl PhysicsMirror {
                 worker_count: 0,
                 synced_version: None,
                 entries: HashMap::new(),
+                ropes: HashMap::new(),
                 ground: None,
                 sim_order: Vec::new(),
                 sim: SimState::Stopped,
                 ground_plane: true,
                 snapshot: Vec::new(),
+                rope_length_snapshot: Vec::new(),
                 accumulator: 0.0,
             }
         }
@@ -211,6 +245,9 @@ impl PhysicsMirror {
 
     fn destroy_all(&mut self) {
         unsafe {
+            for (_, mut rope) in self.ropes.drain() {
+                destroy_rope(&mut rope);
+            }
             for (_, mut entry) in self.entries.drain() {
                 destroy_entry(&mut entry);
             }
@@ -313,6 +350,16 @@ impl PhysicsMirror {
                 );
                 ffi::b3CreateHullShape(body, shape_def, &hull.base);
             }
+            // edit-mode rope: thin capsule along local +X for picking
+            Primitive::Rope { length, radius, .. } => {
+                let r = (radius * scale.y.abs().max(scale.z.abs())).max(1e-4);
+                let capsule = ffi::b3Capsule {
+                    center1: bvec(Vec3::ZERO),
+                    center2: bvec(Vec3::new((length * scale.x.abs()).max(1e-3), 0.0, 0.0)),
+                    radius: r,
+                };
+                ffi::b3CreateCapsuleShape(body, shape_def, &capsule);
+            }
             // torus is not convex: exact triangle mesh so the hole stays a hole.
             // NOTE: mesh shapes cannot be dynamic in box3d; dynamic tori fall
             // back to a convex hull below.
@@ -389,6 +436,15 @@ impl PhysicsMirror {
                     .iter()
                     .map(|o| (o.id, o.transform))
                     .collect();
+                // freeze design length for the whole sim session
+                self.rope_length_snapshot = scene
+                    .objects()
+                    .iter()
+                    .filter_map(|o| match o.primitive {
+                        Primitive::Rope { length, .. } => Some((o.id, length)),
+                        _ => None,
+                    })
+                    .collect();
                 self.sim = SimState::Playing; // set before rebuild: torus hull fallback
                 self.build_simulation(scene);
                 self.accumulator = 0.0;
@@ -403,8 +459,12 @@ impl PhysicsMirror {
         let dynamic_bodies = scene
             .objects()
             .iter()
-            .filter(|o| o.visible && o.dynamic)
-            .count();
+            .filter(|o| o.visible && (o.dynamic || o.primitive.is_rope()))
+            .map(|o| match o.primitive {
+                Primitive::Rope { segments, .. } => segments.clamp(2, 64) as usize + 1,
+                _ => 1,
+            })
+            .sum::<usize>();
         let want = desired_worker_count(dynamic_bodies);
         if want != self.worker_count {
             self.recreate_world(want);
@@ -425,6 +485,7 @@ impl PhysicsMirror {
                 self.ground = Some(ground);
             }
 
+            // pass 1: solid bodies (ropes need their attach targets to exist)
             for object in scene.objects() {
                 if !object.visible {
                     continue;
@@ -437,17 +498,212 @@ impl PhysicsMirror {
                 ) {
                     continue;
                 }
+                // ropes get their own multi-body chain below
+                if object.primitive.is_rope() {
+                    continue;
+                }
                 let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
                 let key = ShapeKey::of(object, world.scale);
                 let entry = self.create_entry(object, &world, key, true);
                 if ffi::b3Body_GetType(entry.body) == ffi::b3BodyType_b3_dynamicBody {
+                    // one-shot world-space impulse at play (N·s); zero is a no-op
+                    if object.initial_force.length_squared() > 1e-12 {
+                        ffi::b3Body_ApplyLinearImpulseToCenter(
+                            entry.body,
+                            bvec(object.initial_force),
+                            true,
+                        );
+                    }
                     self.sim_order.push(object.id);
                 }
                 self.entries.insert(object.id, entry);
             }
+            // pass 2: ropes (segment chains + pins to attach targets)
+            for object in scene.objects() {
+                if !object.visible || !object.primitive.is_rope() {
+                    continue;
+                }
+                if let Some(rope) = self.build_rope(scene, object) {
+                    self.ropes.insert(object.id, rope);
+                }
+            }
         }
         // parents first so children's local conversions see updated parents
         self.sim_order.sort_by_key(|id| scene.depth(*id));
+    }
+
+}
+
+/// Place `n_links + 1` nodes for a rope of design `length` between two pins.
+/// When the rope is longer than the pin span, add a parabolic sag so the
+/// polyline arc length is approximately `length` (slack for swinging).
+/// When shorter or equal, place taut along the span (rope will pull).
+fn rope_node_positions(start: Vec3, end: Vec3, length: f32, n_links: usize) -> Vec<Vec3> {
+    let n_nodes = n_links + 1;
+    let span = end - start;
+    let span_len = span.length();
+    let dir = if span_len > 1e-4 {
+        span / span_len
+    } else {
+        Vec3::NEG_Z
+    };
+
+    // taut placement along the chord
+    let mut pts: Vec<Vec3> = (0..n_nodes)
+        .map(|i| {
+            let t = i as f32 / n_links as f32;
+            if span_len > 1e-4 {
+                start + span * t
+            } else {
+                start + dir * (length * t)
+            }
+        })
+        .collect();
+
+    if length > span_len + 1e-3 && span_len > 1e-4 {
+        // binary-search sag so polyline length ≈ design length
+        let mut lo = 0.0f32;
+        let mut hi = (length - span_len) * 2.0 + 0.5;
+        for _ in 0..16 {
+            let mid = 0.5 * (lo + hi);
+            let mut poly = 0.0f32;
+            let mut prev = start;
+            for i in 0..n_nodes {
+                let t = i as f32 / n_links as f32;
+                let p = start + span * t - Vec3::Z * (4.0 * mid * t * (1.0 - t));
+                if i > 0 {
+                    poly += (p - prev).length();
+                }
+                prev = p;
+            }
+            if poly < length {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let sag = 0.5 * (lo + hi);
+        for i in 0..n_nodes {
+            let t = i as f32 / n_links as f32;
+            pts[i] = start + span * t - Vec3::Z * (4.0 * sag * t * (1.0 - t));
+        }
+    }
+    pts
+}
+
+impl PhysicsMirror {
+    /// Build a multi-segment rope: light spheres at nodes, rigid distance
+    /// joints sized to the **actual** initial segment lengths, and rigid
+    /// pins to attached bodies. Joint rest length must match the spawn
+    /// spacing — a fixed design `seg_len` while nodes sit on a shorter
+    /// chord made the chain explode under gravity.
+    unsafe fn build_rope(
+        &self,
+        scene: &Scene,
+        object: &modeler_core::Object,
+    ) -> Option<RopeSim> {
+        let Primitive::Rope {
+            length,
+            radius,
+            segments,
+        } = object.primitive
+        else {
+            return None;
+        };
+        let length = length.max(0.05);
+        let radius = radius.max(0.005);
+        let n_links = segments.clamp(2, 64) as usize;
+        let n_nodes = n_links + 1;
+
+        let start_w = scene.rope_end_world(object.id, true);
+        let end_w = scene.rope_end_world(object.id, false);
+        let positions = rope_node_positions(start_w, end_w, length, n_links);
+
+        let mut shape_def = ffi::b3DefaultShapeDef();
+        shape_def.userData = object.id.0 as usize as *mut c_void;
+
+        let mut bodies = Vec::with_capacity(n_nodes + 2);
+        for pos in &positions {
+            let mut body_def = ffi::b3DefaultBodyDef();
+            body_def.type_ = ffi::b3BodyType_b3_dynamicBody;
+            body_def.position = bvec(*pos);
+            // Light damping so a hanging mass can still swing.
+            body_def.linearDamping = 0.3;
+            body_def.angularDamping = 0.8;
+            body_def.enableSleep = false;
+            let body = ffi::b3CreateBody(self.world, &body_def);
+            let sphere = ffi::b3Sphere {
+                center: bvec(Vec3::ZERO),
+                radius,
+            };
+            let mut node_shape = shape_def;
+            node_shape.baseMaterial.restitution = 0.0;
+            node_shape.baseMaterial.friction = 0.4;
+            // Sensors: no collision with the hanging mass (avoids explosions).
+            // Density is high so node mass is not tiny vs. a hanging cube —
+            // extreme mass ratios make long distance-joint chains stretch.
+            node_shape.density = 40.0;
+            node_shape.isSensor = true;
+            ffi::b3CreateSphereShape(body, &node_shape, &sphere);
+            bodies.push(body);
+        }
+
+        let mut joints = Vec::new();
+
+        // Rigid distance joints at the **actual** spawn spacing (proven by
+        // the distance_joint_holds_two_spheres test).
+        for i in 0..n_links {
+            let seg = (positions[i + 1] - positions[i]).length().max(1e-3);
+            let mut joint_def = ffi::b3DefaultDistanceJointDef();
+            joint_def.base.bodyIdA = bodies[i];
+            joint_def.base.bodyIdB = bodies[i + 1];
+            joint_def.base.localFrameA.p = bvec(Vec3::ZERO);
+            joint_def.base.localFrameB.p = bvec(Vec3::ZERO);
+            joint_def.base.collideConnected = false;
+            joint_def.length = seg;
+            joint_def.enableSpring = false;
+            joint_def.enableLimit = false;
+            joints.push(ffi::b3CreateDistanceJoint(self.world, &joint_def));
+        }
+
+        // Rigid pins to attach targets (length must be > 0 for the API).
+        for (is_start, end, node_idx) in [
+            (true, object.rope_start, 0usize),
+            (false, object.rope_end, n_nodes - 1),
+        ] {
+            let Some(_target_id) = end.object else {
+                continue;
+            };
+            let world_pt = scene.rope_end_world(object.id, is_start);
+            let pin_body = if let Some(entry) = self.entries.get(&_target_id) {
+                entry.body
+            } else {
+                let mut body_def = ffi::b3DefaultBodyDef();
+                body_def.position = bvec(world_pt);
+                let anchor = ffi::b3CreateBody(self.world, &body_def);
+                bodies.push(anchor);
+                anchor
+            };
+
+            let local_on_target = ffi::b3Body_GetLocalPoint(pin_body, bvec(world_pt));
+            let mut joint_def = ffi::b3DefaultDistanceJointDef();
+            joint_def.base.bodyIdA = pin_body;
+            joint_def.base.bodyIdB = bodies[node_idx];
+            joint_def.base.localFrameA.p = local_on_target;
+            joint_def.base.localFrameB.p = bvec(Vec3::ZERO);
+            joint_def.base.collideConnected = false;
+            joint_def.length = 0.005; // API requires length > 0
+            joint_def.enableSpring = false;
+            joint_def.enableLimit = false;
+            joints.push(ffi::b3CreateDistanceJoint(self.world, &joint_def));
+        }
+
+        Some(RopeSim {
+            object_id: object.id,
+            bodies,
+            node_count: n_nodes,
+            joints,
+        })
     }
 
     pub fn pause(&mut self) {
@@ -467,6 +723,40 @@ impl PhysicsMirror {
                 object.transform = transform;
             }
         }
+        // Restore design length — never leave a rope shortened to the
+        // post-sim attach span (sync used to rewrite length = |end-start|).
+        for (id, length) in self.rope_length_snapshot.drain(..) {
+            if let Some(object) = scene.object_mut(id) {
+                if let Primitive::Rope {
+                    length: l,
+                    radius: _,
+                    segments: _,
+                } = &mut object.primitive
+                {
+                    *l = length;
+                }
+            }
+        }
+        // Drop the live draped polyline and force a mesh rebuild. Without a
+        // mesh_revision bump the render cache keeps the last sim frame's
+        // rope shape parked at the restored transform — ends in the wrong place.
+        let rope_ids: Vec<ObjectId> = scene
+            .objects()
+            .iter()
+            .filter(|o| o.primitive.is_rope())
+            .map(|o| o.id)
+            .collect();
+        for id in rope_ids {
+            if let Some(object) = scene.object_mut(id) {
+                if object.rope_nodes.take().is_some() {
+                    object.mesh_revision = object.mesh_revision.wrapping_add(1);
+                }
+            }
+        }
+        // Re-seat attached ropes on their design-mode pins WITHOUT changing
+        // length (a long rope between two close pins should stay long).
+        crate::rope_handles::sync_attached_ropes(scene);
+
         // back to the serial query world; forces a static rebuild on sync
         if self.worker_count != 0 {
             self.recreate_world(0);
@@ -509,29 +799,196 @@ impl PhysicsMirror {
         for (id, world) in updates {
             scene.set_world_transform(id, world);
         }
+
+        // ropes: write node positions and park the object origin on the
+        // first node so the local tube mesh lines up
+        let mut rope_updates: Vec<(ObjectId, Vec3, Vec<Vec3>)> = Vec::new();
+        unsafe {
+            for rope in self.ropes.values() {
+                let mut nodes = Vec::with_capacity(rope.node_count);
+                for body in rope.bodies.iter().take(rope.node_count) {
+                    let p = ffi::b3Body_GetPosition(*body);
+                    nodes.push(Vec3::new(p.x, p.y, p.z));
+                }
+                if nodes.len() < 2 {
+                    continue;
+                }
+                let origin = nodes[0];
+                rope_updates.push((rope.object_id, origin, nodes));
+            }
+        }
+        for (id, origin, nodes) in rope_updates {
+            // mesh is built as world deltas from the first node; park the
+            // object at that origin with identity rotation so the deltas
+            // land in the right place (stop restores the snapshot)
+            scene.set_world_transform(
+                id,
+                Transform {
+                    location: origin,
+                    rotation: Quat::IDENTITY,
+                    scale: Vec3::ONE,
+                },
+            );
+            if let Some(object) = scene.object_mut(id) {
+                object.rope_nodes = Some(nodes);
+                // bump so the renderer rebuilds the draped mesh
+                object.mesh_revision = object.mesh_revision.wrapping_add(1);
+            }
+        }
     }
 
     // --- queries ------------------------------------------------------------
 
     /// Mouse picking: closest object hit by the ray, Blender-style.
     pub fn pick(&self, origin: Vec3, direction: Vec3) -> Option<ObjectId> {
+        self.pick_surface(origin, direction, &[]).map(|(id, _)| id)
+    }
+
+    /// Closest ray hit on a scene object, with optional exclusions (e.g. the
+    /// rope being dragged so its own capsule does not steal the cast).
+    /// Returns `(object id, world hit point)`.
+    pub fn pick_surface(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        exclude: &[ObjectId],
+    ) -> Option<(ObjectId, Vec3)> {
+        struct Ctx {
+            exclude: *const HashSet<u64>,
+            best_frac: f32,
+            hit_id: u64,
+            point: ffi::b3Pos,
+            found: bool,
+        }
+        unsafe extern "C" fn callback(
+            shape: ffi::b3ShapeId,
+            point: ffi::b3Pos,
+            _normal: ffi::b3Vec3,
+            fraction: f32,
+            _material: u64,
+            _triangle: i32,
+            _child: i32,
+            context: *mut c_void,
+        ) -> f32 {
+            let ctx = &mut *(context as *mut Ctx);
+            let user_data = ffi::b3Shape_GetUserData(shape) as usize as u64;
+            if user_data == 0 || (*ctx.exclude).contains(&user_data) {
+                return -1.0; // ignore ground / excluded
+            }
+            if fraction < ctx.best_frac {
+                ctx.best_frac = fraction;
+                ctx.hit_id = user_data;
+                ctx.point = point;
+                ctx.found = true;
+                return fraction; // clip to this hit
+            }
+            ctx.best_frac
+        }
+
+        let exclude_set: HashSet<u64> = exclude.iter().map(|id| id.0).collect();
+        let mut ctx = Ctx {
+            exclude: &exclude_set,
+            best_frac: 1.0,
+            hit_id: 0,
+            point: ffi::b3Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            found: false,
+        };
         unsafe {
-            let result = ffi::b3World_CastRayClosest(
+            ffi::b3World_CastRay(
                 self.world,
                 bvec(origin),
                 bvec(direction * 10_000.0),
                 ffi::b3DefaultQueryFilter(),
+                Some(callback),
+                &mut ctx as *mut Ctx as *mut c_void,
             );
-            if result.hit {
-                let user_data = ffi::b3Shape_GetUserData(result.shapeId) as usize as u64;
-                if user_data == 0 {
-                    return None; // ground plane
+        }
+        if ctx.found {
+            Some((
+                ObjectId(ctx.hit_id),
+                Vec3::new(ctx.point.x, ctx.point.y, ctx.point.z),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Closest surface point among non-excluded bodies to a world probe
+    /// (used as a magnetic snap when the ray barely misses an object).
+    pub fn closest_surface_point(
+        &self,
+        probe: Vec3,
+        exclude: &[ObjectId],
+        max_dist: f32,
+    ) -> Option<(ObjectId, Vec3)> {
+        let exclude_set: HashSet<u64> = exclude.iter().map(|id| id.0).collect();
+        let max_d2 = max_dist * max_dist;
+        let mut best: Option<(f32, ObjectId, Vec3)> = None;
+        unsafe {
+            for (id, entry) in &self.entries {
+                if exclude_set.contains(&id.0) {
+                    continue;
                 }
-                Some(ObjectId(user_data))
-            } else {
-                None
+                let mut shapes: [ffi::b3ShapeId; 8] = std::mem::zeroed();
+                let count = ffi::b3Body_GetShapes(entry.body, shapes.as_mut_ptr(), 8);
+                for shape in shapes.iter().take(count as usize) {
+                    let aabb = ffi::b3Shape_GetAABB(*shape);
+                    let min = Vec3::new(aabb.lowerBound.x, aabb.lowerBound.y, aabb.lowerBound.z);
+                    let max = Vec3::new(aabb.upperBound.x, aabb.upperBound.y, aabb.upperBound.z);
+                    // Closest point on AABB ≈ surface for box-like shapes;
+                    // good enough for magnetic snap assist.
+                    let closest = probe.clamp(min, max);
+                    // If probe is inside, push to the nearest face
+                    let closest = if (closest - probe).length_squared() < 1e-12 {
+                        let dx = (probe.x - min.x).min(max.x - probe.x);
+                        let dy = (probe.y - min.y).min(max.y - probe.y);
+                        let dz = (probe.z - min.z).min(max.z - probe.z);
+                        if dx <= dy && dx <= dz {
+                            Vec3::new(
+                                if probe.x - min.x < max.x - probe.x {
+                                    min.x
+                                } else {
+                                    max.x
+                                },
+                                probe.y,
+                                probe.z,
+                            )
+                        } else if dy <= dz {
+                            Vec3::new(
+                                probe.x,
+                                if probe.y - min.y < max.y - probe.y {
+                                    min.y
+                                } else {
+                                    max.y
+                                },
+                                probe.z,
+                            )
+                        } else {
+                            Vec3::new(
+                                probe.x,
+                                probe.y,
+                                if probe.z - min.z < max.z - probe.z {
+                                    min.z
+                                } else {
+                                    max.z
+                                },
+                            )
+                        }
+                    } else {
+                        closest
+                    };
+                    let d2 = (closest - probe).length_squared();
+                    if d2 <= max_d2 && best.is_none_or(|(bd, _, _)| d2 < bd) {
+                        best = Some((d2, *id, closest));
+                    }
+                }
             }
         }
+        best.map(|(_, id, p)| (id, p))
     }
 
     /// Physics-mode poke: cast the ray and kick the closest DYNAMIC body,
@@ -802,6 +1259,102 @@ mod tests {
         // cube (half size 1) should rest on the ground plane at z = 0
         let z = scene.object(id).unwrap().transform.location.z;
         assert!((z - 1.0).abs() < 0.05, "cube should rest at z=1, got {z}");
+    }
+
+    #[test]
+    fn initial_force_kicks_dynamic_body_on_play() {
+        let _guard = ffi_lock();
+        // float the cube so gravity has little time to matter
+        let (mut scene, id) = scene_with_dynamic_cube_at(5.0);
+        // impulse along +X: mass of a 2 m cube at density 1 is volume=8
+        scene.object_mut(id).unwrap().initial_force = Vec3::new(40.0, 0.0, 0.0);
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        // a few steps so the impulse integrates into displacement
+        for _ in 0..30 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+        let x = scene.object(id).unwrap().transform.location.x;
+        assert!(
+            x > 0.3,
+            "initial force along +X should move the cube, got x={x}"
+        );
+        physics.stop(&mut scene);
+        let restored = scene.object(id).unwrap().transform.location;
+        assert!(
+            restored.x.abs() < 1e-4 && (restored.z - 5.0).abs() < 1e-4,
+            "stop must restore the pre-play transform, got {restored:?}"
+        );
+    }
+
+    #[test]
+    fn hanging_cube_on_rope_sways_and_stays_off_ground() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        // static ceiling
+        let mut t = Transform::default();
+        t.location = Vec3::new(0.0, 0.0, 6.0);
+        let ceiling = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        scene.object_mut(ceiling).unwrap().dynamic = false;
+        // small dynamic weight, offset in X so it can pendulum
+        let mut t = Transform::default();
+        t.location = Vec3::new(1.5, 0.0, 4.0);
+        t.scale = Vec3::splat(0.3);
+        let weight = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        scene.object_mut(weight).unwrap().dynamic = true;
+        let rope = scene.add_object(
+            Primitive::Rope {
+                length: 2.0,
+                radius: 0.03,
+                segments: 12,
+            },
+            Transform::default(),
+        );
+        {
+            let o = scene.object_mut(rope).unwrap();
+            o.rope_start = modeler_core::RopeEnd {
+                object: Some(ceiling),
+                local_point: Vec3::new(0.0, 0.0, -1.0),
+            };
+            o.rope_end = modeler_core::RopeEnd {
+                object: Some(weight),
+                local_point: Vec3::new(0.0, 0.0, 1.0),
+            };
+        }
+        crate::rope_handles::snap_rope_rest_pose(&mut scene, rope);
+        if let Some(o) = scene.object_mut(rope) {
+            if let Primitive::Rope { length, .. } = &mut o.primitive {
+                *length = 2.0;
+            }
+        }
+
+        let x0 = scene.object(weight).unwrap().transform.location.x;
+        let z0 = scene.object(weight).unwrap().transform.location.z;
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        let mut min_z = z0;
+        let mut max_x_travel = 0.0f32;
+        for _ in 0..180 {
+            physics.update(&mut scene, FIXED_DT);
+            let p = scene.object(weight).unwrap().transform.location;
+            min_z = min_z.min(p.z);
+            max_x_travel = max_x_travel.max((p.x - x0).abs());
+        }
+        assert!(
+            min_z > 1.0,
+            "hanging weight should stay off the ground, min_z={min_z}"
+        );
+        assert!(
+            max_x_travel > 0.3,
+            "offset weight should sway under the rope, max_x_travel={max_x_travel}"
+        );
+        physics.stop(&mut scene);
+        match scene.object(rope).unwrap().primitive {
+            Primitive::Rope { length, .. } => {
+                assert!((length - 2.0).abs() < 1e-3, "length must stay 2 m, got {length}")
+            }
+            _ => panic!("expected rope"),
+        }
     }
 
     #[test]
@@ -1398,6 +1951,70 @@ mod tests {
                 }
             }
             assert_matches_fresh(&scene, &mut physics, step);
+        }
+    }
+
+    #[test]
+    fn distance_joint_holds_two_spheres() {
+        let _guard = ffi_lock();
+        unsafe {
+            let mut def = ffi::b3DefaultWorldDef();
+            def.gravity = bvec(Vec3::new(0.0, 0.0, -9.81));
+            let world = ffi::b3CreateWorld(&def);
+            let mut bd = ffi::b3DefaultBodyDef();
+            let ground = ffi::b3CreateBody(world, &bd);
+            bd.type_ = ffi::b3BodyType_b3_dynamicBody;
+            bd.position = bvec(Vec3::new(0.0, 0.0, 2.0));
+            let a = ffi::b3CreateBody(world, &bd);
+            bd.position = bvec(Vec3::new(0.0, 0.0, 1.0));
+            let b = ffi::b3CreateBody(world, &bd);
+            let mut sd = ffi::b3DefaultShapeDef();
+            sd.density = 1.0;
+            let sphere = ffi::b3Sphere {
+                center: bvec(Vec3::ZERO),
+                radius: 0.1,
+            };
+            ffi::b3CreateSphereShape(a, &sd, &sphere);
+            ffi::b3CreateSphereShape(b, &sd, &sphere);
+            let mut jd = ffi::b3DefaultDistanceJointDef();
+            jd.base.bodyIdA = ground;
+            jd.base.bodyIdB = a;
+            jd.base.localFrameA.p = bvec(Vec3::new(0.0, 0.0, 2.0));
+            jd.base.localFrameB.p = bvec(Vec3::ZERO);
+            jd.length = 0.005;
+            jd.enableSpring = false;
+            let j1 = ffi::b3CreateDistanceJoint(world, &jd);
+            let mut jd = ffi::b3DefaultDistanceJointDef();
+            jd.base.bodyIdA = a;
+            jd.base.bodyIdB = b;
+            jd.base.localFrameA.p = bvec(Vec3::ZERO);
+            jd.base.localFrameB.p = bvec(Vec3::ZERO);
+            jd.length = 1.0;
+            jd.enableSpring = false;
+            let j2 = ffi::b3CreateDistanceJoint(world, &jd);
+            assert!(ffi::b3Joint_IsValid(j1) && ffi::b3Joint_IsValid(j2));
+            for step in 0..120 {
+                ffi::b3World_Step(world, 1.0 / 60.0, 4);
+                if step % 30 == 0 {
+                    let pa = ffi::b3Body_GetPosition(a);
+                    let pb = ffi::b3Body_GetPosition(b);
+                    let d = ((pa.x - pb.x).powi(2)
+                        + (pa.y - pb.y).powi(2)
+                        + (pa.z - pb.z).powi(2))
+                    .sqrt();
+                    println!(
+                        "step {step}: a.z={:.3} b.z={:.3} dist={:.3}",
+                        pa.z, pb.z, d
+                    );
+                }
+            }
+            let pb = ffi::b3Body_GetPosition(b);
+            assert!(
+                pb.z > 0.5,
+                "lower sphere should hang, not free-fall, z={}",
+                pb.z
+            );
+            ffi::b3DestroyWorld(world);
         }
     }
 }

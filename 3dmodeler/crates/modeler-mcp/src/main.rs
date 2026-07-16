@@ -73,13 +73,19 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "light", "sun", "spot"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "rope", "light", "sun", "spot"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
-                    "length": {"type": "number", "description": "Wall only: length in meters (default 2)"},
+                    "length": {"type": "number", "description": "Wall or rope: length in meters (wall default 2, rope default 2)"},
                     "height": {"type": "number", "description": "Wall only: height in meters (default 2.5)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
+                    "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},
+                    "segments": {"type": "integer", "description": "Rope only: number of physics links 2–64 (default 12)"},
+                    "rope_start": {"description": "Rope only: object name/id to pin the start end to, or null for free"},
+                    "rope_end": {"description": "Rope only: object name/id to pin the end to, or null for free"},
+                    "rope_start_point": {"type": "array", "items": {"type": "number"}, "description": "Rope only: [x,y,z] local attach point on the start target (default: its anchor)"},
+                    "rope_end_point": {"type": "array", "items": {"type": "number"}, "description": "Rope only: [x,y,z] local attach point on the end target (default: its anchor)"},
                     "cutouts": {"type": "array", "items": {"type": "object", "properties": {
                         "offset": {"type": "number", "description": "Distance from the wall start to the opening's left edge, meters"},
                         "width": {"type": "number"},
@@ -94,6 +100,7 @@ fn tool_definitions() -> Value {
                     "smooth": {"type": "boolean", "description": "Smooth shading"},
                     "dynamic": {"type": "boolean", "description": "Falls & collides when the physics simulation plays"},
                     "density": {"type": "number"},
+                    "initial_force": {"type": "array", "items": {"type": "number"}, "description": "World-space impulse [x,y,z] (N·s) applied once when simulation starts (dynamic only)"},
                     "show_label": {"type": "boolean", "description": "Show the name as a viewport label"},
                     "show_dimensions": {"type": "boolean", "description": "Show W×D×H dimensions in the viewport"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space pivot point: interactive rotations (R) spin the object around it"},
@@ -138,6 +145,18 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "object": {"type": "string", "description": "Object name (or id as string)"},
                     "bricks": {"type": "integer", "description": "Approximate target brick count, 100..5000 (default 1000); the brick size scales to hit it"}
+                },
+                "required": ["object"]
+            }
+        },
+        {
+            "name": "break_into_balls",
+            "description": "Replace an object with individual dynamic balls/spheres in a cubic packing (they collide and tumble when the simulation plays). Walls keep openings; curved shapes get a stepped ball fill. The balls land in a '<name> balls' folder that can rebuild the original.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object name (or id as string)"},
+                    "balls": {"type": "integer", "description": "Approximate target ball count, 100..5000 (default 1000); the diameter scales to hit it"}
                 },
                 "required": ["object"]
             }
@@ -245,6 +264,7 @@ fn tool_definitions() -> Value {
                     "visible": {"type": "boolean"},
                     "dynamic": {"type": "boolean"},
                     "density": {"type": "number"},
+                    "initial_force": {"type": "array", "items": {"type": "number"}, "description": "World-space impulse [x,y,z] N·s at play (dynamic only)"},
                     "show_label": {"type": "boolean"},
                     "show_dimensions": {"type": "boolean"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space rotation pivot"},
@@ -511,7 +531,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "screenshot" => json!({"cmd": "screenshot"}),
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
-        "add_object" | "add_floor" | "add_roof" | "break_into_bricks" | "boolean_objects"
+        "add_object" | "add_floor" | "add_roof" | "break_into_bricks" | "break_into_balls"
+        | "boolean_objects"
         | "add_modifier" | "update_modifier" | "remove_modifier" | "apply_modifiers"
         | "update_object" | "delete_object" | "set_parent" | "attach_object"
         | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"

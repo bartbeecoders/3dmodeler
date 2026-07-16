@@ -29,12 +29,14 @@ void main() {
 }
 ";
 
-/// Tier colors (normal, selected, active) — echo the selection outline
-/// colors, same values the egui wireframe used.
-const TIER_COLORS: [[f32; 4]; 3] = [
+/// Tier colors (normal, selected, active, selected+modifiers, active+modifiers)
+/// — echo the selection outline colors (orange default, purple with modifiers).
+const TIER_COLORS: [[f32; 4]; 5] = [
     [150.0 / 255.0, 160.0 / 255.0, 175.0 / 255.0, 1.0],
     [230.0 / 255.0, 110.0 / 255.0, 20.0 / 255.0, 1.0],
     [255.0 / 255.0, 170.0 / 255.0, 64.0 / 255.0, 1.0],
+    [150.0 / 255.0, 80.0 / 255.0, 230.0 / 255.0, 1.0],
+    [200.0 / 255.0, 140.0 / 255.0, 255.0 / 255.0, 1.0],
 ];
 
 pub struct WireRender {
@@ -43,7 +45,7 @@ pub struct WireRender {
     cache: WireframeCache,
     positions: Option<VertexBuffer<Vec3>>,
     /// (first vertex, vertex count) per tier within `positions`.
-    ranges: [(u32, u32); 3],
+    ranges: [(u32, u32); 5],
     signature: Option<u64>,
 }
 
@@ -75,10 +77,12 @@ fn wire_signature(scene: &Scene, selection: &Selection) -> u64 {
         ] {
             f.to_bits().hash(&mut h);
         }
+        let has_mod = !object.modifiers.is_empty();
+        has_mod.hash(&mut h);
         let tier: u8 = if selection.active() == Some(object.id) {
-            2
+            if has_mod { 4 } else { 2 }
         } else if selection.is_selected(object.id) {
-            1
+            if has_mod { 3 } else { 1 }
         } else {
             0
         };
@@ -95,7 +99,7 @@ impl WireRender {
                 .expect("wireframe shaders compile"),
             cache: WireframeCache::new(),
             positions: None,
-            ranges: [(0, 0); 3],
+            ranges: [(0, 0); 5],
             signature: None,
         }
     }
@@ -109,9 +113,9 @@ impl WireRender {
         self.signature = Some(signature);
 
         let segments = self.cache.segments(scene, selection);
-        let mut tiers: [Vec<Vec3>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut tiers: [Vec<Vec3>; 5] = Default::default();
         for (a, b, tier) in segments {
-            let t = &mut tiers[usize::from(tier).min(2)];
+            let t = &mut tiers[usize::from(tier).min(4)];
             t.push(vec3(a.x, a.y, a.z));
             t.push(vec3(b.x, b.y, b.z));
         }

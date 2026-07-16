@@ -441,10 +441,15 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
                             normals: mesh.normals.iter().flat_map(|n| [n.x, n.y, n.z]).collect(),
                             indices: mesh.indices.clone(),
                         }),
-                        Some(BlendMaterial {
-                            base_color: object.material.base_color,
-                            roughness: object.material.roughness,
-                            metallic: object.material.metallic,
+                        Some({
+                            let m = scene
+                                .object_material(object.id)
+                                .unwrap_or(object.material);
+                            BlendMaterial {
+                                base_color: m.base_color,
+                                roughness: m.roughness,
+                                metallic: m.metallic,
+                            }
                         }),
                         None,
                         None,
@@ -490,10 +495,14 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
         let material = imported
             .material
             .as_ref()
-            .map(|m| Material {
-                base_color: m.base_color.map(|c| c.clamp(0.0, 1.0)),
-                roughness: m.roughness.clamp(0.0, 1.0),
-                metallic: m.metallic.clamp(0.0, 1.0),
+            .map(|m| {
+                Material {
+                    base_color: m.base_color.map(|c| c.clamp(0.0, 1.0)),
+                    roughness: m.roughness.clamp(0.0, 1.0),
+                    metallic: m.metallic.clamp(0.0, 1.0),
+                    ..Default::default()
+                }
+                .clamped()
             })
             .unwrap_or_default();
         // parents come first in the payload, so the lookup already has them
@@ -520,8 +529,11 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             smooth: false,
             visible: imported.visible,
             material,
+            material_master: None,
+            material_overrides: Default::default(),
             dynamic: false,
             density: 1.0,
+            initial_force: Vec3::ZERO,
             parent,
             folder: None,
             show_label: false,
@@ -535,6 +547,9 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             subdivision: 0,
             modifiers: Vec::new(),
             mesh_revision: 0,
+            rope_start: Default::default(),
+            rope_end: Default::default(),
+            rope_nodes: None,
         });
         name_to_id.insert(&imported.name, id);
         new_ids.push(id);

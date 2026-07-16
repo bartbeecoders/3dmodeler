@@ -155,6 +155,9 @@ Notes:
 - [x] Shift+A "Add Mesh" menu at mouse cursor (Esc / click-away closes) + inline panel section; objects placed at origin (3D cursor comes later)
 - [x] Default startup scene: cube (viewport key/fill/ambient lights serve as the light until a light *object* exists — revisit with the outliner in Phase 6)
 - [x] Simple materials: base color/roughness/metallic per object → three-d PhysicalMaterial
+- [x] Production materials (top 5 from Blender/UE comparison): Principled PBR lobes,
+      master materials + instances, material functions, world-position effects, MPC globals
+      (`modeler-core/src/material.rs`, Properties panel, `scene_render` resolve)
 - [x] `SceneRender`: scene-version-driven GPU model rebuild (full rebuild on change; fine at this scale)
 - [x] Home/'.' now frames real scene bounds
 

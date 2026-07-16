@@ -42,6 +42,7 @@ WORKFLOW
 - AI markers: users draw points, lines and areas on reference images and attach notes to them. get_scene lists them per image with notes and world coordinates (points_world; lines/areas also report length_m). When the user says "this line", "the marked area", "the markers", read them from get_scene and build exactly on those world coordinates, following each marker's note ("draw a wall on this line" = wall segments along the line's points_world). You can also add/update/delete markers yourself (add_image_marker, pixel coordinates) to annotate an image or propose placements.
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
+- Ropes: primitive "rope" (length/radius/segments) is a flexible multi-segment cord. Pin ends with rope_start / rope_end (object name or null) and optional rope_start_point / rope_end_point local points. Ropes always simulate when play runs; hang a weight by anchoring start to a fixed body and end to a dynamic cube.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
 
 STYLE
@@ -64,14 +65,21 @@ fn object_properties() -> Value {
         "visible": {"type": "boolean"},
         "dynamic": {"type": "boolean", "description": "physics: falls & collides when simulating"},
         "density": {"type": "number", "description": "kg/m³ for dynamic objects"},
+        "initial_force": {"type": "array", "items": {"type": "number"}, "description": "world-space impulse [x,y,z] N·s applied once at play (dynamic only)"},
         "pivot": {"type": "array", "items": {"type": "number"}, "description": "pivot point, object space"},
         "anchor": {"type": "array", "items": {"type": "number"}, "description": "attach point, object space"},
         "intensity": {"type": "number", "description": "lights only"},
         "spot_angle_deg": {"type": "number", "description": "spot lights only, 1..160"},
         "shadows": {"type": "boolean", "description": "lights only"},
-        "length": {"type": "number", "description": "walls only, meters"},
+        "length": {"type": "number", "description": "walls or ropes, meters"},
         "height": {"type": "number", "description": "walls only, meters"},
         "thickness": {"type": "number", "description": "walls only, meters"},
+        "radius": {"type": "number", "description": "ropes only: cord radius meters"},
+        "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},
+        "rope_start": {"description": "ropes only: object name/id to pin start, or null for free"},
+        "rope_end": {"description": "ropes only: object name/id to pin end, or null for free"},
+        "rope_start_point": {"type": "array", "items": {"type": "number"}, "description": "ropes only: local attach point on start target"},
+        "rope_end_point": {"type": "array", "items": {"type": "number"}, "description": "ropes only: local attach point on end target"},
         "cutouts": {
             "type": "array",
             "description": "walls only: door/window openings, replaces the list",
@@ -105,8 +113,8 @@ pub fn catalog() -> Vec<ToolSpec> {
     add_properties["primitive"] = json!({
         "type": "string",
         "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus",
-                 "wall", "floor", "empty", "light", "sun", "spot"],
-        "description": "what to add ('light' = point light)"
+                 "wall", "floor", "empty", "rope", "light", "sun", "spot"],
+        "description": "what to add ('light' = point light; 'rope' = physics rope)"
     });
     let mut update_properties = object_properties();
     update_properties["object"] = object_ref("object name or id");
@@ -240,6 +248,15 @@ pub fn catalog() -> Vec<ToolSpec> {
             json!({
                 "object": object_ref("object name or id"),
                 "bricks": {"type": "integer", "description": "target count"}
+            }),
+            &["object"],
+        ),
+        tool(
+            "break_into_balls",
+            "Shatter an object into physics balls/spheres (for demolition scenes).",
+            json!({
+                "object": object_ref("object name or id"),
+                "balls": {"type": "integer", "description": "target count"}
             }),
             &["object"],
         ),
@@ -472,7 +489,7 @@ mod tests {
         let mcp_commands = [
             "get_scene", "new_scene", "add_object", "update_object", "delete_object",
             "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
-            "add_roof", "break_into_bricks", "boolean_objects", "add_modifier",
+            "add_roof", "break_into_bricks", "break_into_balls", "boolean_objects", "add_modifier",
             "update_modifier", "remove_modifier", "apply_modifiers", "add_measurement",
             "simulate", "set_view",
             "screenshot",

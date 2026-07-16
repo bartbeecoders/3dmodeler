@@ -1,18 +1,21 @@
 //! Mesh booleans (CSG): union, subtract and intersect of two triangle
-//! meshes via BSP-tree clipping (the csg.js algorithm). Both meshes must be
-//! expressed in ONE common space — [`mesh_to_frame`] brings a mesh from one
-//! object's local frame into another's. Vertex normals are carried through
-//! the splits by interpolation, so smooth surfaces stay smooth and flat
-//! faces stay flat.
+//! meshes. Both meshes must be expressed in ONE common space —
+//! [`mesh_to_frame`] brings a mesh from one object's local frame into
+//! another's.
 //!
-//! Inputs should be closed (watertight) solids for well-defined results;
-//! open meshes (planes) still clip, but the result can be open too. The
-//! output is a triangle soup with per-polygon vertices (no welding).
+//! Prefer **boolmesh** (Manifold-style mesh boolean with a Morton BVH and
+//! optional rayon parallelism) for closed manifold solids — typically
+//! orders of magnitude faster than BSP on anything beyond a few hundred
+//! triangles. Fall back to BSP-tree clipping (the csg.js algorithm) for
+//! open / non-manifold inputs that boolmesh rejects. Inputs should be
+//! closed (watertight) solids for well-defined results; open meshes still
+//! clip via BSP, but the result can be open too.
 
 use crate::mesh::MeshData;
 use crate::Transform;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Which boolean to apply (A = target mesh, B = tool mesh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +52,165 @@ impl BooleanOp {
 
 /// Boolean of two triangle meshes in the same space.
 pub fn mesh_boolean(a_mesh: &MeshData, b_mesh: &MeshData, op: BooleanOp) -> MeshData {
+    if a_mesh.indices.is_empty() {
+        return match op {
+            BooleanOp::Union => b_mesh.clone(),
+            BooleanOp::Subtract | BooleanOp::Intersect => MeshData::default(),
+        };
+    }
+    if b_mesh.indices.is_empty() {
+        return match op {
+            BooleanOp::Union | BooleanOp::Subtract => a_mesh.clone(),
+            BooleanOp::Intersect => MeshData::default(),
+        };
+    }
+
+    // Disjoint AABBs: exact CSG without building trees or Manifolds.
+    if let Some(fast) = disjoint_aabb_result(a_mesh, b_mesh, op) {
+        return fast;
+    }
+
+    // Primary path: Manifold-style mesh boolean (boolmesh).
+    if let Some(result) = try_boolmesh(a_mesh, b_mesh, op) {
+        return result;
+    }
+
+    // Fallback: BSP clipping for open / non-manifold meshes.
+    mesh_boolean_bsp(a_mesh, b_mesh, op)
+}
+
+/// Axis-aligned bounds of a mesh (min, max). None if empty.
+fn mesh_aabb(mesh: &MeshData) -> Option<(Vec3, Vec3)> {
+    if mesh.positions.is_empty() {
+        return None;
+    }
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &p in &mesh.positions {
+        min = min.min(p);
+        max = max.max(p);
+    }
+    Some((min, max))
+}
+
+/// Exact results when the AABBs do not overlap (with a tiny padding so
+/// coplanar-touching cases still go through the full engine).
+fn disjoint_aabb_result(a: &MeshData, b: &MeshData, op: BooleanOp) -> Option<MeshData> {
+    let (amin, amax) = mesh_aabb(a)?;
+    let (bmin, bmax) = mesh_aabb(b)?;
+    let pad = EPSILON;
+    let overlap = amin.x <= bmax.x + pad
+        && amax.x + pad >= bmin.x
+        && amin.y <= bmax.y + pad
+        && amax.y + pad >= bmin.y
+        && amin.z <= bmax.z + pad
+        && amax.z + pad >= bmin.z;
+    if overlap {
+        return None;
+    }
+    Some(match op {
+        BooleanOp::Union => concat_meshes(a, b),
+        BooleanOp::Subtract => a.clone(),
+        BooleanOp::Intersect => MeshData::default(),
+    })
+}
+
+fn concat_meshes(a: &MeshData, b: &MeshData) -> MeshData {
+    let mut out = a.clone();
+    let base = out.positions.len() as u32;
+    out.positions.extend_from_slice(&b.positions);
+    out.normals.extend_from_slice(&b.normals);
+    out.indices
+        .extend(b.indices.iter().map(|&i| i.saturating_add(base)));
+    out
+}
+
+/// Weld co-located vertices so flat-shaded (per-face duplicated) meshes
+/// become topologically manifold, then run boolmesh.
+fn try_boolmesh(a_mesh: &MeshData, b_mesh: &MeshData, op: BooleanOp) -> Option<MeshData> {
+    use boolmesh::prelude::{compute_boolean, Manifold, OpType};
+
+    let (a_pos, a_idx) = weld_positions(a_mesh);
+    let (b_pos, b_idx) = weld_positions(b_mesh);
+    let a = Manifold::new(&a_pos, &a_idx).ok()?;
+    let b = Manifold::new(&b_pos, &b_idx).ok()?;
+    let op = match op {
+        BooleanOp::Union => OpType::Add,
+        BooleanOp::Subtract => OpType::Subtract,
+        BooleanOp::Intersect => OpType::Intersect,
+    };
+    match compute_boolean(&a, &b, op) {
+        Ok(m) => Some(manifold_to_mesh(m)),
+        // Empty solid (e.g. A entirely inside B for subtract/intersect).
+        Err(msg) if msg.contains("empty") => Some(MeshData::default()),
+        Err(_) => None,
+    }
+}
+
+/// Merge vertices that share the same position (within quantisation),
+/// producing flat f64 positions + usize indices for boolmesh.
+fn weld_positions(mesh: &MeshData) -> (Vec<f64>, Vec<usize>) {
+    // Quantise so floating noise from mesh_to_frame still welds; 1e-5 m
+    // matches our BSP EPSILON scale.
+    const Q: f32 = 1e5;
+    let mut map: HashMap<(i32, i32, i32), usize> =
+        HashMap::with_capacity(mesh.positions.len());
+    let mut pos = Vec::with_capacity(mesh.positions.len() * 3);
+    let mut indices = Vec::with_capacity(mesh.indices.len());
+    for &i in &mesh.indices {
+        let p = mesh.positions[i as usize];
+        let key = (
+            (p.x * Q).round() as i32,
+            (p.y * Q).round() as i32,
+            (p.z * Q).round() as i32,
+        );
+        let n = map.len();
+        let id = *map.entry(key).or_insert_with(|| {
+            pos.extend([p.x as f64, p.y as f64, p.z as f64]);
+            n
+        });
+        indices.push(id);
+    }
+    (pos, indices)
+}
+
+fn manifold_to_mesh(m: boolmesh::prelude::Manifold) -> MeshData {
+    let mut out = MeshData::default();
+    out.positions.reserve(m.ps.len());
+    for p in &m.ps {
+        out.positions
+            .push(Vec3::new(p.x as f32, p.y as f32, p.z as f32));
+    }
+    if m.vert_normals.len() == m.ps.len() {
+        out.normals.reserve(m.vert_normals.len());
+        for n in &m.vert_normals {
+            let v = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
+            out.normals.push(v.normalize_or_zero());
+        }
+    }
+    let tris = m.get_indices();
+    out.indices.reserve(tris.len() * 3);
+    for t in tris {
+        out.indices
+            .extend([t.x as u32, t.y as u32, t.z as u32]);
+    }
+    if out.normals.len() != out.positions.len() {
+        out.recompute_normals();
+    } else {
+        // Replace any zero normals left by the library.
+        for n in &mut out.normals {
+            if *n == Vec3::ZERO {
+                out.recompute_normals();
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// BSP-tree clipping (csg.js). Used when boolmesh cannot accept the mesh
+/// (open surfaces, non-manifold after weld, etc.).
+fn mesh_boolean_bsp(a_mesh: &MeshData, b_mesh: &MeshData, op: BooleanOp) -> MeshData {
     let mut a = Bsp::new(to_polygons(a_mesh));
     let mut b = Bsp::new(to_polygons(b_mesh));
     // csg.js sequences. The invert-clip-invert on b also removes b's faces
@@ -659,5 +821,60 @@ mod tests {
         assert_eq!(BooleanOp::from_name("difference"), Some(BooleanOp::Subtract));
         assert_eq!(BooleanOp::from_name("intersect"), Some(BooleanOp::Intersect));
         assert_eq!(BooleanOp::from_name("nope"), None);
+    }
+
+    #[test]
+    fn boolmesh_beats_bsp_on_sphere_cube() {
+        use std::time::Instant;
+        let sphere = mesh::uv_sphere(48, 24, 0.75);
+        let cube = cube_at(Vec3::new(0.5, 0.0, 0.0));
+        // warm + measure primary path
+        let _ = mesh_boolean(&sphere, &cube, BooleanOp::Subtract);
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            let m = mesh_boolean(&sphere, &cube, BooleanOp::Subtract);
+            assert!(!m.indices.is_empty());
+        }
+        let primary = t0.elapsed();
+        // measure BSP fallback alone
+        let t1 = Instant::now();
+        for _ in 0..10 {
+            let m = mesh_boolean_bsp(&sphere, &cube, BooleanOp::Subtract);
+            assert!(!m.indices.is_empty());
+        }
+        let bsp = t1.elapsed();
+        eprintln!(
+            "sphere−cube ×10: primary={primary:?} bsp={bsp:?} speedup={:.1}×",
+            bsp.as_secs_f64() / primary.as_secs_f64().max(1e-9)
+        );
+        // boolmesh should be clearly faster; allow some CI noise
+        assert!(
+            primary < bsp,
+            "expected boolmesh primary path faster than BSP: {primary:?} vs {bsp:?}"
+        );
+    }
+
+    #[test]
+    fn disjoint_aabb_is_near_instant() {
+        use std::time::Instant;
+        let a = mesh::uv_sphere(32, 16, 1.0);
+        let b = {
+            let mut m = mesh::uv_sphere(32, 16, 1.0);
+            for p in &mut m.positions {
+                *p += Vec3::new(10.0, 0.0, 0.0);
+            }
+            m
+        };
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            let u = mesh_boolean(&a, &b, BooleanOp::Union);
+            assert!((volume(&u) - 2.0 * volume(&a)).abs() < 0.05);
+            let c = mesh_boolean(&a, &b, BooleanOp::Subtract);
+            assert!((volume(&c) - volume(&a)).abs() < 0.05);
+            assert!(mesh_boolean(&a, &b, BooleanOp::Intersect).indices.is_empty());
+        }
+        let elapsed = t0.elapsed();
+        eprintln!("100×3 disjoint sphere ops: {elapsed:?}");
+        assert!(elapsed.as_millis() < 50, "disjoint path should be cheap: {elapsed:?}");
     }
 }

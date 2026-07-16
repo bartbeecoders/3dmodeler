@@ -864,6 +864,118 @@ pub fn frustum(vertices: u32, radius_bottom: f32, radius_top: f32, depth: f32) -
     m
 }
 
+/// Straight rope along local +X from the origin to `(length, 0, 0)`.
+pub fn rope(length: f32, radius: f32) -> MeshData {
+    let length = length.max(0.01);
+    let radius = radius.max(0.001);
+    rope_polyline(&[Vec3::ZERO, Vec3::new(length, 0.0, 0.0)], radius)
+}
+
+/// Tube mesh along an arbitrary polyline (local space). Degenerate or
+/// single-point paths produce a small sphere at the origin.
+pub fn rope_polyline(points: &[Vec3], radius: f32) -> MeshData {
+    let radius = radius.max(0.001);
+    let radial = 8u32;
+    let mut pts: Vec<Vec3> = Vec::new();
+    for p in points {
+        if pts.last().map(|q| (*p - *q).length_squared() > 1e-12).unwrap_or(true) {
+            pts.push(*p);
+        }
+    }
+    if pts.len() < 2 {
+        // tiny sphere fallback
+        return uv_sphere(8, 4, radius);
+    }
+
+    // parallel transport frame along the path
+    let mut tangents = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let t = if i + 1 < pts.len() {
+            (pts[i + 1] - pts[i]).normalize_or_zero()
+        } else {
+            (pts[i] - pts[i - 1]).normalize_or_zero()
+        };
+        tangents.push(if t.length_squared() < 1e-12 {
+            Vec3::X
+        } else {
+            t
+        });
+    }
+    let mut normals = Vec::with_capacity(pts.len());
+    let mut binormals = Vec::with_capacity(pts.len());
+    let mut n = {
+        let t0 = tangents[0];
+        let a = if t0.z.abs() < 0.9 { Vec3::Z } else { Vec3::Y };
+        t0.cross(a).normalize_or_zero()
+    };
+    if n.length_squared() < 1e-12 {
+        n = Vec3::Y;
+    }
+    for i in 0..pts.len() {
+        let t = tangents[i];
+        let b = t.cross(n).normalize_or_zero();
+        let n2 = b.cross(t).normalize_or_zero();
+        n = if n2.length_squared() < 1e-12 { n } else { n2 };
+        let b = t.cross(n).normalize_or_zero();
+        normals.push(n);
+        binormals.push(b);
+    }
+
+    let mut m = MeshData::default();
+    let rings = pts.len() as u32;
+    for i in 0..rings {
+        let p = pts[i as usize];
+        let n = normals[i as usize];
+        let b = binormals[i as usize];
+        for j in 0..radial {
+            let theta = TAU * j as f32 / radial as f32;
+            let (s, c) = theta.sin_cos();
+            let dir = n * c + b * s;
+            m.positions.push(p + dir * radius);
+            m.normals.push(dir);
+        }
+    }
+    for i in 0..rings - 1 {
+        for j in 0..radial {
+            let j1 = (j + 1) % radial;
+            let a = i * radial + j;
+            let b = i * radial + j1;
+            let c = (i + 1) * radial + j1;
+            let d = (i + 1) * radial + j;
+            m.quad(a, b, c, d);
+        }
+    }
+    // end caps
+    for (idx, outward) in [(0u32, -1.0f32), (rings - 1, 1.0f32)] {
+        let p = pts[idx as usize];
+        let t = tangents[idx as usize] * outward;
+        let n = normals[idx as usize];
+        let b = binormals[idx as usize];
+        let center = m.positions.len() as u32;
+        m.positions.push(p);
+        m.normals.push(t);
+        let ring = m.positions.len() as u32;
+        for j in 0..radial {
+            let theta = TAU * j as f32 / radial as f32;
+            let (s, c) = theta.sin_cos();
+            let dir = n * c + b * s;
+            m.positions.push(p + dir * radius);
+            m.normals.push(t);
+        }
+        for j in 0..radial {
+            let j1 = (j + 1) % radial;
+            if outward > 0.0 {
+                m.indices
+                    .extend_from_slice(&[center, ring + j, ring + j1]);
+            } else {
+                m.indices
+                    .extend_from_slice(&[center, ring + j1, ring + j]);
+            }
+        }
+    }
+    m
+}
+
 pub fn torus(major_segments: u32, minor_segments: u32, major_radius: f32, minor_radius: f32) -> MeshData {
     let maj = major_segments.max(3);
     let min = minor_segments.max(3);
