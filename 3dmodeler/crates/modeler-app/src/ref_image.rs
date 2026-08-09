@@ -225,6 +225,7 @@ pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, Stri
         aspect,
         opacity: 0.5,
         visible: true,
+        locked: false,
         flip_h: false,
         flip_v: false,
         data_base64: BASE64.encode(bytes),
@@ -624,14 +625,17 @@ impl ImageMoveTool {
                                 if let Some(image) =
                                     scene.reference_images().iter().find(|r| r.id == id)
                                 {
-                                    self.state = Some(ImageGrab {
-                                        id,
-                                        original: image.location,
-                                        start_mouse: self.last_mouse,
-                                        cur_mouse: self.last_mouse,
-                                        constraint: None,
-                                        status: String::new(),
-                                    });
+                                    if !image.locked {
+                                        self.state = Some(ImageGrab {
+                                            id,
+                                            original: image.location,
+                                            start_mouse: self.last_mouse,
+                                            cur_mouse: self.last_mouse,
+                                            constraint: None,
+                                            status: String::new(),
+                                        });
+                                    }
+                                    // locked images stay put; still consume G
                                 }
                                 true
                             } else {
@@ -737,6 +741,7 @@ mod tests {
             aspect: 1.0,
             opacity: 0.5,
             visible: true,
+            locked: false,
             flip_h: false,
             flip_v: false,
             data_base64: String::new(),

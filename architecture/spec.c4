@@ -1,0 +1,70 @@
+// 3D Modeler (box3d monorepo) — LikeC4 specification
+specification {
+  element person {
+    style {
+      shape person
+    }
+  }
+
+  element system {
+    style {
+      opacity 10%
+    }
+  }
+
+  element container {
+    style {
+      opacity 40%
+    }
+  }
+
+  element component {
+    style {
+      opacity 50%
+    }
+  }
+
+  element library {
+    notation "Library / crate"
+    style {
+      opacity 50%
+    }
+  }
+
+  element app {
+    notation "Application / binary"
+    style {
+      shape browser
+      opacity 40%
+    }
+  }
+
+  element engine {
+    notation "Physics / native engine"
+    style {
+      color indigo
+      opacity 40%
+    }
+  }
+
+  element external {
+    notation "External system"
+    style {
+      color muted
+      opacity 20%
+    }
+  }
+
+  relationship uses
+  relationship depends
+  relationship serves
+  relationship controls
+
+  tag physics
+  tag modeler
+  tag ui
+  tag ai
+  tag native
+  tag wasm
+  tag published
+}

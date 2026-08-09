@@ -419,6 +419,7 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
         .map(|object| {
             let (kind, mesh, material, light, size) = match object.primitive {
                 Primitive::Empty { size } => ("empty", None, None, None, Some(size)),
+                Primitive::Camera { .. } => ("empty", None, None, None, Some(1.0)),
                 Primitive::Light { kind, color, intensity, spot_angle_deg, shadows } => (
                     "light",
                     None,
@@ -444,7 +445,7 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
                         Some({
                             let m = scene
                                 .object_material(object.id)
-                                .unwrap_or(object.material);
+                                .unwrap_or_else(|| object.material.clone());
                             BlendMaterial {
                                 base_color: m.base_color,
                                 roughness: m.roughness,
@@ -528,12 +529,14 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             primitive,
             smooth: false,
             visible: imported.visible,
+            locked: false,
             material,
             material_master: None,
             material_overrides: Default::default(),
             dynamic: false,
             density: 1.0,
             initial_force: Vec3::ZERO,
+            bounciness: 0.0,
             parent,
             folder: None,
             show_label: false,
@@ -544,12 +547,15 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             cutouts: Vec::new(),
             floor_outline: Vec::new(),
             edited_mesh,
+            face_materials: Vec::new(),
             subdivision: 0,
             modifiers: Vec::new(),
             mesh_revision: 0,
             rope_start: Default::default(),
             rope_end: Default::default(),
             rope_nodes: None,
+            cloth_anchors: Vec::new(),
+            cloth_nodes: None,
         });
         name_to_id.insert(&imported.name, id);
         new_ids.push(id);
@@ -612,7 +618,7 @@ fn imported_mesh(mesh: &BlendMesh) -> MeshData {
         .chunks_exact(3)
         .map(|c| Vec3::new(c[0], c[1], c[2]))
         .collect();
-    let mut data = MeshData { positions, normals, indices, seams: Vec::new() };
+    let mut data = MeshData { positions, normals, indices, ..Default::default() };
     if data.normals.len() != data.positions.len() {
         data.recompute_normals();
     }

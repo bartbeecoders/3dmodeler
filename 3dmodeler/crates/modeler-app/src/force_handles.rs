@@ -73,8 +73,7 @@ impl ForceHandles {
             if !object.visible || !object.dynamic {
                 continue;
             }
-            if object.primitive.is_light()
-                || matches!(object.primitive, modeler_core::Primitive::Empty { .. })
+            if object.primitive.is_gizmo()
             {
                 continue;
             }

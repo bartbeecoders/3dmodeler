@@ -274,8 +274,7 @@ impl ContextMenu {
                     None
                 };
                 // Material for solids (lights/empties have no surface material).
-                let has_material = !object.primitive.is_light()
-                    && !matches!(object.primitive, Primitive::Empty { .. });
+                let has_material = !object.primitive.is_gizmo();
                 let material_slot = if has_material {
                     slots.push(PieSlot::new("Set material", PieIcon::MaterialColor));
                     Some(slots.len() - 1)
@@ -283,7 +282,7 @@ impl ContextMenu {
                     None
                 };
                 // Any solid object can shatter into dynamic particles (not ropes).
-                let breakable = has_material && !object.primitive.is_rope();
+                let breakable = has_material && !object.primitive.is_soft_sim();
                 let break_slot = if breakable {
                     slots.push(PieSlot::new("Break", PieIcon::Bricks));
                     Some(slots.len() - 1)
@@ -519,7 +518,9 @@ impl ContextMenu {
             });
 
         if changed {
-            let mut next = scene.object_material(id).unwrap_or(edit.material);
+            let mut next = scene
+                .object_material(id)
+                .unwrap_or_else(|| edit.material.clone());
             match field {
                 MaterialField::Color => next.base_color = edit.material.base_color,
                 MaterialField::Roughness => next.roughness = edit.material.roughness,

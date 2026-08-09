@@ -302,8 +302,17 @@ impl ModalTransform {
 
         // Grab moves the whole hierarchy (children follow, like Blender);
         // Rotate/Scale apply ONLY to the selected objects — linked children
-        // keep their world placement (explicit deviation from Blender)
-        let selected: Vec<ObjectId> = selection.selected().to_vec();
+        // keep their world placement (explicit deviation from Blender).
+        // Locked objects never enter the transform set.
+        let selected: Vec<ObjectId> = selection
+            .selected()
+            .iter()
+            .copied()
+            .filter(|&id| scene.object(id).is_some_and(|o| !o.locked))
+            .collect();
+        if selected.is_empty() {
+            return;
+        }
         let entry = |o: &modeler_core::Object| OriginalEntry {
             id: o.id,
             local: o.transform,
@@ -313,28 +322,26 @@ impl ModalTransform {
         let originals: Vec<OriginalEntry> = scene
             .objects()
             .iter()
-            .filter(|o| selection.is_selected(o.id))
+            .filter(|o| selected.contains(&o.id))
             .map(entry)
             .collect();
         if originals.is_empty() {
             return;
         }
-        // rotate/scale: non-selected descendants must keep their world
-        // placement while their ancestors transform — capture where they are.
-        // grab: leave empty so children ride along through the hierarchy.
-        let frozen: Vec<OriginalEntry> = if kind == Kind::Grab {
-            Vec::new()
-        } else {
-            scene
-                .objects()
-                .iter()
-                .filter(|o| {
-                    !selection.is_selected(o.id)
-                        && selected.iter().any(|&s| scene.is_ancestor(s, o.id))
-                })
-                .map(entry)
-                .collect()
-        };
+        // Descendants that must keep their world placement:
+        // - rotate/scale: every non-selected descendant (linked children stay put)
+        // - grab: only locked descendants (unlocked children ride the hierarchy;
+        //   locked ones pin in world space so locking means "stay put")
+        let frozen: Vec<OriginalEntry> = scene
+            .objects()
+            .iter()
+            .filter(|o| {
+                !selected.contains(&o.id)
+                    && selected.iter().any(|&s| scene.is_ancestor(s, o.id))
+                    && (kind != Kind::Grab || o.locked)
+            })
+            .map(entry)
+            .collect();
         // rotate/scale happen around the pivot points of the SELECTION ROOTS
         // (selected objects whose parent is not selected) — so a grouped
         // assembly turns around its root's pivot, and a plain multi-select

@@ -1,0 +1,196 @@
+views {
+
+  view index {
+    title '3D Modeler — landscape'
+    description 'People and external systems around the workspace'
+
+    include
+      *,
+      repo
+
+    style user, agent, chatUser {
+      color green
+    }
+    style repo {
+      color primary
+    }
+    style llmProviders, threeD, browser, staticHost, sokol {
+      color muted
+    }
+  }
+
+  view workspace of repo {
+    title 'Workspace systems'
+    description 'Box3D engine vs 3D Modeler product'
+
+    include
+      *,
+      repo.*,
+      repo.box3d,
+      repo.modeler
+
+    exclude
+      llmProviders,
+      threeD,
+      browser,
+      staticHost,
+      sokol
+
+    style repo.box3d {
+      color indigo
+    }
+    style repo.modeler {
+      color sky
+    }
+  }
+
+  view box3d of repo.box3d {
+    title 'Box3D physics engine'
+    description 'C17 library structure and consumers in-repo'
+
+    include
+      *,
+      repo.box3d.*,
+      repo.box3dSamples,
+      repo.box3dTests,
+      repo.box3dBench,
+      repo.box3dDocs,
+      repo.modeler.box3dSys
+
+    style repo.box3d.* {
+      color indigo
+    }
+  }
+
+  view modeler of repo.modeler {
+    title '3D Modeler crates'
+    description 'Rust workspace under 3dmodeler/'
+
+    include
+      *,
+      repo.modeler.*,
+      repo.box3d.publicApi,
+      threeD,
+      llmProviders
+
+    style repo.modeler.core {
+      color primary
+    }
+    style repo.modeler.appCrate {
+      color sky
+    }
+    style repo.modeler.box3dSys {
+      color indigo
+    }
+    style repo.modeler.mcpCrate, repo.modeler.aiCrate {
+      color amber
+    }
+  }
+
+  view app-internals of repo.modeler.appCrate {
+    title 'modeler-app internals'
+    description 'Viewport, tools, physics mirror, control API, AI tools'
+
+    include
+      *,
+      repo.modeler.appCrate.*,
+      repo.modeler.core,
+      repo.modeler.box3dSys,
+      repo.modeler.aiCrate,
+      repo.modeler.mcpCrate
+
+    style repo.modeler.appCrate.physicsMirror {
+      color indigo
+    }
+    style repo.modeler.appCrate.controlApi, repo.modeler.appCrate.aiTools {
+      color amber
+    }
+    style repo.modeler.appCrate.viewport, repo.modeler.appCrate.editorUi {
+      color sky
+    }
+  }
+
+  view physics-mirror {
+    title 'Physics mirror dual mode'
+    description 'Edit: static bodies for queries · Play: dynamic simulation'
+
+    include
+      repo.modeler.core.scene,
+      repo.modeler.appCrate.physicsMirror,
+      repo.modeler.appCrate.viewport,
+      repo.modeler.appCrate.tools,
+      repo.modeler.box3dSys,
+      repo.box3d.publicApi,
+      repo.box3d.coreSim,
+      repo.box3d.collision
+
+    style repo.modeler.appCrate.physicsMirror, repo.box3d.* {
+      color indigo
+    }
+  }
+
+  view agent-control {
+    title 'Agent & AI control paths'
+    description 'MCP and in-app chat share the command executor'
+
+    include
+      agent,
+      chatUser,
+      user,
+      repo.modeler.mcpCrate,
+      repo.modeler.appCrate.controlApi,
+      repo.modeler.appCrate.commandExec,
+      repo.modeler.appCrate.aiTools,
+      repo.modeler.aiCrate,
+      repo.modeler.core,
+      llmProviders
+
+    style agent, chatUser, user {
+      color green
+    }
+    style repo.modeler.mcpCrate, repo.modeler.aiCrate, repo.modeler.appCrate.aiTools {
+      color amber
+    }
+  }
+
+  view deploy {
+    title 'Targets: native, WASM, static host'
+    include
+      user,
+      repo.modeler.appCrate,
+      repo.modeler.webDist,
+      browser,
+      staticHost,
+      repo.modeler.mcpCrate,
+      agent
+
+    style user, agent {
+      color green
+    }
+  }
+
+  dynamic view mcp-command {
+    title 'MCP command flow'
+    description 'Agent edits the live native scene'
+
+    agent -> repo.modeler.mcpCrate 'MCP tool call (stdio)'
+    repo.modeler.mcpCrate -> repo.modeler.appCrate.controlApi 'HTTP POST JSON'
+    repo.modeler.appCrate.controlApi -> repo.modeler.appCrate.commandExec 'queue on render loop'
+    repo.modeler.appCrate.commandExec -> repo.modeler.core 'mutate scene'
+    repo.modeler.appCrate.commandExec -> repo.modeler.appCrate.physicsMirror 'sync bodies'
+    repo.modeler.appCrate.viewport -> user 'visible update'
+  }
+
+  dynamic view physics-play {
+    title 'Physics play / stop'
+    description 'Space/▶ simulates; Esc restores snapshot'
+
+    user -> repo.modeler.appCrate.tools 'start play'
+    repo.modeler.appCrate.tools -> repo.modeler.appCrate.physicsMirror 'rebuild dynamic world'
+    repo.modeler.appCrate.physicsMirror -> repo.modeler.box3dSys 'b3World_Step @ 60 Hz'
+    repo.modeler.box3dSys -> repo.box3d.coreSim 'integrate'
+    repo.modeler.appCrate.physicsMirror -> repo.modeler.core.scene 'write transforms'
+    user -> repo.modeler.appCrate.tools 'stop'
+    repo.modeler.appCrate.tools -> repo.modeler.appCrate.physicsMirror 'restore snapshot'
+  }
+}

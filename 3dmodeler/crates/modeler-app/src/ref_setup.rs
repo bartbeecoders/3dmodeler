@@ -194,6 +194,7 @@ pub fn build_placements(
                 aspect: img.aspect(),
                 opacity: params.opacity.clamp(0.0, 1.0),
                 visible: true,
+                locked: false,
                 flip_h,
                 flip_v: false,
                 data_base64: BASE64.encode(&img.bytes),

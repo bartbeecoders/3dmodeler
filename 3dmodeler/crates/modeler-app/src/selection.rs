@@ -36,8 +36,6 @@ impl Selection {
         self.selected.contains(&id)
     }
 
-    /// Blender click rules: plain click selects only the hit object (or
-    /// clears on empty space); shift+click extends / toggles.
     /// The selected reference image, if any.
     pub fn image(&self) -> Option<u64> {
         self.image

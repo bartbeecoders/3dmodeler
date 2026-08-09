@@ -28,9 +28,11 @@ pub enum PieIcon {
     Roof,
     Empty,
     Rope,
+    Cloth,
     LightPoint,
     LightSun,
     LightSpot,
+    Camera,
     // actions (line-art)
     Duplicate,
     Anchor,
@@ -55,6 +57,8 @@ pub enum PieIcon {
     Modifier,
     /// Properties tab: physics (falling ball).
     Physics,
+    /// Properties tab: PBR material library (texture swatches).
+    PbrLibrary,
 }
 
 /// The icon matching a primitive (shared by the pie and the Add dropdown).
@@ -73,11 +77,13 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Roof { .. } => PieIcon::Roof,
         P::Empty { .. } => PieIcon::Empty,
         P::Rope { .. } => PieIcon::Rope,
+        P::Cloth { .. } => PieIcon::Cloth,
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
             modeler_core::LightKind::Sun => PieIcon::LightSun,
             modeler_core::LightKind::Spot => PieIcon::LightSpot,
         },
+        P::Camera { .. } => PieIcon::Camera,
     }
 }
 
@@ -414,6 +420,16 @@ pub fn draw_icon(
             painter.line_segment([p(0.15, -0.55), p(0.55, -0.15)], stroke);
             painter.line_segment([p(0.05, -0.2), p(0.65, 0.05)], stroke);
         }
+        // PBR library: 2×2 texture swatches
+        PieIcon::PbrLibrary => {
+            let half = 0.45 * s;
+            let gap = 0.12 * s;
+            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let center = p(dx * (half + gap) * 0.55, dy * (half + gap) * 0.55);
+                let r = egui::Rect::from_center_size(center, egui::vec2(half, half));
+                painter.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Middle);
+            }
+        }
         // Rope: hanging catenary with thickness ticks
         PieIcon::Rope => {
             let curve = [
@@ -428,6 +444,22 @@ pub fn draw_icon(
             }
             painter.circle_filled(curve[0], 0.12 * s, stroke.color);
             painter.circle_filled(curve[4], 0.12 * s, stroke.color);
+        }
+        // Cloth: draped rectangle with grid lines
+        PieIcon::Cloth => {
+            let tl = p(-0.9, -0.7);
+            let tr = p(0.9, -0.55);
+            let bl = p(-0.75, 0.75);
+            let br = p(0.85, 0.65);
+            painter.line_segment([tl, tr], stroke);
+            painter.line_segment([tr, br], stroke);
+            painter.line_segment([br, bl], stroke);
+            painter.line_segment([bl, tl], stroke);
+            // mid folds
+            painter.line_segment([p(-0.85, 0.0), p(0.88, 0.08)], stroke);
+            painter.line_segment([p(0.0, -0.62), p(0.05, 0.7)], stroke);
+            painter.circle_filled(tl, 0.1 * s, stroke.color);
+            painter.circle_filled(tr, 0.1 * s, stroke.color);
         }
         // Floor: flat slab — parallelogram top with a visible thickness
         PieIcon::Floor => {
@@ -457,6 +489,16 @@ pub fn draw_icon(
             painter.line_segment([p(0.0, -1.0), p(0.0, 1.0)], stroke);
             painter.line_segment([p(-0.65, 0.65), p(0.65, -0.65)], stroke);
             painter.circle_filled(c, 0.14 * s, stroke.color);
+        }
+        // Camera: body rectangle + lens triangle pointing right
+        PieIcon::Camera => {
+            let body = egui::Rect::from_two_pos(p(-0.95, -0.55), p(0.15, 0.55));
+            painter.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Middle);
+            painter.add(egui::Shape::closed_line(
+                vec![p(0.2, -0.45), p(1.0, 0.0), p(0.2, 0.45)],
+                stroke,
+            ));
+            painter.circle_stroke(p(-0.4, 0.0), 0.22 * s, stroke);
         }
         // Point light: bulb circle with diagonal rays
         PieIcon::LightPoint => {

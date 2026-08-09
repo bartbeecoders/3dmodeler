@@ -7,3 +7,4 @@ description = "MCP (Model Context Protocol) server bridging coding agents to the
 [dependencies]
 serde_json = "1"
 minreq = "2"
+base64 = "0.22"

@@ -202,7 +202,9 @@ pub fn loop_cut(
         positions: mesh.positions.clone(),
         normals: Vec::new(), // recomputed after compaction
         indices: Vec::new(),
+        uvs: Vec::new(),
         seams: mesh.seams.clone(),
+        tri_materials: Vec::new(), // surgery invalidates face assignments
     };
     for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
         if !ring_faces.contains(&face_of_tri[ti]) {
@@ -484,7 +486,9 @@ pub fn bevel_edge(
         positions: mesh.positions.clone(),
         normals: Vec::new(),
         indices: Vec::new(),
+        uvs: Vec::new(),
         seams: mesh.seams.clone(),
+        tri_materials: Vec::new(), // surgery invalidates face assignments
     };
     for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
         if !rebuilt.contains(&face_of_tri[ti]) {
@@ -507,7 +511,9 @@ fn strip_face(mesh: &MeshData, topo: &Topology, face: usize) -> MeshData {
         positions: mesh.positions.clone(),
         normals: Vec::new(),
         indices: Vec::new(),
+        uvs: Vec::new(),
         seams: mesh.seams.clone(),
+        tri_materials: Vec::new(), // surgery invalidates face assignments
     };
     for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
         if !skip.contains(&ti) {

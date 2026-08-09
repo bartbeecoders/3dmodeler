@@ -121,7 +121,21 @@ impl DeleteTool {
 }
 
 pub fn delete_selected(scene: &mut Scene, selection: &mut Selection) {
-    for id in selection.selected().to_vec() {
+    // Group roots (placed library components) always remove their whole
+    // subtree — `remove_object` alone would only unparent the children.
+    let mut to_delete: Vec<ObjectId> = Vec::new();
+    for id in selection.selected() {
+        if scene.object(*id).is_some_and(|o| o.group) {
+            for child in scene.subtree(*id) {
+                if !to_delete.contains(&child) {
+                    to_delete.push(child);
+                }
+            }
+        } else if !to_delete.contains(id) {
+            to_delete.push(*id);
+        }
+    }
+    for id in to_delete {
         scene.remove_object(id);
     }
     selection.retain_existing(|id| scene.object(id).is_some());
@@ -227,6 +241,11 @@ fn bake_into_primitive(primitive: &mut Primitive, s: Vec3) -> bool {
             *radius *= s.y.abs().max(s.z.abs());
             true
         }
+        Primitive::Cloth { width, height, .. } => {
+            *width *= s.x;
+            *height *= s.y;
+            true
+        }
         _ => false,
     }
 }
@@ -243,14 +262,19 @@ pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
     let mut baked_meshes = 0usize;
     let mut skipped_lights = 0usize;
 
+    let mut skipped_locked = 0usize;
     for id in selection.selected().to_vec() {
         let Some(object) = scene.object(id) else { continue };
+        if object.locked {
+            skipped_locked += 1;
+            continue;
+        }
         let s = object.transform.scale;
         if (s - Vec3::ONE).abs().max_element() < 1e-6 {
             continue;
         }
-        if matches!(object.primitive, Primitive::Light { .. }) {
-            skipped_lights += 1; // a light's gizmo size is intrinsic
+        if object.primitive.is_light() || object.primitive.is_camera() {
+            skipped_lights += 1; // light/camera gizmo size is intrinsic
             continue;
         }
         let child_ids: Vec<ObjectId> = scene
@@ -308,6 +332,9 @@ pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
     }
 
     let mut message = match applied {
+        0 if skipped_locked > 0 && skipped_locked == selection.selected().len() => {
+            "nothing to apply: selection is locked".to_string()
+        }
         0 => "nothing to apply: selection has no scale".to_string(),
         n => format!("applied scale to {n} object{}", if n == 1 { "" } else { "s" }),
     };
@@ -316,6 +343,9 @@ pub fn apply_scale(scene: &mut Scene, selection: &Selection) -> String {
     }
     if skipped_lights > 0 {
         message += &format!(" — {skipped_lights} light(s) skipped");
+    }
+    if skipped_locked > 0 && applied > 0 {
+        message += &format!(" — {skipped_locked} locked skipped");
     }
     message
 }
@@ -365,13 +395,11 @@ pub fn boolean_apply(
     tools: &[ObjectId],
     op: modeler_core::BooleanOp,
 ) -> Result<String, String> {
-    let no_volume = |o: &modeler_core::Object| {
-        o.primitive.is_light() || matches!(o.primitive, Primitive::Empty { .. })
-    };
+    let no_volume = |o: &modeler_core::Object| o.primitive.is_gizmo();
     let target_object = scene.object(target).ok_or("no such target object")?;
     if no_volume(target_object) {
         return Err(format!(
-            "'{}' is a light/empty — it has no volume to combine",
+            "'{}' is a light/camera/empty — it has no volume to combine",
             target_object.name
         ));
     }
@@ -575,8 +603,9 @@ fn replace_with_particles(
     }
     let object = scene.object(id)?;
     let base_name = object.name.clone();
-    let material = object.material;
+    let material = object.material.clone();
     let density = object.density;
+    let bounciness = object.bounciness;
     let word = kind.singular();
     let folder_word = kind.label();
 
@@ -602,7 +631,8 @@ fn replace_with_particles(
             o.folder = Some(folder);
             o.dynamic = true;
             o.density = density;
-            o.material = material;
+            o.bounciness = bounciness; // shards keep the parent's feel
+            o.material = material.clone();
             let shade = 0.88 + 0.24 * ((i as f32) * 0.618_034).fract();
             for channel in &mut o.material.base_color {
                 *channel = (*channel * shade).clamp(0.0, 1.0);
@@ -644,7 +674,7 @@ pub fn break_into_bricks(
     if matches!(object.primitive, Primitive::Wall { .. }) && object.edited_mesh.is_none() {
         return break_wall_into_bricks(scene, id, target_bricks);
     }
-    if object.primitive.is_light() || matches!(object.primitive, Primitive::Empty { .. }) {
+    if object.primitive.is_gizmo() {
         return None;
     }
     let world = scene.world_transform(id);
@@ -724,7 +754,7 @@ pub fn break_into_balls(
     target_balls: usize,
 ) -> Option<Vec<ObjectId>> {
     let object = scene.object(id)?;
-    if object.primitive.is_light() || matches!(object.primitive, Primitive::Empty { .. }) {
+    if object.primitive.is_gizmo() {
         return None;
     }
     let world = scene.world_transform(id);

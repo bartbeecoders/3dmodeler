@@ -4,6 +4,8 @@
 //! outliner and properties sidebar. Every object has a static body in a
 //! b3World; clicks select via b3World_CastRayClosest.
 
+#![recursion_limit = "256"]
+
 mod add_menu;
 mod ai;
 mod axis_widget;
@@ -14,15 +16,20 @@ mod commands;
 #[cfg(not(target_arch = "wasm32"))]
 mod control;
 mod camera;
+mod camera_render;
 mod context_menu;
+#[cfg(not(target_arch = "wasm32"))]
+mod render_preview;
 mod cutout_handles;
 mod force_handles;
 mod rope_handles;
+mod cloth_handles;
 mod edit_mode;
 #[cfg(not(target_arch = "wasm32"))]
 mod gl_window;
 mod grid;
 mod library;
+mod pbr_library;
 mod mesh_edit;
 mod modal;
 mod modifiers;
@@ -174,6 +181,7 @@ pub fn main() {
     let mut cutout_handles = cutout_handles::CutoutHandles::new();
     let mut force_handles = force_handles::ForceHandles::new();
     let mut rope_handles = rope_handles::RopeHandles::new();
+    let mut cloth_handles = cloth_handles::ClothHandles::new();
     let mut poke_tool = poke::PokeTool::new();
     let mut ui_state = ui::UiState::new();
     // dev/test hook: start with the AI panel open (used by UI verification)
@@ -199,6 +207,20 @@ pub fn main() {
     let mut shade_mode = scene_render::ShadeMode::Shaded;
     let mut lighting_mode = scene_render::LightingMode::Studio;
     let mut xray = false;
+    // F12 toggles live camera preview (native: separate OS window; wasm: egui).
+    let mut camera_live = false;
+    // True after the live preview window has been shown at least once this
+    // session — used to detect the user closing the OS window.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut live_window_started = false;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut render_preview = render_preview::RenderPreview::new();
+    // Reused off-screen targets for live camera rendering.
+    let mut camera_rt: Option<camera_render::CameraRenderTarget> = None;
+    // Separate target for MCP `render` calls so agent-chosen resolutions
+    // don't thrash the live preview's.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut mcp_camera_rt: Option<camera_render::CameraRenderTarget> = None;
     let mut wire_render = wire_render::WireRender::new(&context);
     let mut grid_built =
         (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
@@ -349,6 +371,15 @@ pub fn main() {
                         overlay_clip,
                     );
                     rope_handles.draw(
+                        gui_context,
+                        &scene,
+                        &sel,
+                        &camera,
+                        frame_input.viewport,
+                        frame_input.device_pixel_ratio,
+                        overlay_clip,
+                    );
+                    cloth_handles.draw(
                         gui_context,
                         &scene,
                         &sel,
@@ -509,6 +540,44 @@ pub fn main() {
         if library.revision() != library_saved_revision {
             library::save(&library);
             library_saved_revision = library.revision();
+        }
+
+        // PBR material library: finish downloads, then apply to selection
+        ui_state.pbr_library_panel.poll();
+        ui_state.pbr_library_panel.expand_poly_files();
+        if let Some(msg) = ui_state.pbr_library_panel.take_status() {
+            ui_state.status_message = Some(msg);
+        }
+        if let Some((material, name)) = ui_state.pbr_library_panel.take_apply() {
+            // Edit mode with a face selected: the material goes to that one
+            // face instead of the whole object.
+            if edit_mode.active() {
+                ui_state.status_message = Some(if edit_mode.selected_face().is_none() {
+                    "select a face to apply a PBR material in edit mode".into()
+                } else if edit_mode.apply_material_to_selected_face(&mut scene, material) {
+                    format!("applied PBR material '{name}' to the selected face")
+                } else {
+                    "couldn't apply the material to the selected face".into()
+                });
+            } else {
+                let targets: Vec<_> = sel.selected().to_vec();
+                if targets.is_empty() {
+                    ui_state.status_message =
+                        Some("select an object before applying a PBR material".into());
+                } else {
+                    for id in &targets {
+                        if scene.object(*id).is_some_and(|o| o.primitive.is_gizmo()) {
+                            continue;
+                        }
+                        // Textured PBR is stored on the inline material; break any
+                        // master link so maps aren't lost under master resolve.
+                        let _ = scene.make_material_unique(*id);
+                        scene.set_object_material(*id, material.clone());
+                    }
+                    ui_state.status_message =
+                        Some(format!("applied PBR material '{name}' to selection"));
+                }
+            }
         }
 
         // did egui consume the keyboard this frame (e.g. focused text field)?
@@ -939,10 +1008,21 @@ pub fn main() {
                 frame_input.device_pixel_ratio,
                 pointer_over_ui,
             );
+            cloth_handles.handle_events(
+                &mut frame_input.events,
+                &mut scene,
+                &sel,
+                &physics,
+                &camera,
+                frame_input.viewport,
+                frame_input.device_pixel_ratio,
+                pointer_over_ui,
+            );
         } else {
             cutout_handles.cancel();
             force_handles.cancel();
             rope_handles.cancel();
+            cloth_handles.cancel();
         }
 
         // external control API (MCP): execute queued agent commands
@@ -955,6 +1035,7 @@ pub fn main() {
                 &mut library,
                 &mut shade_mode,
                 &mut lighting_mode,
+                &mut camera,
             );
         }
 
@@ -976,8 +1057,14 @@ pub fn main() {
 
         // design-mode: keep attached rope ends on their targets when those
         // objects move (skip while dragging a rope handle or simulating)
-        if physics.is_stopped() && !rope_handles.dragging() && !modal.active() {
+        if physics.is_stopped()
+            && !rope_handles.dragging()
+            && !cloth_handles.dragging()
+            && !modal.active()
+        {
             rope_handles::sync_attached_ropes(&mut scene);
+            // Keep pinned cloth near their pin targets in design mode
+            cloth_handles::sync_pinned_cloths(&mut scene);
         }
 
         // physics mirror must be current before picking (no-op while playing)
@@ -1000,6 +1087,7 @@ pub fn main() {
                 || cutout_handles.dragging()
                 || force_handles.dragging()
                 || rope_handles.dragging()
+                || cloth_handles.dragging()
                 || !physics.is_stopped(),
         );
 
@@ -1009,6 +1097,28 @@ pub fn main() {
         } else {
             std::collections::HashSet::new()
         };
+
+        // boolean eyedropper: Esc disarms it, and it never outlives the
+        // modifier it was armed on (deleted object, removed modifier)
+        if let Some((target, index)) = ui_state.pick_boolean_tool {
+            let still_valid = scene
+                .object(target)
+                .and_then(|o| o.modifiers.get(index))
+                .is_some_and(|m| matches!(m.kind, modeler_core::ModifierKind::Boolean { .. }));
+            if !still_valid {
+                ui_state.pick_boolean_tool = None;
+            } else {
+                for event in frame_input.events.iter_mut() {
+                    if let Event::KeyPress { kind: Key::Escape, handled, .. } = event {
+                        if !*handled {
+                            ui_state.pick_boolean_tool = None;
+                            ui_state.status_message = Some("tool pick cancelled".to_string());
+                            *handled = true;
+                        }
+                    }
+                }
+            }
+        }
 
         // viewport click selection (box3d ray cast) — object mode only
         for event in frame_input.events.iter_mut() {
@@ -1028,6 +1138,20 @@ pub fn main() {
                     let ray_o = glam::Vec3::new(origin.x, origin.y, origin.z);
                     let ray_d = glam::Vec3::new(direction.x, direction.y, direction.z);
                     let hit = physics.pick(ray_o, ray_d);
+                    // boolean eyedropper armed in the Modifiers panel: this
+                    // click assigns the tool object instead of selecting
+                    if let Some((target, index)) = ui_state.pick_boolean_tool {
+                        *handled = true;
+                        match modifiers::pick_boolean_tool(&mut scene, target, index, hit) {
+                            Ok(message) => {
+                                ui_state.pick_boolean_tool = None;
+                                ui_state.status_message = Some(message);
+                            }
+                            // stay armed on a miss or an invalid pick
+                            Err(message) => ui_state.status_message = Some(message),
+                        }
+                        continue;
+                    }
                     // reference images are not physics bodies: intersect
                     // them analytically and let the nearest hit win
                     let object_t = hit
@@ -1060,9 +1184,18 @@ pub fn main() {
 
         // '.' frames the selection (and re-pivots the orbit on it); Home
         // frames all; End drops the selection onto the ground (z = 0) or
-        // the objects below it, whichever is higher
-        for event in frame_input.events.iter() {
-            if let Event::KeyPress { kind, handled: false, .. } = event {
+        // the objects below it, whichever is higher. F12 renders from a
+        // scene camera (Blender convention).
+        for event in frame_input.events.iter_mut() {
+            if let Event::KeyPress {
+                kind,
+                handled,
+                ..
+            } = event
+            {
+                if *handled {
+                    continue;
+                }
                 match kind {
                     Key::Period => {
                         let bounds =
@@ -1083,10 +1216,11 @@ pub fn main() {
                     {
                         if let Some(image_id) = sel.image() {
                             // ground the reference image: lowest corner to z=0
+                            // (locked images stay put)
                             let min_z = scene
                                 .reference_images()
                                 .iter()
-                                .find(|r| r.id == image_id)
+                                .find(|r| r.id == image_id && !r.locked)
                                 .map(|r| {
                                     r.corners()
                                         .iter()
@@ -1103,6 +1237,27 @@ pub fn main() {
                             physics.drop_to_floor(&mut scene, &sel);
                         }
                     }
+                    Key::F12 if !egui_owns_keyboard => {
+                        camera_live = !camera_live;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if !camera_live {
+                                render_preview.close();
+                                live_window_started = false;
+                            }
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        if !camera_live {
+                            ui_state.clear_render_result();
+                        }
+                        ui_state.status_message = Some(if camera_live {
+                            "Live camera view ON — updates in real time (F12 to close)"
+                                .into()
+                        } else {
+                            "Live camera view OFF".into()
+                        });
+                        *handled = true;
+                    }
                     _ => {}
                 }
             }
@@ -1111,6 +1266,85 @@ pub fn main() {
         scene_render.sync(&scene, &sel, &overlaps, &context, shade_mode, xray);
         lights.sync(&context, &scene, &scene_render, shade_mode, lighting_mode);
         ref_render.sync(&scene, &context);
+
+        // Live camera view: re-render every frame while active so the
+        // preview tracks camera/scene changes. Closing the OS window (✕),
+        // or F12/Esc in that window, stops the stream and must not reopen.
+        #[cfg(not(target_arch = "wasm32"))]
+        if camera_live && live_window_started && !render_preview.is_open() {
+            camera_live = false;
+            live_window_started = false;
+            ui_state.status_message = Some("Live camera view closed".into());
+        }
+
+        if camera_live {
+            match camera_render::resolve_camera(
+                &scene,
+                sel.selected().iter().copied(),
+                sel.active(),
+            ) {
+                Some(cam_id) => {
+                    let bg = settings.theme.viewport_clear();
+                    let (live_w, live_h) = (
+                        camera_render::LIVE_WIDTH,
+                        camera_render::LIVE_HEIGHT,
+                    );
+                    let rt = camera_rt.get_or_insert_with(|| {
+                        camera_render::CameraRenderTarget::new(&context, live_w, live_h)
+                    });
+                    rt.ensure_size(&context, live_w, live_h);
+                    match rt.render(&scene, cam_id, &scene_render, &lights, bg) {
+                        Ok((w, h, rgba)) => {
+                            let name = scene
+                                .object(cam_id)
+                                .map(|o| o.name.clone())
+                                .unwrap_or_else(|| "Camera".into());
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                if !live_window_started {
+                                    // First frame after F12: create the OS window.
+                                    render_preview.open(name, w, h, rgba);
+                                    live_window_started = true;
+                                } else if !render_preview.push_frame(name, w, h, rgba) {
+                                    // User closed the window (✕ / F12 / Esc).
+                                    camera_live = false;
+                                    live_window_started = false;
+                                    ui_state.status_message =
+                                        Some("Live camera view closed".into());
+                                }
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                ui_state.set_render_result(name, w, h, rgba.to_vec());
+                            }
+                        }
+                        Err(e) => {
+                            camera_live = false;
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                render_preview.close();
+                                live_window_started = false;
+                            }
+                            ui_state.status_message =
+                                Some(format!("Camera view failed: {e}"));
+                        }
+                    }
+                }
+                None => {
+                    camera_live = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        render_preview.close();
+                        live_window_started = false;
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    ui_state.clear_render_result();
+                    ui_state.status_message = Some(
+                        "No camera in the scene — Add ▸ Camera, then press F12".into(),
+                    );
+                }
+            }
+        }
 
         let cam = camera.camera(frame_input.viewport);
 
@@ -1149,22 +1383,91 @@ pub fn main() {
             );
         }
 
-        // deliver any pending screenshot requests from the control API
+        // deliver any pending image requests from the control API: viewport
+        // screenshots read the frame just drawn, `render` draws off-screen
+        // from a scene camera (the F12 view, at an agent-chosen resolution)
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(control) = control.as_mut() {
-            if !control.pending_screenshots.is_empty() {
-                let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
-                let response = match commands::encode_screenshot(
-                    &pixels,
-                    frame_input.viewport.width,
-                    frame_input.viewport.height,
-                ) {
-                    Ok(png_base64) => serde_json::json!({"ok": true, "png_base64": png_base64}),
-                    Err(e) => serde_json::json!({"ok": false, "error": e}),
-                };
-                for reply in control.pending_screenshots.drain(..) {
-                    let _ = reply.send(response.clone());
+            let requests: Vec<(serde_json::Value, _)> =
+                control.pending_screenshots.drain(..).collect();
+            // the frame is read at most once, however many requests queued
+            let mut viewport_shot: Option<serde_json::Value> = None;
+            for (mut command, reply) in requests {
+                // a request that moved the viewport camera waits a frame so
+                // the UI overlay matches the 3D view it captures
+                if let Some(left) = command["settle_frames"].as_u64() {
+                    if left > 0 {
+                        command["settle_frames"] = serde_json::json!(left - 1);
+                        control.pending_screenshots.push((command, reply));
+                        continue;
+                    }
                 }
+                let response = if command["cmd"] == "render" {
+                    let width = command["width"].as_u64().unwrap_or(camera_render::LIVE_WIDTH as u64)
+                        .clamp(16, 4096) as u32;
+                    let height = command["height"]
+                        .as_u64()
+                        .unwrap_or(camera_render::LIVE_HEIGHT as u64)
+                        .clamp(16, 4096) as u32;
+                    let camera_id = if command["camera"].is_null() {
+                        camera_render::resolve_camera(
+                            &scene,
+                            sel.selected().iter().copied(),
+                            sel.active(),
+                        )
+                        .ok_or_else(|| {
+                            "no camera in the scene — add_object {\"primitive\":\"camera\"} first"
+                                .to_string()
+                        })
+                    } else {
+                        commands::resolve(&scene, &command["camera"])
+                    };
+                    match camera_id {
+                        Err(e) => serde_json::json!({"ok": false, "error": e}),
+                        Ok(camera_id) => {
+                            let bg = settings.theme.viewport_clear();
+                            let rt = mcp_camera_rt.get_or_insert_with(|| {
+                                camera_render::CameraRenderTarget::new(&context, width, height)
+                            });
+                            rt.ensure_size(&context, width, height);
+                            match rt.render(&scene, camera_id, &scene_render, &lights, bg) {
+                                Err(e) => serde_json::json!({"ok": false, "error": e}),
+                                Ok((w, h, rgba)) => match commands::encode_png_rgba(rgba, w, h) {
+                                    Err(e) => serde_json::json!({"ok": false, "error": e}),
+                                    Ok(png_base64) => serde_json::json!({
+                                        "ok": true,
+                                        "png_base64": png_base64,
+                                        "width": w,
+                                        "height": h,
+                                        "camera": scene
+                                            .object(camera_id)
+                                            .map(|o| o.name.clone())
+                                            .unwrap_or_default(),
+                                    }),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    viewport_shot
+                        .get_or_insert_with(|| {
+                            let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
+                            let (w, h) =
+                                (frame_input.viewport.width, frame_input.viewport.height);
+                            match commands::encode_screenshot(&pixels, w, h) {
+                                Ok(png_base64) => serde_json::json!({
+                                    "ok": true,
+                                    "png_base64": png_base64,
+                                    "width": w,
+                                    "height": h,
+                                    "view": camera.view_name(),
+                                }),
+                                Err(e) => serde_json::json!({"ok": false, "error": e}),
+                            }
+                        })
+                        .clone()
+                };
+                let _ = reply.send(response);
             }
         }
 

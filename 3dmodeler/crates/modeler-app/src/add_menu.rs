@@ -20,10 +20,8 @@ enum PieItem {
     Primitive(Primitive),
     Wall,
     Floor,
-    /// Gable by default; the other shapes live in the Add menu and the
-    /// sidebar Type selector.
-    Roof,
     Rope,
+    Cloth,
 }
 
 /// Slot order around the wheel, starting north and going clockwise.
@@ -40,8 +38,8 @@ fn pie_items() -> [(PieItem, &'static str); 12] {
         (PieItem::Primitive(c[6]), "Torus"),
         (PieItem::Primitive(c[0]), "Plane"),
         (PieItem::Rope, "Rope"),
+        (PieItem::Cloth, "Cloth"),
         (PieItem::Primitive(c[7]), "Empty"),
-        (PieItem::Roof, "Roof"),
         (PieItem::Floor, "Floor"),
         (PieItem::Wall, "Wall"),
     ]
@@ -51,8 +49,8 @@ fn slot_icon(item: PieItem) -> PieIcon {
     match item {
         PieItem::Wall => PieIcon::Wall,
         PieItem::Floor => PieIcon::Floor,
-        PieItem::Roof => PieIcon::Roof,
         PieItem::Rope => PieIcon::Rope,
+        PieItem::Cloth => PieIcon::Cloth,
         PieItem::Primitive(primitive) => pie::primitive_icon(&primitive),
     }
 }
@@ -168,7 +166,7 @@ impl AddMenu {
         scene: &mut Scene,
         selection: &mut crate::selection::Selection,
         wall_tool: &mut crate::wall_tool::WallTool,
-        roof_tool: &mut crate::roof_tool::RoofTool,
+        _roof_tool: &mut crate::roof_tool::RoofTool,
         settings: &crate::settings::Settings,
     ) -> Option<String> {
         if !self.open {
@@ -196,19 +194,25 @@ impl AddMenu {
                     PieItem::Floor => {
                         status = Some(crate::object_ops::add_floor(scene, selection));
                     }
-                    PieItem::Roof => {
-                        let kind = modeler_core::RoofKind::Gable;
-                        match crate::object_ops::add_roof(scene, selection, kind) {
-                            Some(message) => status = Some(message),
-                            None => roof_tool.start(kind),
-                        }
-                    }
                     PieItem::Rope => {
                         let id = scene.add_object(
                             Primitive::Rope {
                                 length: 2.0,
                                 radius: 0.03,
                                 segments: 12,
+                            },
+                            Transform::default(),
+                        );
+                        selection.set(vec![id], Some(id));
+                    }
+                    PieItem::Cloth => {
+                        let id = scene.add_object(
+                            Primitive::Cloth {
+                                width: 2.0,
+                                height: 2.0,
+                                segments_u: 8,
+                                segments_v: 8,
+                                stiffness: 0.25,
                             },
                             Transform::default(),
                         );
@@ -250,6 +254,22 @@ pub fn mesh_menu_buttons(ui: &mut egui::Ui) -> Option<Primitive> {
         .clicked()
     {
         clicked = Some(rope);
+    }
+    let cloth = Primitive::Cloth {
+        width: 2.0,
+        height: 2.0,
+        segments_u: 8,
+        segments_v: 8,
+        stiffness: 0.25,
+    };
+    if pie::icon_menu_button(ui, &pie::primitive_icon(&cloth), "Cloth")
+        .on_hover_text(
+            "Soft cloth sheet with physics: pin grid vertices to objects \
+             (drag numbered handles or Alt+click to add anchors), then Play",
+        )
+        .clicked()
+    {
+        clicked = Some(cloth);
     }
     clicked
 }

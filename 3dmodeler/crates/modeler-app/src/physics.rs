@@ -28,9 +28,73 @@ fn bquat(q: Quat) -> ffi::b3Quat {
     ffi::b3Quat { v: ffi::b3Vec3 { x: q.x, y: q.y, z: q.z }, s: q.w }
 }
 
+fn from_bvec(v: ffi::b3Vec3) -> Vec3 {
+    Vec3::new(v.x, v.y, v.z)
+}
+
+/// Reposition structural edge capsules so each spans the current world segment
+/// between its two cloth nodes (expressed in body A's local frame).
+unsafe fn update_cloth_edge_capsules(
+    bodies: &[ffi::b3BodyId],
+    edges: &[ClothEdgeCollider],
+) {
+    for edge in edges {
+        if edge.body_a >= bodies.len() || edge.body_b >= bodies.len() {
+            continue;
+        }
+        let body_a = bodies[edge.body_a];
+        let body_b = bodies[edge.body_b];
+        if !ffi::b3Body_IsValid(body_a) || !ffi::b3Body_IsValid(body_b) {
+            continue;
+        }
+        if !ffi::b3Shape_IsValid(edge.shape) {
+            continue;
+        }
+        let p_a = from_bvec(ffi::b3Body_GetPosition(body_a));
+        let p_b = from_bvec(ffi::b3Body_GetPosition(body_b));
+        let span = p_b - p_a;
+        let len = span.length();
+        if len < 1e-4 {
+            continue;
+        }
+        // Inset capsule ends so node spheres own the tips (avoids double mass
+        // contact spikes). Leave at least a short segment for edge coverage.
+        let inset = (edge.radius * 0.85).min(len * 0.4);
+        let dir = span / len;
+        let w0 = p_a + dir * inset;
+        let w1 = p_b - dir * inset;
+        let c1 = ffi::b3Body_GetLocalPoint(body_a, bvec(w0));
+        let c2 = ffi::b3Body_GetLocalPoint(body_a, bvec(w1));
+        let capsule = ffi::b3Capsule {
+            center1: c1,
+            center2: c2,
+            radius: edge.radius,
+        };
+        ffi::b3Shape_SetCapsule(edge.shape, &capsule);
+    }
+}
+
 const FIXED_DT: f32 = 1.0 / 60.0;
 const SUBSTEPS: i32 = 4;
 const GRAVITY: Vec3 = Vec3::new(0.0, 0.0, -9.81); // Z-up world
+
+/// Hard cap on fixed steps per rendered frame. Without it the accumulator
+/// catch-up compounds: on a 7.6k-brick scene one 77 ms step makes the next
+/// frame ask for 4 steps, then 9, then 14 — 0.9 fps while the sim still only
+/// advances at 0.23x real time. Dropping the surplus keeps the viewport at the
+/// cost of running in visible slow motion (reported by `slow_motion()`).
+const MAX_STEPS_PER_FRAME: u32 = 2;
+
+/// Above this many dynamic bodies, drop from `SUBSTEPS` to `SUBSTEPS_HEAVY`.
+/// Worth ~10% on a big rubble pile; below it, keep 4 for stack stability.
+const HEAVY_BODY_THRESHOLD: usize = 1000;
+const SUBSTEPS_HEAVY: i32 = 2;
+
+/// Linear speed below which a body may sleep, m/s. box3d's default (0.05) is
+/// too tight for a settled brick pile: 7,300 of 7,591 bodies jitter just above
+/// it forever, at 75 ms/step. At 0.2 the same pile sleeps ~5 s in, at 7 us/step.
+/// 0.2 m/s is 3.3 mm per 60 Hz frame.
+const SLEEP_THRESHOLD: f32 = 0.2;
 
 /// Above this many dynamic bodies, playback recreates the world with box3d's
 /// internal scheduler enabled (native only — wasm has no threads). Small
@@ -69,10 +133,14 @@ struct ShapeKey {
     /// World scale — baked into the shape geometry.
     scale: Vec3,
     density: f32,
+    /// Fingerprint of the enabled modifier stack (0 when empty): the
+    /// collision shape follows boolean cuts, so it must rebuild when the
+    /// stack, its parameters, or a tool object's placement changes.
+    modifier_stamp: u64,
 }
 
 impl ShapeKey {
-    fn of(object: &modeler_core::Object, world_scale: Vec3) -> Self {
+    fn of(scene: &Scene, object: &modeler_core::Object, world_scale: Vec3) -> Self {
         Self {
             primitive: object.primitive,
             mesh_revision: object.mesh_revision,
@@ -81,6 +149,11 @@ impl ShapeKey {
             floor_outline: object.floor_outline.len(),
             scale: world_scale,
             density: object.density,
+            modifier_stamp: if object.modifiers.iter().any(|m| m.enabled) {
+                crate::modifiers::stamp(scene, object.id)
+            } else {
+                0
+            },
         }
     }
 }
@@ -94,6 +167,9 @@ struct BodyEntry {
     key: ShapeKey,
     location: Vec3,
     rotation: Quat,
+    /// Mirrored `Object::bounciness`: retuned in place on the live shapes
+    /// (no rebuild) when the property changes.
+    bounciness: f32,
 }
 
 /// Simulated rope: a chain of segment bodies + distance joints, not a
@@ -108,11 +184,47 @@ struct RopeSim {
     joints: Vec<ffi::b3JointId>,
 }
 
+/// One structural edge with a capsule collider that tracks both nodes.
+struct ClothEdgeCollider {
+    shape: ffi::b3ShapeId,
+    /// Owning body index (capsule is expressed in this body's local space).
+    body_a: usize,
+    body_b: usize,
+    radius: f32,
+}
+
+/// Simulated cloth: a grid of segment bodies + structural/shear distance
+/// joints. Node positions drive `Object::cloth_nodes` (row-major).
+struct ClothSim {
+    object_id: ObjectId,
+    bodies: Vec<ffi::b3BodyId>,
+    /// Grid nodes only (excludes any extra static pin bodies).
+    node_count: usize,
+    joints: Vec<ffi::b3JointId>,
+    /// Capsules along structural edges — updated every step so the sheet
+    /// cannot cut through solid corners between sparse particle contacts.
+    edge_colliders: Vec<ClothEdgeCollider>,
+}
+
 /// Destroy a mirrored body and free the mesh data its shapes referenced.
 unsafe fn destroy_entry(entry: &mut BodyEntry) {
     ffi::b3DestroyBody(entry.body);
     for mesh in entry.meshes.drain(..) {
         ffi::b3DestroyMesh(mesh);
+    }
+}
+
+/// Retune the coefficient of restitution on a live body's shapes. Cheap
+/// enough to do on any edit — no body or mesh is rebuilt.
+unsafe fn set_entry_restitution(entry: &BodyEntry, bounciness: f32) {
+    let count = ffi::b3Body_GetShapeCount(entry.body);
+    if count <= 0 {
+        return;
+    }
+    let mut shapes = vec![std::mem::zeroed::<ffi::b3ShapeId>(); count as usize];
+    let got = ffi::b3Body_GetShapes(entry.body, shapes.as_mut_ptr(), count);
+    for shape in &shapes[..got.max(0) as usize] {
+        ffi::b3Shape_SetRestitution(*shape, bounciness.clamp(0.0, 1.0));
     }
 }
 
@@ -130,6 +242,20 @@ unsafe fn destroy_rope(rope: &mut RopeSim) {
     rope.node_count = 0;
 }
 
+unsafe fn destroy_cloth(cloth: &mut ClothSim) {
+    for joint in cloth.joints.drain(..) {
+        if ffi::b3Joint_IsValid(joint) {
+            ffi::b3DestroyJoint(joint, false);
+        }
+    }
+    for body in cloth.bodies.drain(..) {
+        if ffi::b3Body_IsValid(body) {
+            ffi::b3DestroyBody(body);
+        }
+    }
+    cloth.node_count = 0;
+}
+
 pub struct PhysicsMirror {
     world: ffi::b3WorldId,
     worker_count: u32,
@@ -137,6 +263,8 @@ pub struct PhysicsMirror {
     entries: HashMap<ObjectId, BodyEntry>,
     /// Active rope simulations (play mode only).
     ropes: HashMap<ObjectId, RopeSim>,
+    /// Active cloth simulations (play mode only).
+    cloths: HashMap<ObjectId, ClothSim>,
     /// Simulate-mode ground plane (never has an ObjectId).
     ground: Option<ffi::b3BodyId>,
     /// Dynamic bodies in parent-before-child order for the per-step
@@ -150,6 +278,11 @@ pub struct PhysicsMirror {
     /// a sagging cord to its current span.
     rope_length_snapshot: Vec<(ObjectId, f32)>,
     accumulator: f32,
+    /// Solver substeps for this world; lowered on heavy scenes at play.
+    substeps: i32,
+    /// Fraction of real time the sim is actually advancing at (1.0 = real
+    /// time). Below 1 when `MAX_STEPS_PER_FRAME` is dropping steps.
+    slow_motion: f32,
 }
 
 impl PhysicsMirror {
@@ -164,6 +297,7 @@ impl PhysicsMirror {
                 synced_version: None,
                 entries: HashMap::new(),
                 ropes: HashMap::new(),
+                cloths: HashMap::new(),
                 ground: None,
                 sim_order: Vec::new(),
                 sim: SimState::Stopped,
@@ -171,12 +305,20 @@ impl PhysicsMirror {
                 snapshot: Vec::new(),
                 rope_length_snapshot: Vec::new(),
                 accumulator: 0.0,
+                substeps: SUBSTEPS,
+                slow_motion: 1.0,
             }
         }
     }
 
     pub fn sim_state(&self) -> SimState {
         self.sim
+    }
+
+    /// 1.0 when the sim keeps up with the wall clock; lower when steps are
+    /// being dropped to protect the frame rate. Only meaningful while playing.
+    pub fn slow_motion(&self) -> f32 {
+        self.slow_motion
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -214,7 +356,7 @@ impl PhysicsMirror {
                 continue; // hidden objects are not pickable / simulated
             }
             let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
-            let key = ShapeKey::of(object, world.scale);
+            let key = ShapeKey::of(scene, object, world.scale);
 
             let moved_in_place = match self.entries.get_mut(&object.id) {
                 Some(entry) if entry.key == key => {
@@ -229,6 +371,12 @@ impl PhysicsMirror {
                         entry.location = world.location;
                         entry.rotation = world.rotation;
                     }
+                    // Surface property, not geometry: retune the existing
+                    // shapes instead of rebuilding the body.
+                    if entry.bounciness != object.bounciness {
+                        unsafe { set_entry_restitution(entry, object.bounciness) };
+                        entry.bounciness = object.bounciness;
+                    }
                     true
                 }
                 _ => false,
@@ -237,7 +385,7 @@ impl PhysicsMirror {
                 if let Some(mut old) = self.entries.remove(&object.id) {
                     unsafe { destroy_entry(&mut old) };
                 }
-                let entry = unsafe { self.create_entry(object, &world, key, false) };
+                let entry = unsafe { self.create_entry(scene, object, &world, key, false) };
                 self.entries.insert(object.id, entry);
             }
         }
@@ -247,6 +395,9 @@ impl PhysicsMirror {
         unsafe {
             for (_, mut rope) in self.ropes.drain() {
                 destroy_rope(&mut rope);
+            }
+            for (_, mut cloth) in self.cloths.drain() {
+                destroy_cloth(&mut cloth);
             }
             for (_, mut entry) in self.entries.drain() {
                 destroy_entry(&mut entry);
@@ -277,6 +428,7 @@ impl PhysicsMirror {
     /// per-object dynamic flag (play mode); the static mirror passes false.
     unsafe fn create_entry(
         &self,
+        scene: &Scene,
         object: &modeler_core::Object,
         world: &Transform,
         key: ShapeKey,
@@ -287,21 +439,41 @@ impl PhysicsMirror {
         body_def.rotation = bquat(world.rotation);
         if simulate && object.dynamic {
             body_def.type_ = ffi::b3BodyType_b3_dynamicBody;
+            body_def.sleepThreshold = SLEEP_THRESHOLD;
         }
         let body = ffi::b3CreateBody(self.world, &body_def);
 
         let mut shape_def = ffi::b3DefaultShapeDef();
         shape_def.userData = object.id.0 as usize as *mut c_void;
         shape_def.density = object.density.max(0.001);
+        shape_def.baseMaterial.restitution = object.bounciness.clamp(0.0, 1.0);
+
+        // A modifier stack changes the geometry the user sees, so it must
+        // change what they collide with too — a boolean hole is a real hole.
+        let modified = object
+            .modifiers
+            .iter()
+            .any(|m| m.enabled)
+            .then(|| crate::modifiers::evaluate(scene, object.id))
+            .filter(|mesh| !mesh.indices.is_empty());
 
         let mut meshes = Vec::new();
-        Self::create_shape(self.sim, body, &shape_def, object, world.scale, &mut meshes);
+        Self::create_shape(
+            self.sim,
+            body,
+            &shape_def,
+            object,
+            modified.as_ref(),
+            world.scale,
+            &mut meshes,
+        );
         BodyEntry {
             body,
             meshes,
             key,
             location: world.location,
             rotation: world.rotation,
+            bounciness: object.bounciness,
         }
     }
 
@@ -313,22 +485,33 @@ impl PhysicsMirror {
         body: ffi::b3BodyId,
         shape_def: &ffi::b3ShapeDef,
         object: &modeler_core::Object,
+        // evaluated modifier stack, when the object has one: it replaces the
+        // primitive geometry entirely
+        modified: Option<&modeler_core::MeshData>,
         scale: Vec3, // WORLD scale (baked into geometry)
         meshes: &mut Vec<*mut ffi::b3MeshData>,
     ) {
         let uniform = (scale.x - scale.y).abs() < 1e-6 && (scale.x - scale.z).abs() < 1e-6;
 
+        // Modified geometry (boolean cuts, subdivision) is what the user
+        // sees and expects to collide with. Booleans routinely make it
+        // concave — a plate with a hole is the point of the feature — so it
+        // needs an exact triangle mesh. Mesh shapes cannot be dynamic in
+        // box3d, so a dynamic body while playing falls back to a convex
+        // hull (its holes fill in, but it is still the modified shape).
+        if let Some(mesh) = modified {
+            if !object.dynamic || sim == SimState::Stopped {
+                Self::create_mesh_shape(body, shape_def, mesh, scale, meshes);
+            } else {
+                Self::create_hull_shape(body, shape_def, mesh, scale);
+            }
+            return;
+        }
+
         // edited meshes lose their primitive identity: collide as a convex
         // hull of the deformed vertices
         if object.edited_mesh.is_some() {
-            let mesh = object.collision_mesh();
-            let points: Vec<ffi::b3Vec3> =
-                mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
-            let hull = ffi::b3CreateHull(points.as_ptr(), points.len() as i32, 32);
-            if !hull.is_null() {
-                ffi::b3CreateHullShape(body, shape_def, hull);
-                ffi::b3DestroyHull(hull); // b3CreateHullShape copies
-            }
+            Self::create_hull_shape(body, shape_def, &object.collision_mesh(), scale);
             return;
         }
 
@@ -360,6 +543,15 @@ impl PhysicsMirror {
                 };
                 ffi::b3CreateCapsuleShape(body, shape_def, &capsule);
             }
+            // edit-mode cloth: thicker box so the zero-thickness sheet is pickable
+            Primitive::Cloth { width, height, .. } => {
+                let hull = ffi::b3MakeBoxHull(
+                    (0.5 * width * scale.x.abs()).max(1e-3),
+                    (0.5 * height * scale.y.abs()).max(1e-3),
+                    0.06, // pick thickness (visual mesh stays flat)
+                );
+                ffi::b3CreateHullShape(body, shape_def, &hull.base);
+            }
             // torus is not convex: exact triangle mesh so the hole stays a hole.
             // NOTE: mesh shapes cannot be dynamic in box3d; dynamic tori fall
             // back to a convex hull below.
@@ -387,15 +579,23 @@ impl PhysicsMirror {
             }
             // everything else is convex: simplified hull of the scaled mesh
             _ => {
-                let mesh = object.primitive.generate(true);
-                let points: Vec<ffi::b3Vec3> =
-                    mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
-                let hull = ffi::b3CreateHull(points.as_ptr(), points.len() as i32, 32);
-                if !hull.is_null() {
-                    ffi::b3CreateHullShape(body, shape_def, hull);
-                    ffi::b3DestroyHull(hull); // b3CreateHullShape copies
-                }
+                Self::create_hull_shape(body, shape_def, &object.primitive.generate(true), scale);
             }
+        }
+    }
+
+    /// Convex hull of a mesh's points, scaled into world size.
+    unsafe fn create_hull_shape(
+        body: ffi::b3BodyId,
+        shape_def: &ffi::b3ShapeDef,
+        mesh: &modeler_core::MeshData,
+        scale: Vec3,
+    ) {
+        let points: Vec<ffi::b3Vec3> = mesh.positions.iter().map(|p| bvec(*p * scale)).collect();
+        let hull = ffi::b3CreateHull(points.as_ptr(), points.len() as i32, 32);
+        if !hull.is_null() {
+            ffi::b3CreateHullShape(body, shape_def, hull);
+            ffi::b3DestroyHull(hull); // b3CreateHullShape copies
         }
     }
 
@@ -448,6 +648,7 @@ impl PhysicsMirror {
                 self.sim = SimState::Playing; // set before rebuild: torus hull fallback
                 self.build_simulation(scene);
                 self.accumulator = 0.0;
+                self.slow_motion = 1.0;
             }
         }
     }
@@ -459,12 +660,28 @@ impl PhysicsMirror {
         let dynamic_bodies = scene
             .objects()
             .iter()
-            .filter(|o| o.visible && (o.dynamic || o.primitive.is_rope()))
+            .filter(|o| o.visible && (o.dynamic || o.primitive.is_soft_sim()))
             .map(|o| match o.primitive {
                 Primitive::Rope { segments, .. } => segments.clamp(2, 64) as usize + 1,
+                Primitive::Cloth {
+                    segments_u,
+                    segments_v,
+                    ..
+                } => {
+                    let su = segments_u.clamp(1, 24) as usize + 1;
+                    let sv = segments_v.clamp(1, 24) as usize + 1;
+                    su * sv
+                }
                 _ => 1,
             })
             .sum::<usize>();
+        // Heavy scenes trade solver substeps for step time (~10%); light ones
+        // keep 4 substeps, which stacked geometry needs to stay stable.
+        self.substeps = if dynamic_bodies > HEAVY_BODY_THRESHOLD {
+            SUBSTEPS_HEAVY
+        } else {
+            SUBSTEPS
+        };
         let want = desired_worker_count(dynamic_bodies);
         if want != self.worker_count {
             self.recreate_world(want);
@@ -490,21 +707,18 @@ impl PhysicsMirror {
                 if !object.visible {
                     continue;
                 }
-                // empties and lights are markers: pickable while editing
-                // (static mirror), but never collide or simulate
-                if matches!(
-                    object.primitive,
-                    Primitive::Empty { .. } | Primitive::Light { .. }
-                ) {
+                // empties, lights and cameras are markers: pickable while
+                // editing (static mirror), but never collide or simulate
+                if object.primitive.is_gizmo() {
                     continue;
                 }
-                // ropes get their own multi-body chain below
-                if object.primitive.is_rope() {
+                // ropes / cloth get their own multi-body chains below
+                if object.primitive.is_soft_sim() {
                     continue;
                 }
                 let world = worlds.get(&object.id).copied().unwrap_or(object.transform);
-                let key = ShapeKey::of(object, world.scale);
-                let entry = self.create_entry(object, &world, key, true);
+                let key = ShapeKey::of(scene, object, world.scale);
+                let entry = self.create_entry(scene, object, &world, key, true);
                 if ffi::b3Body_GetType(entry.body) == ffi::b3BodyType_b3_dynamicBody {
                     // one-shot world-space impulse at play (N·s); zero is a no-op
                     if object.initial_force.length_squared() > 1e-12 {
@@ -525,6 +739,15 @@ impl PhysicsMirror {
                 }
                 if let Some(rope) = self.build_rope(scene, object) {
                     self.ropes.insert(object.id, rope);
+                }
+            }
+            // pass 3: cloth grids
+            for object in scene.objects() {
+                if !object.visible || !object.primitive.is_cloth() {
+                    continue;
+                }
+                if let Some(cloth) = self.build_cloth(scene, object) {
+                    self.cloths.insert(object.id, cloth);
                 }
             }
         }
@@ -706,6 +929,304 @@ impl PhysicsMirror {
         })
     }
 
+    /// Cloth: grid of light spheres with structural + shear distance joints,
+    /// pins from `cloth_anchors` to attach targets.
+    unsafe fn build_cloth(
+        &self,
+        scene: &Scene,
+        object: &modeler_core::Object,
+    ) -> Option<ClothSim> {
+        let Primitive::Cloth {
+            width,
+            height,
+            segments_u,
+            segments_v,
+            stiffness,
+        } = object.primitive
+        else {
+            return None;
+        };
+        let width = width.max(0.05);
+        let height = height.max(0.05);
+        let su = segments_u.clamp(1, 24);
+        let sv = segments_v.clamp(1, 24);
+        // 0 = soft drape, 1 = near-rigid
+        let stiff = stiffness.clamp(0.0, 1.0);
+        let nu = (su + 1) as usize;
+        let nv = (sv + 1) as usize;
+        let n_nodes = nu * nv;
+        let world = scene.world_transform(object.id);
+
+        let mut positions = Vec::with_capacity(n_nodes);
+        for v in 0..=sv {
+            for u in 0..=su {
+                let local =
+                    modeler_core::mesh::cloth_vertex_local(width, height, su, sv, u, v);
+                positions.push(world.transform_point(local));
+            }
+        }
+
+        // Collision radius ~ half cell so neighboring spheres nearly touch at
+        // rest. Tiny radii left large gaps so the visual mesh cut through
+        // solid corners between sparse particle contacts.
+        let cell = (width / su as f32)
+            .min(height / sv as f32)
+            .max(0.02);
+        let radius = (0.42 * cell).clamp(0.02, 0.2);
+
+        let mut shape_def = ffi::b3DefaultShapeDef();
+        shape_def.userData = object.id.0 as usize as *mut c_void;
+        // Negative group index: all shapes on this cloth never collide with
+        // each other (spheres/capsules), but still hit the world.
+        shape_def.filter.groupIndex = -(object.id.0 as i32).saturating_add(1).max(1);
+
+        // Softer cloth = lighter nodes so gravity folds the sheet more
+        let node_density = 1.5 + 4.0 * stiff;
+        let lin_damp = 0.15 + 0.35 * stiff;
+
+        let mut bodies = Vec::with_capacity(n_nodes + object.cloth_anchors.len());
+        for pos in &positions {
+            let mut body_def = ffi::b3DefaultBodyDef();
+            body_def.type_ = ffi::b3BodyType_b3_dynamicBody;
+            body_def.position = bvec(*pos);
+            body_def.linearDamping = lin_damp;
+            body_def.angularDamping = 0.5 + 0.5 * stiff;
+            body_def.enableSleep = false;
+            let body = ffi::b3CreateBody(self.world, &body_def);
+            let sphere = ffi::b3Sphere {
+                center: bvec(Vec3::ZERO),
+                radius,
+            };
+            let mut node_shape = shape_def;
+            node_shape.baseMaterial.restitution = 0.0;
+            node_shape.baseMaterial.friction = 0.65;
+            // Not sensors so cloth can rest on floors/props.
+            node_shape.density = node_density;
+            node_shape.isSensor = false;
+            ffi::b3CreateSphereShape(body, &node_shape, &sphere);
+            bodies.push(body);
+        }
+
+        // Structural edge capsules (owned by body A, retargeted each step).
+        let mut edge_colliders = Vec::new();
+        let mut edge_shape_def = shape_def;
+        edge_shape_def.density = 0.0; // no mass contribution; spheres carry mass
+        edge_shape_def.baseMaterial.friction = 0.65;
+        edge_shape_def.baseMaterial.restitution = 0.0;
+        let add_edge = |bodies: &[ffi::b3BodyId],
+                        edges: &mut Vec<ClothEdgeCollider>,
+                        a: usize,
+                        b: usize| {
+            let p0 = positions[a];
+            let p1 = positions[b];
+            let mid = 0.5 * (p0 + p1);
+            // Temporary capsule in body A local space (updated before first step)
+            let la = Vec3::ZERO;
+            let lb = p1 - p0; // approximate if A is at p0 with identity rot
+            let capsule = ffi::b3Capsule {
+                center1: bvec(la),
+                center2: bvec(lb),
+                radius,
+            };
+            let _ = mid;
+            let shape = ffi::b3CreateCapsuleShape(bodies[a], &edge_shape_def, &capsule);
+            edges.push(ClothEdgeCollider {
+                shape,
+                body_a: a,
+                body_b: b,
+                radius,
+            });
+        };
+        for v in 0..=sv {
+            for u in 0..su {
+                let a = (u + v * (su + 1)) as usize;
+                let b = a + 1;
+                add_edge(&bodies, &mut edge_colliders, a, b);
+            }
+        }
+        for v in 0..sv {
+            for u in 0..=su {
+                let a = (u + v * (su + 1)) as usize;
+                let b = a + (su as usize + 1);
+                add_edge(&bodies, &mut edge_colliders, a, b);
+            }
+        }
+        // Initial capsule placement in correct local frames
+        update_cloth_edge_capsules(&bodies, &edge_colliders);
+
+        let mut joints = Vec::new();
+        let idx = |u: u32, v: u32| (u as usize) + (v as usize) * nu;
+
+        // Map stiffness → spring hertz. At 1.0 use rigid distance joints.
+        // Structural stays taut; shear/bend are softer so folds form.
+        let rigid = stiff >= 0.98;
+        let struct_hz = 2.0 + 28.0 * stiff;
+        let shear_hz = 1.0 + 14.0 * stiff;
+        let bend_hz = 0.5 + 8.0 * stiff;
+        let damp = 0.35 + 0.35 * stiff;
+        // Soft cloth: allow a little extra rest length so it can wrinkle
+        let soft = 1.0 - stiff;
+        let stretch_struct = 1.0;
+        let stretch_shear = 1.0 + 0.06 * soft;
+        let stretch_bend = 1.0 + 0.15 * soft;
+
+        let link = |bodies: &[ffi::b3BodyId],
+                        joints: &mut Vec<ffi::b3JointId>,
+                        positions: &[Vec3],
+                        a: usize,
+                        b: usize,
+                        stretch: f32,
+                        hertz: f32| {
+            let seg = (positions[b] - positions[a]).length().max(1e-3) * stretch;
+            let mut joint_def = ffi::b3DefaultDistanceJointDef();
+            joint_def.base.bodyIdA = bodies[a];
+            joint_def.base.bodyIdB = bodies[b];
+            joint_def.base.localFrameA.p = bvec(Vec3::ZERO);
+            joint_def.base.localFrameB.p = bvec(Vec3::ZERO);
+            joint_def.base.collideConnected = false;
+            joint_def.length = seg;
+            if rigid {
+                joint_def.enableSpring = false;
+                joint_def.enableLimit = false;
+            } else {
+                joint_def.enableSpring = true;
+                joint_def.hertz = hertz.max(0.25);
+                joint_def.dampingRatio = damp;
+                // Limit stretch so edges don't open wide gaps that cut solids
+                joint_def.enableLimit = true;
+                joint_def.minLength = (seg * 0.9).max(1e-3);
+                joint_def.maxLength = seg * (1.0 + 0.12 * soft + 0.03);
+            }
+            joints.push(ffi::b3CreateDistanceJoint(self.world, &joint_def));
+        };
+
+        // structural (edges)
+        for v in 0..=sv {
+            for u in 0..su {
+                link(
+                    &bodies,
+                    &mut joints,
+                    &positions,
+                    idx(u, v),
+                    idx(u + 1, v),
+                    stretch_struct,
+                    struct_hz,
+                );
+            }
+        }
+        for v in 0..sv {
+            for u in 0..=su {
+                link(
+                    &bodies,
+                    &mut joints,
+                    &positions,
+                    idx(u, v),
+                    idx(u, v + 1),
+                    stretch_struct,
+                    struct_hz,
+                );
+            }
+        }
+        // shear (diagonals)
+        for v in 0..sv {
+            for u in 0..su {
+                link(
+                    &bodies,
+                    &mut joints,
+                    &positions,
+                    idx(u, v),
+                    idx(u + 1, v + 1),
+                    stretch_shear,
+                    shear_hz,
+                );
+                link(
+                    &bodies,
+                    &mut joints,
+                    &positions,
+                    idx(u + 1, v),
+                    idx(u, v + 1),
+                    stretch_shear,
+                    shear_hz,
+                );
+            }
+        }
+        // bend (skip-one) — skip on very soft cloth for freer drape
+        if stiff > 0.08 {
+            for v in 0..=sv {
+                for u in 0..su.saturating_sub(1) {
+                    link(
+                        &bodies,
+                        &mut joints,
+                        &positions,
+                        idx(u, v),
+                        idx(u + 2, v),
+                        stretch_bend,
+                        bend_hz,
+                    );
+                }
+            }
+            for v in 0..sv.saturating_sub(1) {
+                for u in 0..=su {
+                    link(
+                        &bodies,
+                        &mut joints,
+                        &positions,
+                        idx(u, v),
+                        idx(u, v + 2),
+                        stretch_bend,
+                        bend_hz,
+                    );
+                }
+            }
+        }
+
+        // pins from anchors
+        for anchor in &object.cloth_anchors {
+            let Some(target_id) = anchor.object else {
+                continue;
+            };
+            if scene.object(target_id).is_none() {
+                continue;
+            }
+            let u = anchor.u.min(su);
+            let v = anchor.v.min(sv);
+            let node_idx = idx(u, v);
+            let world_pt = scene
+                .world_transform(target_id)
+                .transform_point(anchor.local_point);
+
+            let pin_body = if let Some(entry) = self.entries.get(&target_id) {
+                entry.body
+            } else {
+                let mut body_def = ffi::b3DefaultBodyDef();
+                body_def.position = bvec(world_pt);
+                let anchor_body = ffi::b3CreateBody(self.world, &body_def);
+                bodies.push(anchor_body);
+                anchor_body
+            };
+
+            let local_on_target = ffi::b3Body_GetLocalPoint(pin_body, bvec(world_pt));
+            let mut joint_def = ffi::b3DefaultDistanceJointDef();
+            joint_def.base.bodyIdA = pin_body;
+            joint_def.base.bodyIdB = bodies[node_idx];
+            joint_def.base.localFrameA.p = local_on_target;
+            joint_def.base.localFrameB.p = bvec(Vec3::ZERO);
+            joint_def.base.collideConnected = false;
+            joint_def.length = 0.005;
+            joint_def.enableSpring = false;
+            joint_def.enableLimit = false;
+            joints.push(ffi::b3CreateDistanceJoint(self.world, &joint_def));
+        }
+
+        Some(ClothSim {
+            object_id: object.id,
+            bodies,
+            node_count: n_nodes,
+            joints,
+            edge_colliders,
+        })
+    }
+
     pub fn pause(&mut self) {
         if self.sim == SimState::Playing {
             self.sim = SimState::Paused;
@@ -737,18 +1258,25 @@ impl PhysicsMirror {
                 }
             }
         }
-        // Drop the live draped polyline and force a mesh rebuild. Without a
+        // Drop live draped soft-body meshes and force a mesh rebuild. Without a
         // mesh_revision bump the render cache keeps the last sim frame's
-        // rope shape parked at the restored transform — ends in the wrong place.
-        let rope_ids: Vec<ObjectId> = scene
+        // shape parked at the restored transform.
+        let soft_ids: Vec<ObjectId> = scene
             .objects()
             .iter()
-            .filter(|o| o.primitive.is_rope())
+            .filter(|o| o.primitive.is_soft_sim())
             .map(|o| o.id)
             .collect();
-        for id in rope_ids {
+        for id in soft_ids {
             if let Some(object) = scene.object_mut(id) {
+                let mut dirty = false;
                 if object.rope_nodes.take().is_some() {
+                    dirty = true;
+                }
+                if object.cloth_nodes.take().is_some() {
+                    dirty = true;
+                }
+                if dirty {
                     object.mesh_revision = object.mesh_revision.wrapping_add(1);
                 }
             }
@@ -772,13 +1300,30 @@ impl PhysicsMirror {
             return;
         }
         self.accumulator = (self.accumulator + frame_dt).min(0.25);
-        let mut stepped = false;
-        while self.accumulator >= FIXED_DT {
-            unsafe { ffi::b3World_Step(self.world, FIXED_DT, SUBSTEPS) };
+        let wanted = (self.accumulator / FIXED_DT).floor() as u32;
+        let steps = wanted.min(MAX_STEPS_PER_FRAME);
+        for _ in 0..steps {
+            // Keep structural edge capsules spanning current node pairs so
+            // the cloth mesh cannot tunnel through object corners.
+            unsafe {
+                for cloth in self.cloths.values() {
+                    update_cloth_edge_capsules(&cloth.bodies, &cloth.edge_colliders);
+                }
+            }
+            unsafe { ffi::b3World_Step(self.world, FIXED_DT, self.substeps) };
             self.accumulator -= FIXED_DT;
-            stepped = true;
         }
-        if !stepped {
+        // Drop the surplus instead of banking it: a scene too slow to keep up
+        // stays in slow motion rather than spiralling into 14 steps per frame.
+        if wanted > steps {
+            self.accumulator = self.accumulator.min(FIXED_DT);
+            // exponential smoothing so the footer reading does not flicker
+            let ratio = steps as f32 / wanted as f32;
+            self.slow_motion += 0.2 * (ratio - self.slow_motion);
+        } else {
+            self.slow_motion += 0.2 * (1.0 - self.slow_motion);
+        }
+        if steps == 0 {
             return;
         }
         // read every body first (scale comes from the scene), THEN write in
@@ -832,6 +1377,37 @@ impl PhysicsMirror {
             if let Some(object) = scene.object_mut(id) {
                 object.rope_nodes = Some(nodes);
                 // bump so the renderer rebuilds the draped mesh
+                object.mesh_revision = object.mesh_revision.wrapping_add(1);
+            }
+        }
+
+        // cloth: same origin-at-first-node trick for the draped grid
+        let mut cloth_updates: Vec<(ObjectId, Vec3, Vec<Vec3>)> = Vec::new();
+        unsafe {
+            for cloth in self.cloths.values() {
+                let mut nodes = Vec::with_capacity(cloth.node_count);
+                for body in cloth.bodies.iter().take(cloth.node_count) {
+                    let p = ffi::b3Body_GetPosition(*body);
+                    nodes.push(Vec3::new(p.x, p.y, p.z));
+                }
+                if nodes.is_empty() {
+                    continue;
+                }
+                let origin = nodes[0];
+                cloth_updates.push((cloth.object_id, origin, nodes));
+            }
+        }
+        for (id, origin, nodes) in cloth_updates {
+            scene.set_world_transform(
+                id,
+                Transform {
+                    location: origin,
+                    rotation: Quat::IDENTITY,
+                    scale: Vec3::ONE,
+                },
+            );
+            if let Some(object) = scene.object_mut(id) {
+                object.cloth_nodes = Some(nodes);
                 object.mesh_revision = object.mesh_revision.wrapping_add(1);
             }
         }
@@ -1101,14 +1677,15 @@ impl PhysicsMirror {
 
         let selected = selection.selected().to_vec();
         // selection roots: selected objects whose parent is not selected —
-        // children follow their root through the hierarchy
+        // children follow their root through the hierarchy. Locked objects
+        // stay put (End / Drop to floor).
         let roots: Vec<ObjectId> = selected
             .iter()
             .copied()
             .filter(|&id| {
-                scene
-                    .object(id)
-                    .is_some_and(|o| o.parent.map_or(true, |p| !selected.contains(&p)))
+                scene.object(id).is_some_and(|o| {
+                    !o.locked && o.parent.map_or(true, |p| !selected.contains(&p))
+                })
             })
             .collect();
         // the rays ignore every moving object, subtrees included
@@ -1259,6 +1836,172 @@ mod tests {
         // cube (half size 1) should rest on the ground plane at z = 0
         let z = scene.object(id).unwrap().transform.location.z;
         assert!((z - 1.0).abs() < 0.05, "cube should rest at z=1, got {z}");
+    }
+
+    /// Drop a cube and report the highest point it reaches after its first
+    /// contact with the ground (0 if it never leaves the floor).
+    fn rebound_height(bounciness: f32, floor_bounciness: f32) -> f32 {
+        let (mut scene, id) = scene_with_dynamic_cube_at(4.0);
+        scene.object_mut(id).unwrap().bounciness = bounciness;
+        // static slab to land on, its own top at z = 0 like the ground plane
+        let mut t = Transform::default();
+        t.location = Vec3::new(0.0, 0.0, -1.0);
+        t.scale = Vec3::new(10.0, 10.0, 1.0);
+        let floor = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        scene.object_mut(floor).unwrap().bounciness = floor_bounciness;
+
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        let mut landed = false;
+        let mut peak = 0.0_f32;
+        for _ in 0..600 {
+            physics.update(&mut scene, FIXED_DT);
+            let z = scene.object(id).unwrap().transform.location.z;
+            // resting height is 1 (half of a 2 m cube)
+            if z < 1.1 {
+                landed = true;
+            } else if landed {
+                peak = peak.max(z - 1.0);
+            }
+        }
+        assert!(landed, "cube never reached the floor");
+        peak
+    }
+
+    #[test]
+    fn bouncy_object_rebounds_and_dead_one_does_not() {
+        let _guard = ffi_lock();
+        let dead = rebound_height(0.0, 0.0);
+        let bouncy = rebound_height(0.85, 0.0);
+        assert!(dead < 0.05, "a bounciness-0 cube should thud, rose {dead}");
+        assert!(
+            bouncy > 0.5,
+            "a bounciness-0.85 cube should rebound, rose {bouncy}"
+        );
+    }
+
+    #[test]
+    fn bouncy_floor_bounces_a_dead_object() {
+        // contacts take the higher of the two values, so bounciness on a
+        // STATIC floor is enough — this is what the Physics panel promises
+        let _guard = ffi_lock();
+        let on_bouncy_floor = rebound_height(0.0, 0.85);
+        assert!(
+            on_bouncy_floor > 0.5,
+            "a bouncy floor should throw a dead cube back up, rose {on_bouncy_floor}"
+        );
+    }
+
+    #[test]
+    fn bounciness_edit_retunes_the_static_mirror_without_rebuild() {
+        let _guard = ffi_lock();
+        let (mut scene, id) = scene_with_dynamic_cube_at(3.0);
+        let mut physics = PhysicsMirror::new();
+        physics.sync(&scene);
+        let body = physics.entries[&id].body;
+        let body_ident = (body.index1, body.world0, body.generation);
+        scene.object_mut(id).unwrap().bounciness = 0.7;
+        physics.sync(&scene);
+        let entry = &physics.entries[&id];
+        assert_eq!(entry.bounciness, 0.7);
+        assert!(
+            unsafe { ffi::b3Body_IsValid(body) }
+                && (entry.body.index1, entry.body.world0, entry.body.generation) == body_ident,
+            "changing bounciness must not rebuild the body"
+        );
+        let mut shape = [unsafe { std::mem::zeroed::<ffi::b3ShapeId>() }];
+        let got = unsafe { ffi::b3Body_GetShapes(entry.body, shape.as_mut_ptr(), 1) };
+        assert_eq!(got, 1);
+        let r = unsafe { ffi::b3Shape_GetRestitution(shape[0]) };
+        assert!((r - 0.7).abs() < 1e-6, "shape restitution not applied: {r}");
+    }
+
+    /// Plate at z = 2 with an optional boolean hole punched through it, and
+    /// a ball dropped from z = 5 straight down the middle. Returns the ball's
+    /// resting height.
+    fn drop_ball_onto_plate(punch_hole: bool) -> f32 {
+        let mut scene = Scene::new();
+        // 6 x 6 x 0.4 m plate, static
+        let mut t = Transform::default();
+        t.location = Vec3::new(0.0, 0.0, 2.0);
+        t.scale = Vec3::new(3.0, 3.0, 0.2);
+        let plate = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+
+        if punch_hole {
+            // 2 m cutter through the plate's middle
+            let mut t = Transform::default();
+            t.location = Vec3::new(0.0, 0.0, 2.0);
+            let cutter = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+            crate::modifiers::add_boolean(
+                &mut scene,
+                plate,
+                &[cutter],
+                modeler_core::BooleanOp::Subtract,
+            )
+            .expect("boolean added");
+        }
+
+        let mut t = Transform::default();
+        t.location = Vec3::new(0.0, 0.0, 5.0);
+        t.scale = Vec3::splat(0.3); // 0.3 m radius — fits the 2 m hole
+        let ball = scene.add_object(Primitive::UvSphere { segments: 16, rings: 8, radius: 1.0 }, t);
+        scene.object_mut(ball).unwrap().dynamic = true;
+
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        for _ in 0..420 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+        scene.object(ball).unwrap().transform.location.z
+    }
+
+    #[test]
+    fn a_ball_falls_through_a_boolean_hole() {
+        let _guard = ffi_lock();
+        // solid plate: the ball lands on top (plate top 2.2 + radius 0.3)
+        let on_plate = drop_ball_onto_plate(false);
+        assert!(
+            (on_plate - 2.5).abs() < 0.1,
+            "ball should rest on the solid plate at z≈2.5, got {on_plate}"
+        );
+        // same plate with a hole cut through it: the ball drops to the ground
+        let through = drop_ball_onto_plate(true);
+        assert!(
+            (through - 0.3).abs() < 0.1,
+            "ball should fall through the hole to the ground at z≈0.3, got {through}"
+        );
+    }
+
+    #[test]
+    fn a_boolean_hole_is_not_pickable() {
+        // the static mirror is also what viewport clicks ray-cast against
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        let mut t = Transform::default();
+        t.scale = Vec3::new(3.0, 3.0, 0.2);
+        let plate = scene.add_object(Primitive::Cube { size: 2.0 }, t);
+        let cutter = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        crate::modifiers::add_boolean(
+            &mut scene,
+            plate,
+            &[cutter],
+            modeler_core::BooleanOp::Subtract,
+        )
+        .expect("boolean added");
+
+        let mut physics = PhysicsMirror::new();
+        physics.sync(&scene);
+        let down = Vec3::new(0.0, 0.0, -1.0);
+        assert_eq!(
+            physics.pick(Vec3::new(0.0, 0.0, 5.0), down),
+            None,
+            "a ray down the hole must miss the plate"
+        );
+        assert_eq!(
+            physics.pick(Vec3::new(2.0, 2.0, 5.0), down),
+            Some(plate),
+            "a ray onto solid material must still hit the plate"
+        );
     }
 
     #[test]
@@ -1853,6 +2596,389 @@ mod tests {
                  (workers: {})",
                 desired_worker_count(count)
             );
+        }
+    }
+
+    /// Per-frame cost breakdown for a REAL saved scene (default: the
+    /// 7.6k-brick house). Ignored by default:
+    ///
+    ///   cargo test --release -p modeler-app -- --ignored --nocapture perf_scene_file
+    ///
+    /// Override the file with `BEE3D_PERF_SCENE=/path/to/scene.bee3d`.
+    #[test]
+    #[ignore = "perf probe on a saved scene: run in --release with --nocapture"]
+    fn perf_scene_file() {
+        let _guard = ffi_lock();
+        use std::time::Instant;
+
+        let path = std::env::var("BEE3D_PERF_SCENE")
+            .unwrap_or_else(|_| "/home/bart/Documents/3dmodels/house-test8.bee3d".to_string());
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            println!("skip: cannot read {path}");
+            return;
+        };
+        let t0 = Instant::now();
+        let data = Scene::from_json(&json).expect("scene parses");
+        let parse = t0.elapsed();
+        let mut scene = Scene::new();
+        let t0 = Instant::now();
+        scene.restore(&data);
+        let restore = t0.elapsed();
+
+        let total = scene.objects().len();
+        let dynamic = scene.objects().iter().filter(|o| o.visible && o.dynamic).count();
+        println!("scene {path}");
+        println!("  objects {total}, dynamic {dynamic}");
+        println!("  json parse {parse:.2?}, restore {restore:.2?}");
+
+        // --- edit-mode mirror ------------------------------------------
+        let mut physics = PhysicsMirror::new();
+        let t0 = Instant::now();
+        physics.sync(&scene);
+        println!("  static mirror build            {:>12.2?}", t0.elapsed());
+
+        // --- play ------------------------------------------------------
+        let t0 = Instant::now();
+        physics.play(&scene);
+        println!(
+            "  play() build_simulation        {:>12.2?}  (workers {})",
+            t0.elapsed(),
+            desired_worker_count(dynamic)
+        );
+
+        // --- steady-state frame, split into solver vs scene write-back --
+        const STEPS: u32 = 60;
+        let mut solver = std::time::Duration::ZERO;
+        let mut wt = std::time::Duration::ZERO;
+        let mut write = std::time::Duration::ZERO;
+        for _ in 0..STEPS {
+            let t0 = Instant::now();
+            unsafe { ffi::b3World_Step(physics.world, FIXED_DT, SUBSTEPS) };
+            solver += t0.elapsed();
+
+            let t0 = Instant::now();
+            let worlds = scene.world_transforms();
+            wt += t0.elapsed();
+
+            let t0 = Instant::now();
+            let mut updates: Vec<(ObjectId, Transform)> =
+                Vec::with_capacity(physics.sim_order.len());
+            unsafe {
+                for id in &physics.sim_order {
+                    let Some(entry) = physics.entries.get(id) else { continue };
+                    let t = ffi::b3Body_GetTransform(entry.body);
+                    let mut world = worlds.get(id).copied().unwrap_or_default();
+                    world.location = Vec3::new(t.p.x, t.p.y, t.p.z);
+                    world.rotation = Quat::from_xyzw(t.q.v.x, t.q.v.y, t.q.v.z, t.q.s);
+                    updates.push((*id, world));
+                }
+            }
+            for (id, world) in updates {
+                scene.set_world_transform(id, world);
+            }
+            write += t0.elapsed();
+        }
+        println!("  per frame, b3World_Step        {:>12.2?}", solver / STEPS);
+        println!("  per frame, world_transforms()  {:>12.2?}", wt / STEPS);
+        println!("  per frame, scene write-back    {:>12.2?}", write / STEPS);
+
+        // --- renderer CPU proxy (what SceneRender::sync does per frame) --
+        let ids: Vec<ObjectId> = scene.objects().iter().map(|o| o.id).collect();
+        let t0 = Instant::now();
+        let mut sink = 0.0f32;
+        for &id in &ids {
+            // instance_key() and instance_color() each resolve the material
+            let a = scene.object_material_for_render(id).unwrap_or_default();
+            let b = scene.object_material_for_render(id).unwrap_or_default();
+            sink += a.roughness + b.metallic;
+        }
+        println!(
+            "  per frame, 2x material resolve {:>12.2?}  (sink {sink:.1})",
+            t0.elapsed()
+        );
+
+        // instance signature hashing: id + 16 matrix floats + color per member
+        let worlds = scene.world_transforms();
+        let t0 = Instant::now();
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            for &id in &ids {
+                id.0.hash(&mut h);
+                let w = worlds.get(&id).copied().unwrap_or_default();
+                for f in [
+                    w.location.x, w.location.y, w.location.z,
+                    w.rotation.x, w.rotation.y, w.rotation.z, w.rotation.w,
+                    w.scale.x, w.scale.y, w.scale.z,
+                ] {
+                    f.to_bits().hash(&mut h);
+                }
+            }
+            println!(
+                "  per frame, instance sig hash   {:>12.2?}  (h {})",
+                t0.elapsed(),
+                h.finish() % 10
+            );
+        }
+
+        unsafe {
+            let c = ffi::b3World_GetCounters(physics.world);
+            println!(
+                "  counters: bodies {} shapes {} contacts {} awake-contacts {} islands {} \
+                 tree-h {} sat-calls {}",
+                c.bodyCount, c.shapeCount, c.contactCount, c.awakeContactCount,
+                c.islandCount, c.treeHeight, c.satCallCount
+            );
+            let p = ffi::b3World_GetProfile(physics.world);
+            println!(
+                "  profile ms: step {:.2} pairs {:.2} collide {:.2} solve {:.2} \
+                 (setup {:.2} prepare {:.2} warmStart {:.2} solveImpulses {:.2} \
+                 relax {:.2} restitution {:.2} store {:.2}) refit {:.2} bullets {:.2} \
+                 sleep {:.2} transforms {:.2}",
+                p.step, p.pairs, p.collide, p.solve, p.solverSetup, p.prepareConstraints,
+                p.warmStart, p.solveImpulses, p.relaxImpulses, p.applyRestitution,
+                p.storeImpulses, p.refit, p.bullets, p.sleepIslands, p.transforms
+            );
+        }
+
+        let t0 = Instant::now();
+        physics.stop(&mut scene);
+        println!("  stop()                         {:>12.2?}", t0.elapsed());
+
+        // --- settling trace: does the pile ever sleep? -------------------
+        {
+            println!("  --- 600-step trace (10 s of sim) ---");
+            let mut p = PhysicsMirror::new();
+            p.play(&scene);
+            let mut awake_bodies = 0;
+            for i in 1..=600u32 {
+                let t0 = Instant::now();
+                unsafe { ffi::b3World_Step(p.world, FIXED_DT, SUBSTEPS) };
+                let dt = t0.elapsed();
+                if i % 60 == 0 {
+                    unsafe {
+                        let c = ffi::b3World_GetCounters(p.world);
+                        awake_bodies = p
+                            .entries
+                            .values()
+                            .filter(|e| ffi::b3Body_IsAwake(e.body))
+                            .count();
+                        println!(
+                            "    t={:>4.1}s step {:>8.2?} contacts {:>7} awake-contacts {:>7} \
+                             awake-bodies {:>5} islands {:>4}",
+                            i as f32 / 60.0,
+                            dt,
+                            c.contactCount,
+                            c.awakeContactCount,
+                            awake_bodies,
+                            c.islandCount
+                        );
+                    }
+                }
+            }
+            let _ = awake_bodies;
+        }
+
+        // --- only a subset dynamic (impact-local simulation) ------------
+        println!("  --- N nearest bodies dynamic, rest static (60-step avg) ---");
+        let center = Vec3::new(0.0, 0.0, 1.0);
+        let mut by_dist: Vec<(ObjectId, f32)> = scene
+            .objects()
+            .iter()
+            .map(|o| (o.id, (o.transform.location - center).length()))
+            .collect();
+        by_dist.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for n in [250usize, 1000, 2500] {
+            let mut s = Scene::new();
+            s.restore(&scene.snapshot());
+            let keep: HashSet<ObjectId> =
+                by_dist.iter().take(n).map(|(id, _)| *id).collect();
+            let ids: Vec<ObjectId> = s.objects().iter().map(|o| o.id).collect();
+            for id in ids {
+                if let Some(o) = s.object_mut(id) {
+                    o.dynamic = keep.contains(&id);
+                }
+            }
+            let mut p = PhysicsMirror::new();
+            p.play(&s);
+            let mut solver = std::time::Duration::ZERO;
+            for _ in 0..STEPS {
+                let t0 = Instant::now();
+                unsafe { ffi::b3World_Step(p.world, FIXED_DT, SUBSTEPS) };
+                solver += t0.elapsed();
+            }
+            unsafe {
+                let c = ffi::b3World_GetCounters(p.world);
+                println!(
+                    "    {n:>5} dynamic: {:>9.2?}/step, contacts {:>7}, awake-contacts {:>7}",
+                    solver / STEPS,
+                    c.contactCount,
+                    c.awakeContactCount
+                );
+            }
+        }
+
+        // --- A/B: worker count x substeps ------------------------------
+        println!("  --- solver-only A/B (60 steps each, fresh play) ---");
+        for workers in [0u32, 4, 8, 16] {
+            for substeps in [1i32, 2, 4] {
+                let mut p = PhysicsMirror::new();
+                p.recreate_world(workers); // real world uses `workers`
+                // build_simulation only recreates when the count differs, so
+                // report the count it wants and keep the world we just made
+                p.worker_count = desired_worker_count(dynamic);
+                p.play(&scene);
+                let mut solver = std::time::Duration::ZERO;
+                for _ in 0..STEPS {
+                    let t0 = Instant::now();
+                    unsafe { ffi::b3World_Step(p.world, FIXED_DT, substeps) };
+                    solver += t0.elapsed();
+                }
+                println!(
+                    "    workers {workers:>2}, substeps {substeps}: {:>10.2?}/step",
+                    solver / STEPS
+                );
+            }
+        }
+    }
+
+    /// Emulate the real frame loop: feed `update()` the wall-clock time the
+    /// previous frame actually took, and report how many fixed steps it runs
+    /// per frame (the accumulator catch-up), the frame time and the ratio of
+    /// simulated time to real time.
+    #[test]
+    #[ignore = "perf probe: run in --release with --nocapture"]
+    fn perf_frame_loop() {
+        let _guard = ffi_lock();
+        use std::time::Instant;
+        let path = std::env::var("BEE3D_PERF_SCENE")
+            .unwrap_or_else(|_| "/home/bart/Documents/3dmodels/house-test8.bee3d".to_string());
+        let Ok(json) = std::fs::read_to_string(&path) else { return };
+        let data = Scene::from_json(&json).expect("scene parses");
+        let mut scene = Scene::new();
+        scene.restore(&data);
+
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        let mut frame_dt = 1.0 / 60.0f32; // first frame: assume vsync
+        let mut sim_time = 0.0f32;
+        let mut real_time = 0.0f32;
+        for frame in 1..=25u32 {
+            let before = physics.accumulator;
+            let t0 = Instant::now();
+            physics.update(&mut scene, frame_dt);
+            let elapsed = t0.elapsed().as_secs_f32();
+            let steps = (((before + frame_dt.min(0.25)).min(0.25) / FIXED_DT).floor() as u32)
+                .min(MAX_STEPS_PER_FRAME);
+            sim_time += steps as f32 * FIXED_DT;
+            real_time += elapsed;
+            println!(
+                "  frame {frame:>3}: dt in {:>7.1} ms -> {steps:>2} steps, \
+                 physics {:>7.1} ms  ({:>4.1} fps)",
+                frame_dt * 1000.0,
+                elapsed * 1000.0,
+                1.0 / elapsed
+            );
+            frame_dt = elapsed; // next frame gets this frame's real duration
+        }
+        println!(
+            "  => sim advanced {sim_time:.2} s in {real_time:.2} s of wall clock \
+             ({:.2}x real time)",
+            sim_time / real_time
+        );
+        physics.stop(&mut scene);
+    }
+
+    #[test]
+    #[ignore = "perf probe: run in --release with --nocapture"]
+    fn perf_sleep_probe() {
+        let _guard = ffi_lock();
+        use std::time::Instant;
+        let path = std::env::var("BEE3D_PERF_SCENE")
+            .unwrap_or_else(|_| "/home/bart/Documents/3dmodels/house-test8.bee3d".to_string());
+        let Ok(json) = std::fs::read_to_string(&path) else { return };
+        let data = Scene::from_json(&json).expect("scene parses");
+        let mut scene = Scene::new();
+        scene.restore(&data);
+
+        // one config per process: box3d world slots and chaotic divergence
+        // make back-to-back configs in one process unreliable
+        let thresh: f32 = std::env::var("BEE3D_SLEEP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        {
+            let label = format!("sleepThreshold {thresh}");
+            let mut p = PhysicsMirror::new();
+            p.play(&scene);
+            if thresh > 0.0 {
+                unsafe {
+                    for e in p.entries.values() {
+                        ffi::b3Body_SetSleepThreshold(e.body, thresh);
+                    }
+                }
+            }
+            // optional: park every body that was not kicked at play, so only
+            // the struck region simulates (contact wakes the neighbours)
+            if std::env::var("BEE3D_START_ASLEEP").is_ok() {
+                unsafe {
+                    for (id, e) in p.entries.iter() {
+                        let kicked = scene
+                            .object(*id)
+                            .is_some_and(|o| o.initial_force.length_squared() > 1e-12);
+                        if !kicked {
+                            ffi::b3Body_SetAwake(e.body, false);
+                        }
+                    }
+                }
+            }
+            let steps: u32 = std::env::var("BEE3D_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600);
+            let quiet = std::env::var("BEE3D_QUIET").is_ok();
+            let mut last = std::time::Duration::ZERO;
+            let mut all = std::time::Duration::ZERO;
+            for i in 0..steps {
+                let t0 = Instant::now();
+                unsafe { ffi::b3World_Step(p.world, FIXED_DT, SUBSTEPS) };
+                all += t0.elapsed();
+                if i + 60 >= steps {
+                    last += t0.elapsed();
+                }
+                if !quiet && (i + 1) % 30 == 0 {
+                    unsafe {
+                        let awake = p
+                            .entries
+                            .values()
+                            .filter(|e| ffi::b3Body_IsAwake(e.body))
+                            .count();
+                        println!(
+                            "    t={:>4.2}s awake {awake:>5}  step {:>9.2?}",
+                            (i + 1) as f32 / 60.0,
+                            t0.elapsed()
+                        );
+                    }
+                }
+            }
+            unsafe {
+                let awake = p.entries.values().filter(|e| ffi::b3Body_IsAwake(e.body)).count();
+                let dynamic_bodies = p
+                    .entries
+                    .values()
+                    .filter(|e| ffi::b3Body_GetType(e.body) == ffi::b3BodyType_b3_dynamicBody)
+                    .count();
+                let c = ffi::b3World_GetCounters(p.world);
+                println!(
+                    "{label:>24}: all {:>9.2?}/step  last60 {:>9.2?}/step  \
+                     awake {awake:>5}/{dynamic_bodies}  contacts {:>7} awake-contacts {:>7}",
+                    all / steps,
+                    last / 60,
+                    c.contactCount,
+                    c.awakeContactCount
+                );
+            }
         }
     }
 

@@ -426,7 +426,7 @@ fn valid_attach_target(scene: &Scene, rope_id: ObjectId, target: ObjectId) -> bo
         return false;
     }
     // lights never simulate; ropes would create pin cycles
-    if object.primitive.is_light() || object.primitive.is_rope() {
+    if object.primitive.is_gizmo() || object.primitive.is_soft_sim() {
         return false;
     }
     true

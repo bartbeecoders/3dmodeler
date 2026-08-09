@@ -9,12 +9,66 @@ use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::{EulerRot, Quat, Vec2, Vec3};
 use modeler_core::{
-    library, Library, LibraryAsset, ObjectId, Primitive, Scene, Transform, WallCutout,
+    library, Library, LibraryAsset, Material, MaterialTextures, ObjectId, Primitive, Scene,
+    Transform, WallCutout,
 };
 use serde_json::{json, Value};
 
+/// Load a local PBR collection entry by id (`ambientcg:Grass005`) or display name.
+fn load_local_pbr(material_ref: &str) -> Result<(Material, String), String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        id: String,
+        name: String,
+        #[serde(default)]
+        textures: MaterialTextures,
+        #[serde(default)]
+        base_color: Option<[f32; 3]>,
+        #[serde(default)]
+        roughness: Option<f32>,
+        #[serde(default)]
+        metallic: Option<f32>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct Collection {
+        #[serde(default)]
+        entries: Vec<Entry>,
+    }
+    let path = dirs::config_dir()
+        .ok_or_else(|| "no config dir".to_string())?
+        .join("box3d-modeler")
+        .join("pbr")
+        .join("collection.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let coll: Collection =
+        serde_json::from_str(&text).map_err(|e| format!("parse collection: {e}"))?;
+    let entry = coll
+        .entries
+        .into_iter()
+        .find(|e| e.id == material_ref || e.name.eq_ignore_ascii_case(material_ref))
+        .ok_or_else(|| {
+            format!("no local PBR material '{material_ref}' (use list_pbr to see names)")
+        })?;
+    if entry.textures.is_empty() {
+        return Err(format!("material '{}' has no texture maps", entry.name));
+    }
+    let mut mat = Material::default();
+    if let Some(c) = entry.base_color {
+        mat.base_color = c;
+    }
+    if let Some(r) = entry.roughness {
+        mat.roughness = r;
+    }
+    if let Some(m) = entry.metallic {
+        mat.metallic = m;
+    }
+    mat.textures = entry.textures;
+    Ok((mat, entry.name))
+}
+
 /// Resolve an object reference: numeric id or (unique) name.
-fn resolve(scene: &Scene, reference: &Value) -> Result<ObjectId, String> {
+pub fn resolve(scene: &Scene, reference: &Value) -> Result<ObjectId, String> {
     if let Some(n) = reference.as_u64() {
         let id = ObjectId(n);
         return scene
@@ -96,6 +150,7 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         "anchor": [object.anchor.x, object.anchor.y, object.anchor.z],
         "group": object.group,
         "visible": object.visible,
+        "locked": object.locked,
         "smooth": object.smooth,
         "subdivision": object.subdivision_only_levels().unwrap_or(0),
         "modifiers": modifiers,
@@ -106,6 +161,7 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             object.initial_force.y,
             object.initial_force.z
         ],
+        "bounciness": object.bounciness,
         "color": object.material.base_color,
         "show_label": object.show_label,
         "show_dimensions": object.show_dimensions,
@@ -120,6 +176,18 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             "intensity": intensity,
             "spot_angle_deg": spot_angle_deg,
             "shadows": shadows,
+        });
+    }
+    if let modeler_core::Primitive::Camera {
+        fov_deg,
+        clip_start,
+        clip_end,
+    } = object.primitive
+    {
+        json["camera"] = json!({
+            "fov_deg": fov_deg,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
         });
     }
     if matches!(object.primitive, modeler_core::Primitive::Wall { .. }) {
@@ -144,6 +212,23 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
         };
         json["rope_start"] = end_json(object.rope_start);
         json["rope_end"] = end_json(object.rope_end);
+    }
+    if object.primitive.is_cloth() {
+        json["cloth_anchors"] = Value::Array(
+            object
+                .cloth_anchors
+                .iter()
+                .map(|a| {
+                    json!({
+                        "u": a.u,
+                        "v": a.v,
+                        "object": a.object.map(|id| id.0),
+                        "object_name": a.object.and_then(|id| scene.object(id).map(|o| o.name.clone())),
+                        "local_point": [a.local_point.x, a.local_point.y, a.local_point.z],
+                    })
+                })
+                .collect(),
+        );
     }
     json
 }
@@ -174,9 +259,17 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
             radius: 0.03,
             segments: 12,
         }),
+        "cloth" => Some(Primitive::Cloth {
+            width: 2.0,
+            height: 2.0,
+            segments_u: 8,
+            segments_v: 8,
+            stiffness: 0.25,
+        }),
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
         "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
+        "camera" => Some(Primitive::default_camera()),
         _ => None,
     }
 }
@@ -231,6 +324,7 @@ fn apply_object_params(
         Some(v) => Some(vec3_from(v).ok_or("rope_end_point must be [x, y, z]")?),
         None => None,
     };
+    let cloth_anchors_ref = params.get("cloth_anchors").cloned();
 
     {
         let object = scene.object_mut(id).ok_or("object vanished")?;
@@ -290,9 +384,69 @@ fn apply_object_params(
                 };
             }
         }
+        // cloth parameters
+        if let Primitive::Cloth {
+            width,
+            height,
+            segments_u,
+            segments_v,
+            stiffness,
+        } = object.primitive
+        {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let w = get("width");
+            let h = get("height");
+            let st = get("stiffness");
+            let su = params
+                .get("segments_u")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            let sv = params
+                .get("segments_v")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            if w.is_some() || h.is_some() || su.is_some() || sv.is_some() || st.is_some() {
+                let new_su = su.unwrap_or(segments_u).clamp(1, 24);
+                let new_sv = sv.unwrap_or(segments_v).clamp(1, 24);
+                if new_su != segments_u || new_sv != segments_v {
+                    object.cloth_anchors = crate::cloth_handles::remap_cloth_anchors(
+                        &object.cloth_anchors,
+                        segments_u.max(1),
+                        segments_v.max(1),
+                        new_su,
+                        new_sv,
+                    );
+                } else {
+                    for a in &mut object.cloth_anchors {
+                        a.u = a.u.min(new_su);
+                        a.v = a.v.min(new_sv);
+                    }
+                }
+                object.primitive = Primitive::Cloth {
+                    width: w.unwrap_or(width).max(0.05),
+                    height: h.unwrap_or(height).max(0.05),
+                    segments_u: new_su,
+                    segments_v: new_sv,
+                    stiffness: st.unwrap_or(stiffness).clamp(0.0, 1.0),
+                };
+            }
+        }
         if let Some(cutouts) = cutouts {
             object.cutouts = cutouts?;
             object.mesh_revision += 1; // render/physics caches key on it
+        }
+        // locked is applied before transform so a single update can unlock
+        // and move; while locked, location/rotation/scale are rejected
+        if let Some(v) = params.get("locked").and_then(Value::as_bool) {
+            object.locked = v;
+        }
+        let wants_transform =
+            location.is_some() || rotation.is_some() || scale.is_some();
+        if wants_transform && object.locked {
+            return Err(
+                "object is locked — set locked=false first to move, rotate or scale"
+                    .into(),
+            );
         }
         if let Some(location) = location {
             object.transform.location = location?;
@@ -348,6 +502,23 @@ fn apply_object_params(
                     .and_then(Value::as_bool)
                     .unwrap_or(shadows),
             };
+        } else if let Primitive::Camera {
+            fov_deg,
+            clip_start,
+            clip_end,
+        } = object.primitive
+        {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let start = get("clip_start").unwrap_or(clip_start).max(0.001);
+            let mut end = get("clip_end").unwrap_or(clip_end).max(start + 0.01);
+            if end <= start {
+                end = start + 0.01;
+            }
+            object.primitive = Primitive::Camera {
+                fov_deg: get("fov_deg").unwrap_or(fov_deg).clamp(1.0, 170.0),
+                clip_start: start,
+                clip_end: end,
+            };
         } else if let Some(color) = color {
             let c = color?;
             object.material.base_color = [c.x, c.y, c.z];
@@ -371,6 +542,9 @@ fn apply_object_params(
         if let Some(force) = params.get("initial_force") {
             object.initial_force =
                 vec3_from(force).ok_or("initial_force must be [x, y, z]")?;
+        }
+        if let Some(v) = params.get("bounciness").and_then(Value::as_f64) {
+            object.bounciness = (v as f32).clamp(0.0, 1.0);
         }
         if let Some(v) = params.get("show_label").and_then(Value::as_bool) {
             object.show_label = v;
@@ -423,7 +597,82 @@ fn apply_object_params(
             crate::rope_handles::snap_rope_rest_pose(scene, id);
         }
     }
+
+    let is_cloth = scene
+        .object(id)
+        .map(|o| o.primitive.is_cloth())
+        .unwrap_or(false);
+    if is_cloth {
+        if let Some(v) = cloth_anchors_ref {
+            let anchors = parse_cloth_anchors(scene, id, &v)?;
+            if let Some(object) = scene.object_mut(id) {
+                object.cloth_anchors = anchors;
+            }
+            crate::cloth_handles::align_cloth_to_pins(scene, id);
+        }
+    }
     Ok(())
+}
+
+/// Parse `cloth_anchors` JSON array:
+/// `[{ "u": 0, "v": 0, "object": "Cube"|null, "local_point": [x,y,z]? }, ...]`
+fn parse_cloth_anchors(
+    scene: &Scene,
+    cloth_id: ObjectId,
+    value: &Value,
+) -> Result<Vec<modeler_core::ClothAnchor>, String> {
+    let arr = value
+        .as_array()
+        .ok_or("cloth_anchors must be an array")?;
+    let (su, sv) = match scene.object(cloth_id).map(|o| o.primitive) {
+        Some(Primitive::Cloth {
+            segments_u,
+            segments_v,
+            ..
+        }) => (segments_u.clamp(1, 24), segments_v.clamp(1, 24)),
+        _ => (8, 8),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let u = item
+            .get("u")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("cloth_anchors[{i}].u required"))? as u32;
+        let v = item
+            .get("v")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("cloth_anchors[{i}].v required"))? as u32;
+        let local_point = match item.get("local_point") {
+            Some(p) => vec3_from(p).ok_or_else(|| {
+                format!("cloth_anchors[{i}].local_point must be [x, y, z]")
+            })?,
+            None => Vec3::ZERO,
+        };
+        let object = match item.get("object") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let target = resolve(scene, v)?;
+                if target == cloth_id {
+                    return Err("cloth cannot anchor to itself".into());
+                }
+                Some(target)
+            }
+        };
+        let local_point = if object.is_some() && item.get("local_point").is_none() {
+            object
+                .and_then(|t| scene.object(t).map(|o| o.anchor))
+                .unwrap_or(Vec3::ZERO)
+        } else {
+            local_point
+        };
+        out.push(modeler_core::ClothAnchor {
+            u: u.min(su),
+            v: v.min(sv),
+            object,
+            local_point,
+        });
+    }
+    Ok(out)
 }
 
 /// Resolve a rope-end attach target: `null` / `""` = free, otherwise an
@@ -517,6 +766,20 @@ fn apply_ref_image_params(scene: &mut Scene, id: u64, params: &Value) -> Result<
     let image = scene
         .reference_image_mut(id)
         .ok_or("reference image vanished")?;
+    // locked first so one update can unlock + transform
+    if let Some(v) = params.get("locked").and_then(Value::as_bool) {
+        image.locked = v;
+    }
+    let wants_transform = location.is_some()
+        || plane.is_some()
+        || params.get("rotation_deg").is_some()
+        || params.get("width_m").is_some();
+    if wants_transform && image.locked {
+        return Err(
+            "reference image is locked — set locked=false first to move, rotate or scale"
+                .into(),
+        );
+    }
     if let Some(plane) = plane {
         image.plane = plane;
     }
@@ -566,6 +829,7 @@ fn ref_image_json(image: &modeler_core::ReferenceImage) -> Value {
         "height_m": image.height_m(),
         "opacity": image.opacity,
         "visible": image.visible,
+        "locked": image.locked,
         "flip_h": image.flip_h,
         "flip_v": image.flip_v,
         "width_px": px.map(|(w, _)| w),
@@ -824,6 +1088,49 @@ pub fn set_view(
     })
 }
 
+/// Apply the optional viewport-camera arguments of a `screenshot` command
+/// (`view` = axis preset, `frame` = fit the view) before the frame renders.
+/// Returns an error response for unknown values, `None` when applied.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn apply_view_args(
+    command: &Value,
+    camera: &mut crate::camera::BlenderCamera,
+    scene: &Scene,
+    selection: &Selection,
+) -> Option<Value> {
+    if let Some(view) = command.get("view").and_then(Value::as_str) {
+        // same yaw/pitch as the numpad presets (see camera::handle_events)
+        let (yaw, pitch) = match view.to_ascii_lowercase().as_str() {
+            "front" => (0.0, 0.0),
+            "back" => (180.0, 0.0),
+            "right" => (90.0, 0.0),
+            "left" => (-90.0, 0.0),
+            "top" => (0.0, 90.0),
+            "bottom" => (0.0, -90.0),
+            other => {
+                return Some(json!({"ok": false,
+                    "error": format!(
+                        "unknown view '{other}' (front|back|left|right|top|bottom)")}));
+            }
+        };
+        camera.set_view(yaw, pitch);
+    }
+    if let Some(frame) = command.get("frame").and_then(Value::as_str) {
+        let bounds = match frame.to_ascii_lowercase().as_str() {
+            "all" => scene.bounds(),
+            "selection" => crate::selection_bounds(scene, selection),
+            other => {
+                return Some(json!({"ok": false,
+                    "error": format!("unknown frame '{other}' (all|selection)")}));
+            }
+        };
+        if let Some((center, radius)) = bounds {
+            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+        }
+    }
+    None
+}
+
 pub fn execute(
     command: &Value,
     scene: &mut Scene,
@@ -890,7 +1197,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|light|sun|spot)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|light|sun|spot|camera)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());
@@ -1179,6 +1486,12 @@ fn execute_inner(
         "attach_object" => {
             let child = resolve(scene, &command["object"])?;
             let parent = resolve(scene, &command["to"])?;
+            if scene.object(child).is_some_and(|o| o.locked) {
+                return Err(
+                    "object is locked — set locked=false first to attach (attach moves it)"
+                        .into(),
+                );
+            }
             let at = match command.get("location").filter(|v| !v.is_null()) {
                 Some(v) => Some(vec3_from(v).ok_or("location must be [x, y, z]")?),
                 None => None,
@@ -1262,6 +1575,17 @@ fn execute_inner(
             // two points in SOURCE-IMAGE PIXELS + the real distance between
             // them; rescales the image so that span matches reality
             let id = resolve_ref_image(scene, &command["image"])?;
+            if scene
+                .reference_images()
+                .iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.locked)
+            {
+                return Err(
+                    "reference image is locked — set locked=false first to calibrate"
+                        .into(),
+                );
+            }
             let point_px = |key: &str| -> Result<(f64, f64), String> {
                 let a = command[key]
                     .as_array()
@@ -1491,6 +1815,106 @@ fn execute_inner(
                 .collect();
             Ok(json!({"placed": placed}))
         }
+        "list_pbr" => {
+            let path = dirs::config_dir()
+                .ok_or_else(|| "no config dir".to_string())?
+                .join("box3d-modeler")
+                .join("pbr")
+                .join("collection.json");
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                r#"{"entries":[]}"#.to_string()
+            });
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("parse collection: {e}"))?;
+            let entries = value
+                .get("entries")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let materials: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    let tex = e.get("textures").cloned().unwrap_or(json!({}));
+                    json!({
+                        "id": e.get("id"),
+                        "name": e.get("name"),
+                        "category": e.get("category"),
+                        "maps": tex.as_object().map(|m| {
+                            m.keys()
+                                .filter(|k| !k.starts_with("uv_"))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        }),
+                    })
+                })
+                .collect();
+            Ok(json!({"materials": materials, "count": materials.len()}))
+        }
+        "apply_pbr" => {
+            let material_ref = command
+                .get("material")
+                .and_then(|v| v.as_str())
+                .ok_or("apply_pbr requires 'material' (id or name from list_pbr)")?;
+            let (mut mat, name) = load_local_pbr(material_ref)?;
+            // uv_scale accepts a number (uniform) or [u, v]
+            match command.get("uv_scale") {
+                Some(Value::Number(n)) => {
+                    let s = n.as_f64().unwrap_or(1.0) as f32;
+                    mat.textures.uv_scale = [s, s];
+                }
+                Some(Value::Array(a)) if a.len() == 2 => {
+                    let f = |i: usize| a[i].as_f64().unwrap_or(1.0) as f32;
+                    mat.textures.uv_scale = [f(0), f(1)];
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "uv_scale must be a number or [u, v], got {other}"
+                    ))
+                }
+                None => {}
+            }
+            if let Some(r) = command.get("uv_rotation").and_then(|v| v.as_f64()) {
+                mat.textures.uv_rotation = r as f32;
+            }
+            mat = mat.clamped();
+            let mut targets: Vec<ObjectId> = Vec::new();
+            if let Some(arr) = command.get("objects").and_then(|v| v.as_array()) {
+                for r in arr {
+                    targets.push(resolve(scene, r)?);
+                }
+            } else if command.get("object").is_some() {
+                targets.push(resolve(scene, &command["object"])?);
+            } else {
+                // fall back to current selection
+                targets = selection.selected().to_vec();
+            }
+            if targets.is_empty() {
+                return Err(
+                    "apply_pbr needs 'object'/'objects' or a non-empty selection".into(),
+                );
+            }
+            let mut applied = Vec::new();
+            for id in targets {
+                if scene.object(id).is_some_and(|o| o.primitive.is_gizmo()) {
+                    continue;
+                }
+                let _ = scene.make_material_unique(id);
+                if scene.set_object_material(id, mat.clone()) {
+                    if let Some(o) = scene.object(id) {
+                        applied.push(json!({"id": o.id.0, "name": o.name}));
+                    }
+                }
+            }
+            if applied.is_empty() {
+                return Err("no objects received the material".into());
+            }
+            Ok(json!({
+                "material": name,
+                "applied": applied,
+                "uv_scale": mat.textures.uv_scale,
+                "uv_rotation": mat.textures.uv_rotation,
+            }))
+        }
         other => Err(format!(
             "unknown cmd '{other}' (get_scene, new_scene, add_object, update_object, \
              delete_object, set_parent, attach_object, group_objects, ungroup_object, \
@@ -1498,7 +1922,7 @@ fn execute_inner(
              update_reference_image, delete_reference_image, calibrate_reference_image, \
              add_image_marker, update_image_marker, delete_image_marker, \
              get_library, create_library_object, update_library_object, \
-             delete_library_object, place_library_object)"
+             delete_library_object, place_library_object, list_pbr, apply_pbr)"
         )),
     }
 }
@@ -1516,7 +1940,14 @@ pub fn encode_screenshot(pixels: &[[u8; 4]], width: u32, height: u32) -> Result<
             rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
         }
     }
-    let image = image::RgbaImage::from_raw(width, height, rgba)
+    encode_png_rgba(&rgba, width, height)
+}
+
+/// Encode a flat top-down RGBA buffer as a base64 PNG (the camera renderer
+/// in `camera_render` hands out pixels in this form already).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<String, String> {
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())
         .ok_or("pixel buffer does not match the frame size")?;
     let mut png_bytes: Vec<u8> = Vec::new();
     image
@@ -1543,6 +1974,57 @@ mod tests {
     fn tiny_png_base64() -> String {
         let pixels = vec![[255u8, 255, 255, 255]; 8 * 4];
         encode_screenshot(&pixels, 8, 4).expect("encode")
+    }
+
+    #[test]
+    fn locked_object_rejects_transform_until_unlocked() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+        let id = scene.add_object(
+            modeler_core::Primitive::Cube { size: 1.0 },
+            modeler_core::Transform::default(),
+        );
+        let name = scene.object(id).unwrap().name.clone();
+        let response = execute(
+            &json!({"cmd": "update_object", "object": name, "locked": true}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["object"]["locked"], true);
+
+        let response = execute(
+            &json!({
+                "cmd": "update_object", "object": name,
+                "location": [5.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(
+            response["error"].as_str().unwrap_or("").contains("locked"),
+            "{response}"
+        );
+        assert!((scene.object(id).unwrap().transform.location.x - 0.0).abs() < 1e-5);
+
+        let response = execute(
+            &json!({
+                "cmd": "update_object", "object": name,
+                "locked": false, "location": [5.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert!((scene.object(id).unwrap().transform.location.x - 5.0).abs() < 1e-5);
+        assert!(!scene.object(id).unwrap().locked);
     }
 
     #[test]
@@ -1711,6 +2193,53 @@ mod tests {
         assert_eq!(response["ok"], true, "{response}");
         let response = run(json!({"cmd": "get_scene"}));
         assert_eq!(response["reference_images"][0]["markers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn camera_via_control_api() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+
+        let response = execute(
+            &json!({
+                "cmd": "add_object", "primitive": "camera", "new_name": "Shot",
+                "fov_deg": 35.0, "clip_start": 0.2, "clip_end": 50.0,
+                "location": [1.0, -5.0, 2.0]
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["name"], "Shot");
+        let cam = scene.objects().iter().find(|o| o.name == "Shot").unwrap();
+        match cam.primitive {
+            Primitive::Camera {
+                fov_deg,
+                clip_start,
+                clip_end,
+            } => {
+                assert!((fov_deg - 35.0).abs() < 1e-5);
+                assert!((clip_start - 0.2).abs() < 1e-5);
+                assert!((clip_end - 50.0).abs() < 1e-5);
+            }
+            other => panic!("expected camera, got {other:?}"),
+        }
+        assert!((cam.transform.location.x - 1.0).abs() < 1e-5);
+
+        let response = execute(
+            &json!({
+                "cmd": "update_object", "object": "Shot",
+                "fov_deg": 60.0
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["object"]["camera"]["fov_deg"], 60.0);
     }
 
     #[test]
@@ -2253,5 +2782,42 @@ mod tests {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(&bytes[1..4], b"PNG");
+    }
+
+    #[test]
+    fn rgba_encoder_rejects_a_mismatched_buffer() {
+        assert!(encode_png_rgba(&[0u8; 16], 2, 2).is_ok());
+        assert!(encode_png_rgba(&[0u8; 15], 2, 2).is_err());
+    }
+
+    #[test]
+    fn screenshot_view_args_move_the_viewport_camera() {
+        let (scene, selection, ..) = setup();
+        let mut camera = crate::camera::BlenderCamera::new();
+
+        assert!(
+            apply_view_args(&json!({"view": "top"}), &mut camera, &scene, &selection).is_none()
+        );
+        assert_eq!(camera.view_name(), "Top Orthographic");
+        apply_view_args(&json!({"view": "front"}), &mut camera, &scene, &selection);
+        assert_eq!(camera.view_name(), "Front Orthographic");
+
+        // framing the default scene puts the cube in view
+        let far = camera.distance;
+        apply_view_args(&json!({"frame": "all"}), &mut camera, &scene, &selection);
+        assert!(camera.distance < far, "frame all should zoom in: {}", camera.distance);
+    }
+
+    #[test]
+    fn unknown_view_args_are_reported() {
+        let (scene, selection, ..) = setup();
+        let mut camera = crate::camera::BlenderCamera::new();
+        let error =
+            apply_view_args(&json!({"view": "sideways"}), &mut camera, &scene, &selection).unwrap();
+        assert_eq!(error["ok"], json!(false));
+        let error =
+            apply_view_args(&json!({"frame": "everything"}), &mut camera, &scene, &selection)
+                .unwrap();
+        assert_eq!(error["ok"], json!(false));
     }
 }

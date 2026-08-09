@@ -10,9 +10,15 @@
 //! Renderers key their caches on [`stamp`], which fingerprints everything
 //! the evaluated mesh depends on (including boolean tools and their
 //! placement relative to the target).
+//!
+//! Physics and ray picking follow the EVALUATED mesh, not the cage: a
+//! boolean hole is a real hole that objects fall and click through. Static
+//! bodies get an exact triangle-mesh collider; dynamic ones fall back to a
+//! convex hull (box3d has no dynamic mesh shapes). Edit mode (Tab) still
+//! works on the base mesh, like Blender.
 
 use modeler_core::{
-    boolean, MeshData, Modifier, ModifierKind, ObjectId, Primitive, Scene, Transform,
+    boolean, MeshData, Modifier, ModifierKind, ObjectId, Scene, Transform,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -139,9 +145,8 @@ fn hash_transform(h: &mut DefaultHasher, t: &Transform) {
 }
 
 fn no_volume(object: &modeler_core::Object) -> bool {
-    object.primitive.is_light()
-        || matches!(object.primitive, Primitive::Empty { .. })
-        || object.primitive.is_rope()
+    object.primitive.is_gizmo()
+        || object.primitive.is_soft_sim()
 }
 
 /// True when any object's stack references `tool` as a boolean tool.
@@ -151,6 +156,65 @@ pub fn tool_referenced(scene: &Scene, tool: ObjectId) -> bool {
             |m| matches!(m.kind, ModifierKind::Boolean { object, .. } if object == tool),
         )
     })
+}
+
+/// Assign the object under the viewport cursor as the tool of `target`'s
+/// boolean modifier at `index` (the Modifiers panel eyedropper). Like
+/// [`add_boolean`], the new tool is hidden so the cut is visible, and the
+/// previous tool — if this modifier was the only thing referencing it — is
+/// shown again. `Err` leaves everything untouched so the eyedropper can
+/// stay armed for another try.
+pub fn pick_boolean_tool(
+    scene: &mut Scene,
+    target: ObjectId,
+    index: usize,
+    hit: Option<ObjectId>,
+) -> Result<String, String> {
+    let Some(tool) = hit else {
+        return Err("no object there — click the object to cut with".to_string());
+    };
+    if tool == target {
+        return Err("an object cannot be its own boolean tool".to_string());
+    }
+    let tool_object = scene
+        .object(tool)
+        .ok_or("that object is gone".to_string())?;
+    if no_volume(tool_object) {
+        return Err(format!(
+            "'{}' has no volume to cut with",
+            tool_object.name
+        ));
+    }
+    let tool_name = tool_object.name.clone();
+
+    let previous = match scene.object(target).and_then(|o| o.modifiers.get(index)) {
+        Some(modifier) => match modifier.kind {
+            ModifierKind::Boolean { object, .. } => object,
+            _ => return Err("that modifier is not a boolean".to_string()),
+        },
+        None => return Err("that modifier is gone".to_string()),
+    };
+    if previous == tool {
+        return Ok(format!("'{tool_name}' is already the tool"));
+    }
+
+    if let Some(object) = scene.object_mut(target) {
+        if let Some(modifier) = object.modifiers.get_mut(index) {
+            if let ModifierKind::Boolean { object: slot, .. } = &mut modifier.kind {
+                *slot = tool;
+            }
+        }
+    }
+    if let Some(object) = scene.object_mut(tool) {
+        object.visible = false; // the cut is the preview; the cutter hides
+    }
+    // release the old tool once nothing else cuts with it
+    if previous != tool && !tool_referenced(scene, previous) {
+        if let Some(object) = scene.object_mut(previous) {
+            object.visible = true;
+        }
+    }
+    Ok(format!("boolean tool set to '{tool_name}'"))
 }
 
 /// Add a boolean modifier to `target` for each tool object. The tools stay
@@ -484,5 +548,55 @@ mod tests {
         // apply: refused because the whole result would be empty
         assert!(apply(&mut scene, target, usize::MAX).is_err());
         assert!(scene.object(target).unwrap().edited_mesh.is_none());
+    }
+
+    #[test]
+    fn eyedropper_swaps_the_tool_and_hides_only_the_one_in_use() {
+        let mut scene = Scene::new();
+        let (target, first) = two_cubes(&mut scene);
+        add_boolean(&mut scene, target, &[first], BooleanOp::Subtract).unwrap();
+        assert!(!scene.object(first).unwrap().visible, "tool hides");
+
+        let second = scene.add_object(
+            Primitive::Cube { size: 1.0 },
+            Transform { location: Vec3::new(-0.25, 0.0, 0.0), ..Transform::default() },
+        );
+        pick_boolean_tool(&mut scene, target, 0, Some(second)).unwrap();
+
+        assert!(!scene.object(second).unwrap().visible, "new tool hides");
+        assert!(
+            scene.object(first).unwrap().visible,
+            "the replaced tool comes back — nothing cuts with it anymore"
+        );
+        assert!(matches!(
+            scene.object(target).unwrap().modifiers[0].kind,
+            ModifierKind::Boolean { object, .. } if object == second
+        ));
+    }
+
+    #[test]
+    fn eyedropper_rejects_bad_picks_without_changing_anything() {
+        let mut scene = Scene::new();
+        let (target, tool) = two_cubes(&mut scene);
+        add_boolean(&mut scene, target, &[tool], BooleanOp::Subtract).unwrap();
+        let light = scene.add_object(
+            Primitive::Light {
+                kind: modeler_core::LightKind::Point,
+                color: [1.0; 3],
+                intensity: 1.0,
+                spot_angle_deg: 45.0,
+                shadows: false,
+            },
+            Transform::default(),
+        );
+
+        // clicked nothing, clicked itself, clicked a light
+        for hit in [None, Some(target), Some(light)] {
+            assert!(pick_boolean_tool(&mut scene, target, 0, hit).is_err());
+        }
+        assert!(matches!(
+            scene.object(target).unwrap().modifiers[0].kind,
+            ModifierKind::Boolean { object, .. } if object == tool
+        ));
     }
 }

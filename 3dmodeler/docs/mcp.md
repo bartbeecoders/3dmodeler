@@ -4,7 +4,9 @@
 Protocol) server that lets AI coding agents — Claude Code, Claude Desktop,
 Cursor, Windsurf, and anything else that speaks MCP — inspect and edit the
 scene of a **running** 3D modeler, control the physics simulation, and take
-viewport screenshots so the agent can *see* what it is building.
+pictures — viewport screenshots (any axis view) and camera renders — so the
+agent can *see* what it is building. Pictures come back inline, as MCP
+resources, or written to a file, whichever the client prefers.
 
 ```
 agent (Claude Code, …)
@@ -173,7 +175,8 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | Tool | What it does |
 | --- | --- |
 | `get_scene` | Full scene dump: objects (name, id, primitive, local & world transforms, parent, pivot & anchor points, group flag, color, physics flags, dimensions in m), measurements, sim state |
-| `screenshot` | Renders the viewport and returns a PNG **image** — the agent's eyes |
+| `screenshot` | Renders the viewport and returns a PNG **image** — the agent's eyes. `view` (`front`/`back`/`left`/`right`/`top`/`bottom`) switches to that orthographic axis view first, `frame` (`all`/`selection`) fits the view — both move the user's viewport camera, like the numpad keys. `save_path` writes the PNG to that file and returns the path instead of the image |
+| `render` | Off-screen render from a **scene camera object** (what F12 shows in the app): the framed shot without grid, outlines or gizmos. `camera` (name or id, default = selected/first camera), `width`/`height` (16–4096, default 960×540), `save_path` as above. The viewport is untouched |
 | `set_view` | Switch viewport shading (`wireframe` / `solid` / `shaded`) and lighting (`studio` rig, or `scene` = the scene's light objects with shadows) before a screenshot |
 | `add_object` | Add `plane` / `cube` / `sphere` / `icosphere` / `cylinder` / `cone` / `torus` / `wall` / `empty` — or a light: `light` (point), `sun`, `spot` (`color`, `intensity`, `spot_angle_deg`, `shadows`; sun & spot shine along local -Z, aim with the rotation) — with optional name, location, rotation (Euler °), scale, color, physics & adornment flags |
 | `update_object` | Change any of the above on an existing object (by name or id); `new_name` renames |
@@ -194,6 +197,31 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 Conventions the agent should know (also sent in the server's MCP
 `instructions`): units are **meters**, the world is **Z-up** (ground = XY
 plane), rotations are XYZ Euler degrees, colors are `[r, g, b]` in 0–1.
+
+### Images as resources
+
+The same two pictures are also published as MCP **resources**, for clients
+that attach resources to the conversation instead of calling a tool:
+
+| URI | Image |
+| --- | --- |
+| `modeler://screenshot` | The viewport exactly as it looks now |
+| `modeler://screenshot/{view}` | Switches to that axis view, frames the whole scene, then captures (moves the viewport camera) |
+| `modeler://render` | Camera render from the selected (or first) camera |
+| `modeler://render/{camera}` | Camera render from the named camera — percent-encode spaces, e.g. `modeler://render/Key%20Cam` |
+
+`resources/read` returns one `image/png` content with the PNG in `blob`.
+
+### Screenshots on disk
+
+Agents that read images from files rather than from tool output pass
+`save_path`; the server decodes the PNG and writes it, creating parent
+directories, and answers with the absolute path and size:
+
+```
+screenshot {"view": "front", "frame": "all", "save_path": "/tmp/front.png"}
+→ saved /tmp/front.png (1920x1012 PNG, 185736 bytes)
+```
 
 ## 5. Try it
 
@@ -221,7 +249,7 @@ Useful prompt patterns:
 ## 7. Protocol notes
 
 `modeler-mcp` implements the MCP stdio transport by hand (newline-delimited
-JSON-RPC 2.0; `initialize`, `tools/list`, `tools/call`, `ping`) — no async
-runtime, ~300 lines. The HTTP hop is localhost-only. Undo integration comes
+JSON-RPC 2.0; `initialize`, `tools/list`, `tools/call`, `resources/list`,
+`resources/templates/list`, `resources/read`, `ping`) — no async runtime. The HTTP hop is localhost-only. Undo integration comes
 for free: agent edits land in the same undo stack as manual edits, so Ctrl+Z
 in the app steps back through what the agent did.

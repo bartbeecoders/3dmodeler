@@ -64,9 +64,67 @@ struct CachedModel {
     mode: ShadeMode,
     xray: bool,
     material: Material,
+    /// The FULL display mesh (outline + topology compares); when face
+    /// materials are live, `model` itself only draws the slot-0 remainder.
     cpu_mesh: CpuMesh,
     model: Gm<Mesh, PhysicalMaterial>,
+    /// One extra model per used face-material slot (edit-mode per-face
+    /// materials). Same vertex buffers as `model`, filtered indices.
+    face_models: Vec<FaceModel>,
+    /// The face materials the face models were built from.
+    face_materials: Vec<Material>,
+    /// The per-triangle slots the split was built from — an in-place vertex
+    /// update is only valid while the assignment is unchanged.
+    tri_materials: Vec<u32>,
     outline: Option<(Srgba, Gm<Mesh, ColorMaterial>)>,
+}
+
+/// A per-face-material submodel of a single object.
+struct FaceModel {
+    /// 1-based slot into `Object::face_materials`.
+    slot: u32,
+    model: Gm<Mesh, PhysicalMaterial>,
+}
+
+/// Split a mesh by `tri_materials` into the slot-0 remainder plus one
+/// submesh per face-material slot in use. Submeshes keep the full vertex
+/// buffers and filter only the index buffer, so in-place vertex updates
+/// stay valid across all of them. None when the mesh has no live
+/// assignment (empty or stale `tri_materials`, or no slot in use).
+fn split_by_face_materials(
+    data: &MeshData,
+    slots: usize,
+) -> Option<(MeshData, Vec<(u32, MeshData)>)> {
+    let tri_count = data.indices.len() / 3;
+    if slots == 0 || data.tri_materials.len() != tri_count {
+        return None;
+    }
+    let live = |slot: u32| slot > 0 && slot as usize <= slots;
+    let mut used: Vec<u32> = data.tri_materials.iter().copied().filter(|&s| live(s)).collect();
+    used.sort_unstable();
+    used.dedup();
+    if used.is_empty() {
+        return None;
+    }
+    let subset = |keep: &dyn Fn(u32) -> bool| {
+        let mut sub = data.clone();
+        sub.tri_materials = Vec::new();
+        sub.seams = Vec::new();
+        sub.indices = data
+            .indices
+            .chunks_exact(3)
+            .zip(&data.tri_materials)
+            .filter(|&(_, &slot)| keep(slot))
+            .flat_map(|(tri, _)| tri.iter().copied())
+            .collect();
+        sub
+    };
+    let base = subset(&|slot| !live(slot));
+    let per_slot = used
+        .into_iter()
+        .map(|s| (s, subset(&|slot| slot == s)))
+        .collect();
+    Some((base, per_slot))
 }
 
 /// Selection tier of an object. Part of the instancing group key: outlines
@@ -177,7 +235,7 @@ fn instance_key(
     mode: ShadeMode,
     xray: bool,
 ) -> Option<(u64, GroupKey)> {
-    if object.edited_mesh.is_some() || object.primitive.is_light() {
+    if object.edited_mesh.is_some() || object.primitive.is_gizmo() {
         return None;
     }
     // live draped ropes rebuild every frame — not instanceable
@@ -193,9 +251,12 @@ fn instance_key(
     // boolean modifiers make the mesh depend on other objects: unique
     let subdivision = object.subdivision_only_levels()?;
     let mat = render_material(scene, object.id);
-    // Transparent / emissive materials skip instancing so alpha blend and
-    // glow stay correct per object.
-    if mat.alpha < 0.999 || mat.emissive_rgb().iter().any(|&c| c > 1e-4) {
+    // Transparent / emissive / textured materials skip instancing so alpha
+    // blend, glow, and UV-mapped maps stay correct per object.
+    if mat.alpha < 0.999
+        || mat.emissive_rgb().iter().any(|&c| c > 1e-4)
+        || mat.textures.has_any()
+    {
         return None;
     }
     let (roughness, metallic, alpha, emissive) = match mode {
@@ -243,12 +304,33 @@ fn display_mesh(scene: &Scene, object: &modeler_core::Object) -> MeshData {
 }
 
 fn to_cpu_mesh(data: &MeshData) -> CpuMesh {
-    CpuMesh {
+    let mut data = data.clone();
+    data.ensure_uvs();
+    let uvs = if data.uvs.len() == data.positions.len() {
+        Some(
+            data.uvs
+                .iter()
+                .map(|u| three_d::vec2(u.x, u.y))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let mut mesh = CpuMesh {
         positions: Positions::F32(data.positions.iter().map(|p| vec3(p.x, p.y, p.z)).collect()),
         normals: Some(data.normals.iter().map(|n| vec3(n.x, n.y, n.z)).collect()),
+        uvs,
         indices: Indices::U32(data.indices.clone()),
         ..Default::default()
+    };
+    // Normal maps sample in tangent space. Without tangents the three-d
+    // PhysicalMaterial shader uses undefined `tang`/`bitang` attributes and
+    // the surface normals collapse — studio lighting still "works" via strong
+    // ambient, but scene Lights mode looks unlit on PBR materials.
+    if mesh.normals.is_some() && mesh.uvs.is_some() {
+        mesh.compute_tangents();
     }
+    mesh
 }
 
 pub fn transform_mat(t: &Transform) -> Mat4 {
@@ -288,6 +370,15 @@ fn physical_material(
             metallic: 0.0,
             ..Default::default()
         }
+    } else if matches!(primitive, Primitive::Camera { .. }) {
+        // dark body with a cool lens glow so it reads against the grid
+        CpuMaterial {
+            albedo: Srgba::new(40, 40, 48, mat_alpha),
+            emissive: Srgba::new(40, 90, 140, 255),
+            roughness: 0.6,
+            metallic: 0.2,
+            ..Default::default()
+        }
     } else {
         // Solid ignores the object material for a uniform studio look
         let ([r, g, b], roughness, metallic, emissive) = match mode {
@@ -305,22 +396,87 @@ fn physical_material(
             emissive[1].clamp(0.0, 1.0),
             emissive[2].clamp(0.0, 1.0),
         ];
-        CpuMaterial {
+        let mut cpu = CpuMaterial {
             albedo: srgb([r, g, b], mat_alpha),
             roughness,
             metallic,
             emissive: srgb(em, 255),
             occlusion_strength: material.occlusion.clamp(0.0, 1.0),
             ..Default::default()
+        };
+        // Texture maps only in Shaded mode (Solid is a studio preview).
+        if mode == ShadeMode::Shaded && material.textures.has_any() {
+            apply_pbr_textures(&mut cpu, &material.textures);
         }
+        cpu
     };
     let transparent = xray || (mode != ShadeMode::Solid && material.alpha < 0.999);
-    if transparent {
+    let mut m = if transparent {
         let mut m = PhysicalMaterial::new_transparent(context, &cpu);
         m.render_states.cull = Cull::None;
         m
     } else {
         PhysicalMaterial::new_opaque(context, &cpu)
+    };
+    // UV tiling / rotation from material.textures
+    if mode == ShadeMode::Shaded && material.textures.has_any() {
+        let xform = Mat3::from(material.textures.uv_matrix());
+        if let Some(ref mut t) = m.albedo_texture {
+            t.transformation = xform;
+        }
+        if let Some(ref mut t) = m.normal_texture {
+            t.transformation = xform;
+        }
+        if let Some(ref mut t) = m.metallic_roughness_texture {
+            t.transformation = xform;
+        }
+        if let Some(ref mut t) = m.occlusion_texture {
+            t.transformation = xform;
+        }
+    }
+    m
+}
+
+/// Load cached PBR maps into a `CpuMaterial` (glTF metal/rough + optional ORM).
+fn apply_pbr_textures(cpu: &mut CpuMaterial, textures: &modeler_core::MaterialTextures) {
+    use crate::pbr_library::{cpu_texture_from_key, pack_orm};
+
+    if let Some(key) = &textures.albedo {
+        if let Some(tex) = cpu_texture_from_key(key) {
+            cpu.albedo_texture = Some(tex);
+            // When an albedo map is present, keep base_color as a tint (white = map only).
+            cpu.albedo = Srgba::new(255, 255, 255, cpu.albedo.a);
+        }
+    }
+    if let Some(key) = &textures.normal {
+        if let Some(tex) = cpu_texture_from_key(key) {
+            cpu.normal_texture = Some(tex);
+        }
+    }
+    let rough = textures
+        .roughness
+        .as_ref()
+        .and_then(|k| cpu_texture_from_key(k));
+    let metal = textures
+        .metallic
+        .as_ref()
+        .and_then(|k| cpu_texture_from_key(k));
+    let occ = textures
+        .occlusion
+        .as_ref()
+        .and_then(|k| cpu_texture_from_key(k));
+
+    if let Some(orm) = pack_orm(occ.as_ref(), rough.as_ref(), metal.as_ref()) {
+        // glTF ORM: R=AO, G=roughness, B=metallic — three-d occlusion_metallic_roughness
+        cpu.occlusion_metallic_roughness_texture = Some(orm);
+    } else {
+        if let Some(r) = rough {
+            // Roughness-only greyscale → metallic_roughness (G channel used)
+            cpu.metallic_roughness_texture = Some(r);
+        }
+        if let Some(o) = occ {
+            cpu.occlusion_texture = Some(o);
+        }
     }
 }
 
@@ -559,12 +715,20 @@ impl SceneRender {
                     || cached.smooth != object.smooth
                     || cached.mesh_revision != object.mesh_revision
                     || cached.modifier_stamp != modifier_stamp
+                    // GPU mesh created before PBR: no tangents → normal maps
+                    // break Lights-mode lighting until the mesh is rebuilt.
+                    || (mat.textures.normal.is_some()
+                        && mode == ShadeMode::Shaded
+                        && cached.cpu_mesh.tangents.is_none())
             }
             None => true,
         };
         let rebuild_material = match self.cache.get(&object.id) {
             Some(cached) => {
-                cached.material != mat || cached.mode != mode || cached.xray != xray
+                cached.material != mat
+                    || cached.face_materials != object.face_materials
+                    || cached.mode != mode
+                    || cached.xray != xray
             }
             None => true,
         };
@@ -584,6 +748,9 @@ impl SceneRender {
                     (Positions::F32(old_pos), Indices::U32(old_idx)) => {
                         old_pos.len() == new_mesh.positions.len()
                             && old_idx.as_slice() == new_mesh.indices.as_slice()
+                            // a changed face-material assignment re-splits
+                            // the index buffers: full rebuild
+                            && cached.tri_materials == new_mesh.tri_materials
                     }
                     _ => false,
                 };
@@ -596,6 +763,11 @@ impl SceneRender {
                     new_mesh.normals.iter().map(|n| vec3(n.x, n.y, n.z)).collect();
                 cached.model.geometry.set_positions(&positions).ok()?;
                 cached.model.geometry.set_normals(&normals).ok()?;
+                for face in &mut cached.face_models {
+                    // face submodels share the full vertex buffers
+                    face.model.geometry.set_positions(&positions).ok()?;
+                    face.model.geometry.set_normals(&normals).ok()?;
+                }
                 if let Some((_, outline)) = &mut cached.outline {
                     outline.geometry.set_positions(&positions).ok()?;
                     outline.geometry.set_normals(&normals).ok()?;
@@ -610,8 +782,34 @@ impl SceneRender {
 
             if !updated_in_place {
                 let cpu_mesh = to_cpu_mesh(&new_mesh);
+                let split = split_by_face_materials(&new_mesh, object.face_materials.len());
+                let (base_cpu, face_models) = match &split {
+                    Some((base, per_slot)) => {
+                        let face_models = per_slot
+                            .iter()
+                            .map(|(slot, sub)| {
+                                let m = &object.face_materials[*slot as usize - 1];
+                                FaceModel {
+                                    slot: *slot,
+                                    model: Gm::new(
+                                        Mesh::new(context, &to_cpu_mesh(sub)),
+                                        physical_material(
+                                            context,
+                                            m,
+                                            &object.primitive,
+                                            mode,
+                                            xray,
+                                        ),
+                                    ),
+                                }
+                            })
+                            .collect();
+                        (to_cpu_mesh(base), face_models)
+                    }
+                    None => (cpu_mesh.clone(), Vec::new()),
+                };
                 let model = Gm::new(
-                    Mesh::new(context, &cpu_mesh),
+                    Mesh::new(context, &base_cpu),
                     physical_material(context, &mat, &object.primitive, mode, xray),
                 );
                 self.cache.insert(
@@ -626,28 +824,26 @@ impl SceneRender {
                         material: mat,
                         cpu_mesh,
                         model,
+                        face_models,
+                        face_materials: object.face_materials.clone(),
+                        tri_materials: new_mesh.tri_materials.clone(),
                         outline: None,
                     },
                 );
             } else if rebuild_material {
                 let cached = self.cache.get_mut(&object.id).unwrap();
-                cached.material = mat;
-                cached.mode = mode;
-                cached.xray = xray;
-                cached.model.material =
-                    physical_material(context, &mat, &object.primitive, mode, xray);
+                Self::refresh_materials(cached, object, &mat, context, mode, xray);
             }
         } else if rebuild_material {
             let cached = self.cache.get_mut(&object.id).unwrap();
-            cached.material = mat;
-            cached.mode = mode;
-            cached.xray = xray;
-            cached.model.material =
-                physical_material(context, &mat, &object.primitive, mode, xray);
+            Self::refresh_materials(cached, object, &mat, context, mode, xray);
         }
 
         let cached = self.cache.get_mut(&object.id).unwrap();
         cached.model.set_transformation(transformation);
+        for face in &mut cached.face_models {
+            face.model.set_transformation(transformation);
+        }
 
         let desired_color = tier.color();
 
@@ -672,10 +868,38 @@ impl SceneRender {
         }
     }
 
+    /// Material-only resync of a cached model (mode/xray toggle, edited
+    /// materials): the mesh split is unchanged — set_face_material bumps
+    /// `mesh_revision`, so slot changes always take the mesh rebuild path.
+    fn refresh_materials(
+        cached: &mut CachedModel,
+        object: &modeler_core::Object,
+        mat: &Material,
+        context: &Context,
+        mode: ShadeMode,
+        xray: bool,
+    ) {
+        cached.mode = mode;
+        cached.xray = xray;
+        cached.model.material = physical_material(context, mat, &object.primitive, mode, xray);
+        cached.material = mat.clone();
+        for face in &mut cached.face_models {
+            if let Some(m) = object.face_materials.get(face.slot as usize - 1) {
+                face.model.material =
+                    physical_material(context, m, &object.primitive, mode, xray);
+            }
+        }
+        cached.face_materials = object.face_materials.clone();
+    }
+
     pub fn models(&self) -> impl Iterator<Item = &dyn Object> {
         self.order
             .iter()
-            .filter_map(|id| self.cache.get(id).map(|c| &c.model as &dyn Object))
+            .filter_map(|id| self.cache.get(id))
+            .flat_map(|c| {
+                std::iter::once(&c.model as &dyn Object)
+                    .chain(c.face_models.iter().map(|f| &f.model as &dyn Object))
+            })
             .chain(
                 self.group_order
                     .iter()
@@ -698,20 +922,37 @@ impl SceneRender {
             }))
     }
 
-    /// Geometry for shadow maps: every visible model EXCEPT light gizmos —
-    /// a light sits inside its own gizmo mesh, which would shadow the whole
-    /// scene. (Instanced groups never contain lights.)
+    /// Geometry for shadow maps: every visible model EXCEPT light/camera/
+    /// empty gizmos — a light sits inside its own gizmo mesh, which would
+    /// shadow the whole scene. (Instanced groups never contain gizmos.)
     pub fn shadow_casters(&self) -> Vec<&dyn Geometry> {
         self.order
             .iter()
             .filter_map(|id| self.cache.get(id))
-            .filter(|c| !c.primitive.is_light())
+            .filter(|c| !c.primitive.is_gizmo())
             .map(|c| &c.model.geometry as &dyn Geometry)
             .chain(
                 self.group_order
                     .iter()
                     .filter_map(|hash| self.groups.get(hash))
                     .map(|g| &g.model.geometry as &dyn Geometry),
+            )
+            .collect()
+    }
+
+    /// Solid scene meshes for camera rendering (F12): no light/camera/empty
+    /// gizmos and no selection outlines.
+    pub fn camera_render_models(&self) -> Vec<&dyn Object> {
+        self.order
+            .iter()
+            .filter_map(|id| self.cache.get(id))
+            .filter(|c| !c.primitive.is_gizmo())
+            .map(|c| &c.model as &dyn Object)
+            .chain(
+                self.group_order
+                    .iter()
+                    .filter_map(|hash| self.groups.get(hash))
+                    .map(|g| &g.model as &dyn Object),
             )
             .collect()
     }
@@ -826,6 +1067,16 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             hash_f32(h, spot_angle_deg);
             shadows.hash(h);
         }
+        Primitive::Camera {
+            fov_deg,
+            clip_start,
+            clip_end,
+        } => {
+            14u8.hash(h);
+            hash_f32(h, fov_deg);
+            hash_f32(h, clip_start);
+            hash_f32(h, clip_end);
+        }
         Primitive::Rope {
             length,
             radius,
@@ -835,6 +1086,20 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             hash_f32(h, length);
             hash_f32(h, radius);
             segments.hash(h);
+        }
+        Primitive::Cloth {
+            width,
+            height,
+            segments_u,
+            segments_v,
+            stiffness,
+        } => {
+            13u8.hash(h);
+            hash_f32(h, width);
+            hash_f32(h, height);
+            segments_u.hash(h);
+            segments_v.hash(h);
+            hash_f32(h, stiffness);
         }
     }
 }
@@ -889,7 +1154,9 @@ impl SceneLights {
                 Srgba::new(180, 190, 210, 255),
                 vec3(0.6, -0.5, -0.2),
             ),
-            scene_ambient: AmbientLight::new(context, 0.06, Srgba::WHITE),
+            // Slightly brighter than pure black so PBR albedo still reads
+            // when no scene light hits a surface; key/fill come from objects.
+            scene_ambient: AmbientLight::new(context, 0.12, Srgba::WHITE),
             suns: Vec::new(),
             points: Vec::new(),
             spots: Vec::new(),
@@ -1066,6 +1333,52 @@ mod tests {
     }
 
     #[test]
+    fn split_by_face_materials_partitions_triangles() {
+        let mut mesh = modeler_core::Primitive::Cube { size: 1.0 }.generate(false);
+        let tri_count = mesh.indices.len() / 3;
+
+        // no assignment / stale length → no split
+        assert!(split_by_face_materials(&mesh, 1).is_none());
+        mesh.tri_materials = vec![0; tri_count - 1];
+        assert!(split_by_face_materials(&mesh, 1).is_none());
+
+        // two tris on slot 1, one on an out-of-range slot (treated as base)
+        mesh.tri_materials = vec![0; tri_count];
+        mesh.tri_materials[0] = 1;
+        mesh.tri_materials[1] = 1;
+        mesh.tri_materials[2] = 7;
+        let (base, per_slot) = split_by_face_materials(&mesh, 1).expect("split");
+        assert_eq!(per_slot.len(), 1);
+        let (slot, sub) = &per_slot[0];
+        assert_eq!(*slot, 1);
+        assert_eq!(sub.indices.len(), 2 * 3);
+        assert_eq!(base.indices.len(), (tri_count - 2) * 3);
+        // vertex buffers stay full so in-place updates remain valid
+        assert_eq!(base.positions.len(), mesh.positions.len());
+        assert_eq!(sub.positions.len(), mesh.positions.len());
+        assert_eq!(sub.indices, mesh.indices[..6].to_vec());
+
+        // slot count 0 → everything is base
+        assert!(split_by_face_materials(&mesh, 0).is_none());
+    }
+
+    #[test]
+    fn cpu_mesh_gets_uvs_and_tangents_for_normal_maps() {
+        let mesh = modeler_core::Primitive::Cube { size: 1.0 }.generate(false);
+        let cpu = to_cpu_mesh(&mesh);
+        assert!(cpu.uvs.is_some(), "UVs required for PBR maps");
+        assert!(
+            cpu.tangents.is_some(),
+            "tangents required so normal maps work with scene Lights"
+        );
+        assert_eq!(
+            cpu.tangents.as_ref().unwrap().len(),
+            cpu.positions.len(),
+            "one tangent per vertex"
+        );
+    }
+
+    #[test]
     fn identical_cubes_share_a_group_regardless_of_base_color() {
         let (mut scene, a) = scene_with_cube();
         let b = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
@@ -1189,5 +1502,8 @@ mod tests {
             Transform::default(),
         );
         assert!(key_of(&scene, light, OutlineTier::None, ShadeMode::Shaded).is_none());
+
+        let cam = scene.add_object(Primitive::default_camera(), Transform::default());
+        assert!(key_of(&scene, cam, OutlineTier::None, ShadeMode::Shaded).is_none());
     }
 }

@@ -43,6 +43,7 @@ WORKFLOW
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Ropes: primitive "rope" (length/radius/segments) is a flexible multi-segment cord. Pin ends with rope_start / rope_end (object name or null) and optional rope_start_point / rope_end_point local points. Ropes always simulate when play runs; hang a weight by anchoring start to a fixed body and end to a dynamic cube.
+- Cloth: primitive "cloth" (width/height/segments_u/segments_v/stiffness 0..1) is a soft sheet in local XY. Pin grid vertices with cloth_anchors: [{u, v, object, local_point?}]. Default four corners are free; attach top edge to a bar for a hanging curtain. Low stiffness (~0.2) drapes; 1.0 is stiff.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
 
 STYLE
@@ -63,23 +64,30 @@ fn object_properties() -> Value {
         "smooth": {"type": "boolean", "description": "smooth shading"},
         "subdivision": {"type": "integer", "description": "subsurf level 0..4"},
         "visible": {"type": "boolean"},
+        "locked": {"type": "boolean", "description": "when true, move/rotate/scale are blocked until unlocked"},
         "dynamic": {"type": "boolean", "description": "physics: falls & collides when simulating"},
         "density": {"type": "number", "description": "kg/m³ for dynamic objects"},
         "initial_force": {"type": "array", "items": {"type": "number"}, "description": "world-space impulse [x,y,z] N·s applied once at play (dynamic only)"},
+        "bounciness": {"type": "number", "description": "elasticity 0-1: 0 dead/clay, 0.25 wood, 0.5 steel, 0.8 rubber. Works on static objects too (e.g. a bouncy floor)"},
         "pivot": {"type": "array", "items": {"type": "number"}, "description": "pivot point, object space"},
         "anchor": {"type": "array", "items": {"type": "number"}, "description": "attach point, object space"},
         "intensity": {"type": "number", "description": "lights only"},
         "spot_angle_deg": {"type": "number", "description": "spot lights only, 1..160"},
         "shadows": {"type": "boolean", "description": "lights only"},
         "length": {"type": "number", "description": "walls or ropes, meters"},
-        "height": {"type": "number", "description": "walls only, meters"},
+        "height": {"type": "number", "description": "walls or cloth, meters"},
+        "width": {"type": "number", "description": "cloth only, meters"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},
+        "segments_u": {"type": "integer", "description": "cloth only: grid cells along width 1–24"},
+        "segments_v": {"type": "integer", "description": "cloth only: grid cells along height 1–24"},
+        "stiffness": {"type": "number", "description": "cloth only: 0 soft .. 1 stiff (default 0.25)"},
         "rope_start": {"description": "ropes only: object name/id to pin start, or null for free"},
         "rope_end": {"description": "ropes only: object name/id to pin end, or null for free"},
         "rope_start_point": {"type": "array", "items": {"type": "number"}, "description": "ropes only: local attach point on start target"},
         "rope_end_point": {"type": "array", "items": {"type": "number"}, "description": "ropes only: local attach point on end target"},
+        "cloth_anchors": {"type": "array", "description": "cloth only: [{u,v,object?,local_point?}]"},
         "cutouts": {
             "type": "array",
             "description": "walls only: door/window openings, replaces the list",
@@ -113,8 +121,8 @@ pub fn catalog() -> Vec<ToolSpec> {
     add_properties["primitive"] = json!({
         "type": "string",
         "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus",
-                 "wall", "floor", "empty", "rope", "light", "sun", "spot"],
-        "description": "what to add ('light' = point light; 'rope' = physics rope)"
+                 "wall", "floor", "empty", "rope", "cloth", "light", "sun", "spot"],
+        "description": "what to add ('light' = point light; 'rope'/'cloth' = soft physics)"
     });
     let mut update_properties = object_properties();
     update_properties["object"] = object_ref("object name or id");
@@ -335,6 +343,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "rotation_deg": {"type": "number"},
                 "width_m": {"type": "number", "description": "display width in meters"},
                 "opacity": {"type": "number", "description": "0..1"},
+                "visible": {"type": "boolean"},
+                "locked": {"type": "boolean"},
                 "flip_h": {"type": "boolean"},
                 "flip_v": {"type": "boolean"}
             }),
@@ -342,7 +352,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         ),
         tool(
             "update_reference_image",
-            "Change a reference image (plane, location, size, opacity, visibility, name).",
+            "Change a reference image (plane, location, size, opacity, visibility, lock, name). Transform fields fail while locked.",
             json!({
                 "image": {"type": ["string", "integer"], "description": "image name or id"},
                 "new_name": {"type": "string"},
@@ -352,6 +362,7 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "width_m": {"type": "number"},
                 "opacity": {"type": "number"},
                 "visible": {"type": "boolean"},
+                "locked": {"type": "boolean"},
                 "flip_h": {"type": "boolean"},
                 "flip_v": {"type": "boolean"}
             }),

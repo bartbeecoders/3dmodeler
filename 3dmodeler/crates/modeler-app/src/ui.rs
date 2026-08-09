@@ -8,6 +8,7 @@ use crate::camera::BlenderCamera;
 use crate::context_menu::ContextMenu;
 use crate::edit_mode::{EditMode, SelectMode};
 use crate::library::LibraryPanel;
+use crate::pbr_library::PbrLibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops;
 use crate::physics::{PhysicsMirror, SimState};
@@ -41,6 +42,7 @@ enum MasterAction {
 #[derive(Default)]
 struct OutlinerActions {
     visibility_toggle: Option<ObjectId>,
+    lock_toggle: Option<ObjectId>,
     clicked: Option<ObjectId>,
     start_rename: Option<(ObjectId, String)>,
     commit_rename: Option<(ObjectId, String)>,
@@ -50,6 +52,9 @@ struct OutlinerActions {
     move_to_folder: Option<(ObjectId, Option<u64>)>,
     folder_eye: Option<u64>,
     delete_folder: Option<u64>,
+    /// Clicked folder header: select every object filed under it (and their
+    /// subtrees).
+    clicked_folder: Option<u64>,
     commit_folder_rename: Option<(u64, String)>,
     /// Rebuild the wall stored in this bricks folder.
     rebuild_wall: Option<u64>,
@@ -89,6 +94,10 @@ pub struct UiState {
     show_about: bool,
     /// Decoded-once GPU texture of the embedded About banner.
     about_texture: Option<egui::TextureHandle>,
+    /// F12 camera render result (in-app floating window; wasm only — native
+    /// opens a separate OS window via `render_preview`).
+    #[cfg(target_arch = "wasm32")]
+    render_result: Option<RenderResult>,
     import_open: bool,
     import_buffer: String,
     /// Break-into-particles dialog: Some((kind, target count)) while open.
@@ -97,6 +106,10 @@ pub struct UiState {
     break_dialog: Option<(object_ops::BreakKind, i32)>,
     /// Active Properties panel tab (Blender-style icon tabs).
     properties_tab: PropertiesTab,
+    /// Eyedropper armed on a boolean modifier: (object owning the stack,
+    /// modifier index). The next viewport click picks that modifier's tool
+    /// object instead of changing the selection; Esc cancels.
+    pub pick_boolean_tool: Option<(ObjectId, usize)>,
     pub status_message: Option<String>,
     current_file: Option<io::FileHandle>,
     /// Scene version at the last save/load/new (None until the first frame
@@ -108,6 +121,7 @@ pub struct UiState {
     settings_window: SettingsWindow,
     ref_setup: RefSetupDialog,
     pub library_panel: LibraryPanel,
+    pub pbr_library_panel: PbrLibraryPanel,
     pub context_menu: ContextMenu,
     pub chat_panel: crate::ai::ChatPanel,
     applied_theme: Option<Theme>,
@@ -124,6 +138,18 @@ pub struct McpStatus {
     pub port: u16,
     pub commands_handled: u64,
     pub seconds_since_last: Option<f32>,
+}
+
+/// Latest F12 camera render, kept so the window can reopen with the image.
+#[cfg(target_arch = "wasm32")]
+struct RenderResult {
+    camera_name: String,
+    width: u32,
+    height: u32,
+    /// RGBA top-left origin.
+    rgba: Vec<u8>,
+    /// Uploaded once when the window is drawn.
+    texture: Option<egui::TextureHandle>,
 }
 
 /// Layout info the viewport overlays need to avoid the UI chrome.
@@ -149,8 +175,11 @@ impl UiState {
             show_keymap: false,
             show_about: false,
             about_texture: None,
+            #[cfg(target_arch = "wasm32")]
+            render_result: None,
             import_open: false,
             import_buffer: String::new(),
+            pick_boolean_tool: None,
             break_dialog: None,
             properties_tab: PropertiesTab::Transform,
             status_message: None,
@@ -160,6 +189,7 @@ impl UiState {
             settings_window: SettingsWindow::new(),
             ref_setup: RefSetupDialog::new(),
             library_panel: LibraryPanel::new(),
+            pbr_library_panel: PbrLibraryPanel::new(),
             context_menu: ContextMenu::new(),
             chat_panel: crate::ai::ChatPanel::new(),
             applied_theme: None,
@@ -322,6 +352,8 @@ impl UiState {
         let left_offset = self.chat_panel.ui(ctx, chat, settings);
         self.keymap_window(ctx);
         self.about_window(ctx);
+        #[cfg(target_arch = "wasm32")]
+        self.render_result_window(ctx);
         self.import_window(ctx, scene, undo);
         self.save_as_window(ctx, scene, settings);
         self.confirm_new_window(ctx, scene, selection, undo);
@@ -1107,6 +1139,23 @@ impl UiState {
                         }
                     }
                 }
+                // The sim drops steps rather than spiralling into catch-up on
+                // heavy scenes; say so instead of leaving it a mystery.
+                if physics.sim_state() == SimState::Playing && physics.slow_motion() < 0.9 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "slow motion {:.2}x",
+                            physics.slow_motion()
+                        ))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(230, 170, 60)),
+                    )
+                    .on_hover_text(
+                        "Too many dynamic bodies to simulate in real time — \
+                         physics steps are being dropped to keep the viewport \
+                         responsive.",
+                    );
+                }
                 ui.checkbox(&mut physics.ground_plane, "ground")
                     .on_hover_text("Static ground plane at z=0 during simulation");
                 ui.checkbox(snap_to_grid, "snap")
@@ -1256,8 +1305,16 @@ impl UiState {
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
-            .default_size(250.0)
+            .default_size(280.0)
+            .min_width(240.0)
+            // Hard cap: PBR grids and long labels must not expand the panel
+            // across the whole window (egui grows panels to fit min content).
+            .max_width(340.0)
+            .resizable(true)
             .show(ctx, |ui| {
+                // Clamp content width so children can't push preferred size past max.
+                let panel_w = ui.available_width().min(340.0);
+                ui.set_max_width(panel_w);
                 ui.horizontal(|ui| {
                     theme::section_header(ui, "Outliner");
                     ui.with_layout(
@@ -1294,7 +1351,32 @@ impl UiState {
                 }
                 ui.separator();
                 if !scene.reference_images().is_empty() {
-                    theme::section_header(ui, "Reference Images");
+                    ui.horizontal(|ui| {
+                        // bulk eye: show/hide every reference image at once
+                        // (same ●/○ language as the per-image and folder rows)
+                        let all_visible =
+                            scene.reference_images().iter().all(|r| r.visible);
+                        let eye = if all_visible { "●" } else { "○" };
+                        if ui
+                            .small_button(eye)
+                            .on_hover_text(if all_visible {
+                                "Hide all reference images"
+                            } else {
+                                "Show all reference images"
+                            })
+                            .clicked()
+                        {
+                            let show = !all_visible;
+                            let ids: Vec<u64> =
+                                scene.reference_images().iter().map(|r| r.id).collect();
+                            for id in ids {
+                                if let Some(image) = scene.reference_image_mut(id) {
+                                    image.visible = show;
+                                }
+                            }
+                        }
+                        theme::section_header(ui, "Reference Images");
+                    });
                     reference_image_rows(ui, scene, selection, settings, calibrate, marker_tool);
                     ui.separator();
                 }
@@ -1322,6 +1404,8 @@ impl UiState {
                     edit_point,
                     &mut self.break_dialog,
                     &mut self.properties_tab,
+                    &mut self.pbr_library_panel,
+                    &mut self.pick_boolean_tool,
                 ) {
                     self.status_message = Some(message);
                 }
@@ -1378,7 +1462,7 @@ impl UiState {
             let Some(folder) = scene.folder(fid) else { continue };
             let folder_name = folder.name.clone();
             let open = !self.collapsed_folders.contains(&fid);
-            self.folder_row(ui, scene, fid, &folder_name, open, &mut acts);
+            self.folder_row(ui, scene, selection, fid, &folder_name, open, &mut acts);
             if !open {
                 continue;
             }
@@ -1442,11 +1526,12 @@ impl UiState {
     }
 
     /// One folder header: collapse triangle, eye, name (drop target,
-    /// double-click renames), member count and delete.
+    /// click selects members, double-click renames), member count and delete.
     fn folder_row(
         &mut self,
         ui: &mut egui::Ui,
         scene: &Scene,
+        selection: &Selection,
         fid: u64,
         name: &str,
         open: bool,
@@ -1476,6 +1561,10 @@ impl UiState {
                 .filter(|o| o.folder == Some(fid))
                 .map(|o| o.id)
                 .collect();
+            // Highlight the folder when every filed root is selected (empty
+            // folders stay unselected — there is nothing to select).
+            let folder_selected = !members.is_empty()
+                && members.iter().all(|&id| selection.is_selected(id));
             let all_visible = members
                 .iter()
                 .all(|&id| scene.object(id).is_some_and(|o| o.visible));
@@ -1504,9 +1593,10 @@ impl UiState {
 
             let row = ui
                 .selectable_label(
-                    false,
+                    folder_selected,
                     egui::RichText::new(format!("📂 {name}")).strong(),
                 )
+                .on_hover_text("Select everything in this folder")
                 .interact(egui::Sense::click());
             ui.label(
                 egui::RichText::new(format!("{}", members.len()))
@@ -1517,11 +1607,7 @@ impl UiState {
                 self.rename_folder = Some((fid, name.to_string()));
                 self.rename_needs_focus = true;
             } else if row.clicked() {
-                if open {
-                    self.collapsed_folders.insert(fid);
-                } else {
-                    self.collapsed_folders.remove(&fid);
-                }
+                acts.clicked_folder = Some(fid);
             }
             // dropping an object on the folder files it here
             if let Some(dragged) = row.dnd_release_payload::<ObjectId>() {
@@ -1538,7 +1624,7 @@ impl UiState {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✖")
-                    .on_hover_text("Delete the folder (its objects are kept)")
+                    .on_hover_text("Delete the folder and everything in it")
                     .clicked()
                 {
                     acts.delete_folder = Some(fid);
@@ -1603,6 +1689,19 @@ impl UiState {
                     .clicked()
                 {
                     acts.visibility_toggle = Some(object.id);
+                }
+                // lock: blocks move / rotate / scale
+                let lock = if object.locked { "🔒" } else { "🔓" };
+                if ui
+                    .small_button(lock)
+                    .on_hover_text(if object.locked {
+                        "Unlock — allow move, rotate and scale"
+                    } else {
+                        "Lock — prevent move, rotate and scale"
+                    })
+                    .clicked()
+                {
+                    acts.lock_toggle = Some(object.id);
                 }
 
                 if let Some((rename_id, buffer)) = &mut self.rename {
@@ -1724,11 +1823,49 @@ impl UiState {
             }
         }
         if let Some(fid) = acts.delete_folder {
+            // Delete every object filed in the folder (and their subtrees),
+            // then drop the empty folder.
+            let members: Vec<ObjectId> = scene
+                .objects()
+                .iter()
+                .filter(|o| o.folder == Some(fid))
+                .map(|o| o.id)
+                .collect();
+            let mut to_delete: Vec<ObjectId> = Vec::new();
+            for id in members {
+                for child in scene.subtree(id) {
+                    if !to_delete.contains(&child) {
+                        to_delete.push(child);
+                    }
+                }
+            }
+            for id in to_delete {
+                scene.remove_object(id);
+            }
             scene.remove_folder(fid);
             self.collapsed_folders.remove(&fid);
             if self.rename_folder.as_ref().is_some_and(|(id, _)| *id == fid) {
                 self.rename_folder = None;
             }
+            selection.retain_existing(|id| scene.object(id).is_some());
+        }
+        if let Some(fid) = acts.clicked_folder {
+            let members: Vec<ObjectId> = scene
+                .objects()
+                .iter()
+                .filter(|o| o.folder == Some(fid))
+                .map(|o| o.id)
+                .collect();
+            let mut ids: Vec<ObjectId> = Vec::new();
+            for id in &members {
+                for child in scene.subtree(*id) {
+                    if !ids.contains(&child) {
+                        ids.push(child);
+                    }
+                }
+            }
+            let active = members.first().copied().or_else(|| ids.first().copied());
+            selection.set(ids, active);
         }
         if let Some((fid, name)) = acts.commit_folder_rename {
             let trimmed = name.trim();
@@ -1754,6 +1891,11 @@ impl UiState {
                 object.visible = !object.visible;
             }
         }
+        if let Some(id) = acts.lock_toggle {
+            if let Some(object) = scene.object_mut(id) {
+                object.locked = !object.locked;
+            }
+        }
         if let Some(id) = acts.clicked {
             let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
             if shift {
@@ -1766,14 +1908,20 @@ impl UiState {
                 match (anchor, clicked) {
                     (Some(a), Some(c)) => {
                         let (lo, hi) = if a <= c { (a, c) } else { (c, a) };
-                        selection.extend(&acts.row_order[lo..=hi], id);
+                        let mut range: Vec<ObjectId> = acts.row_order[lo..=hi].to_vec();
+                        // Library components (group roots) expand to their
+                        // full subtree so range-selecting the group header
+                        // still covers every part.
+                        expand_groups_in_list(scene, &mut range);
+                        selection.extend(&range, id);
                     }
-                    // no anchor (or a hidden one): extend with the row alone
-                    _ => selection.click(Some(id), true),
+                    // no anchor (or a hidden one): extend with the group/unit
+                    _ => selection.click_expanded(scene, Some(id), true),
                 }
             } else {
-                // Ctrl+Click toggles one object, a plain click selects it
-                selection.click(Some(id), ctrl);
+                // Plain click / Ctrl+Click: groups (placed library assets)
+                // select as one unit, same as the viewport.
+                selection.click_expanded(scene, Some(id), ctrl);
             }
         }
         if let Some((id, name)) = acts.start_rename {
@@ -1837,6 +1985,8 @@ impl UiState {
                         ("Add ▸ Floor", "Floor slab encompassing the selected walls"),
                         ("Drag ⊕ handle (wall)", "Move a door/window opening; Esc cancels the drag"),
                         ("Add ▸ Measure", "Ruler: click two points"),
+                        ("Add ▸ Camera", "Place a render camera (looks along −Z)"),
+                        ("F12", "Toggle live camera view (separate window; real-time)"),
                         ("Esc", "Stop physics (restore)"),
                     ] {
                         ui.label(egui::RichText::new(keys).monospace());
@@ -1914,6 +2064,85 @@ impl UiState {
                 }
             });
         self.show_about &= open;
+    }
+
+    /// Store / update a live F12 camera frame for the in-app result window (wasm).
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_render_result(
+        &mut self,
+        camera_name: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) {
+        if let Some(result) = self.render_result.as_mut() {
+            if result.width == width && result.height == height {
+                result.camera_name = camera_name;
+                result.rgba = rgba;
+                return; // keep GPU texture; draw path uploads new pixels
+            }
+        }
+        self.render_result = Some(RenderResult {
+            camera_name,
+            width,
+            height,
+            rgba,
+            texture: None,
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn clear_render_result(&mut self) {
+        self.render_result = None;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn render_result_window(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.render_result.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let title = format!("Camera View — {} (live)", result.camera_name);
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([
+                (result.width as f32 * 0.55).clamp(320.0, 960.0),
+                (result.height as f32 * 0.55).clamp(200.0, 720.0),
+            ])
+            .show(ctx, |ui| {
+                let size = [result.width as usize, result.height as usize];
+                let image = egui::ColorImage::from_rgba_unmultiplied(size, &result.rgba);
+                let texture = result.texture.get_or_insert_with(|| {
+                    ctx.load_texture(
+                        "camera-render-result",
+                        image.clone(),
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                texture.set(image, egui::TextureOptions::LINEAR);
+                let avail = ui.available_size();
+                let aspect = result.width as f32 / result.height.max(1) as f32;
+                let mut w = avail.x;
+                let mut h = w / aspect;
+                if h > avail.y {
+                    h = avail.y;
+                    w = h * aspect;
+                }
+                ui.image((texture.id(), egui::vec2(w.max(1.0), h.max(1.0))));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}×{} live · F12 to close",
+                        result.width, result.height
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            });
+        if !open {
+            self.render_result = None;
+        }
     }
 
     /// A dialog window is on screen. main.rs then leaves Tab to egui (field
@@ -2042,6 +2271,20 @@ fn add_menu_items(
             selection.set(vec![id], Some(id));
             return true;
         }
+    }
+    ui.separator();
+    // camera (Blender's Add ▸ Camera)
+    let camera_prim = Primitive::default_camera();
+    if crate::pie::icon_menu_button(ui, &crate::pie::PieIcon::Camera, "Camera")
+        .on_hover_text(
+            "Render camera: looks along −Z. Place and rotate it, then press F12 \
+             to render the scene from its view",
+        )
+        .clicked()
+    {
+        let id = scene.add_object(camera_prim, Transform::default());
+        selection.set(vec![id], Some(id));
+        return true;
     }
     ui.separator();
     if ui
@@ -2186,7 +2429,7 @@ fn object_menu(
         .active()
         .and_then(|id| scene.object(id))
         .is_some_and(|o| {
-            !o.primitive.is_light() && !matches!(o.primitive, Primitive::Empty { .. })
+            !o.primitive.is_gizmo()
         });
     ui.menu_button("Break into…", |ui| {
         if ui
@@ -2346,6 +2589,23 @@ pub fn parent_selected_to_active(scene: &mut Scene, selection: &Selection) {
     }
 }
 
+/// Append every descendant of group-flagged roots so a library component
+/// covers its full assembly in multi-select paths.
+fn expand_groups_in_list(scene: &Scene, ids: &mut Vec<ObjectId>) {
+    let roots: Vec<ObjectId> = ids
+        .iter()
+        .copied()
+        .filter(|&id| scene.object(id).is_some_and(|o| o.group))
+        .collect();
+    for root in roots {
+        for child in scene.subtree(root) {
+            if !ids.contains(&child) {
+                ids.push(child);
+            }
+        }
+    }
+}
+
 /// Make the selection ONE group: parent everything to the active object
 /// (world transforms preserved) and flag it as the group root — viewport
 /// clicks then select the whole assembly.
@@ -2414,6 +2674,23 @@ fn view_menu(
         }
     });
     ui.checkbox(xray, "X-ray");
+    ui.separator();
+    ui.label(
+        egui::RichText::new("Render  (F12)")
+            .weak()
+            .size(11.0),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Press F12 for a live view from the active/selected camera \
+             (or the first camera in the scene). It updates as you move the \
+             camera or edit the scene. Add ▸ Camera places one. The preview \
+             is a separate window — drag it to another monitor. F12 again closes it.",
+        )
+        .weak()
+        .size(11.0),
+    );
+    ui.separator();
     ui.label(egui::RichText::new("Lighting (shaded)").weak().size(11.0));
     ui.horizontal(|ui| {
         for (mode, label) in [
@@ -2584,6 +2861,19 @@ fn reference_image_rows(
                         edited.visible = !edited.visible;
                         changed = true;
                     }
+                    let lock = if edited.locked { "🔒" } else { "🔓" };
+                    if ui
+                        .small_button(lock)
+                        .on_hover_text(if edited.locked {
+                            "Unlock — allow move, rotate and scale"
+                        } else {
+                            "Lock — prevent move, rotate and scale"
+                        })
+                        .clicked()
+                    {
+                        edited.locked = !edited.locked;
+                        changed = true;
+                    }
                     if ui.small_button("✖").on_hover_text("Delete image").clicked() {
                         delete = Some(id);
                     }
@@ -2598,56 +2888,70 @@ fn reference_image_rows(
                     );
                 });
 
-                ui.horizontal(|ui| {
-                    ui.label("Plane");
-                    for plane in ImagePlane::ALL {
+                let transform_enabled = !edited.locked;
+                ui.add_enabled_ui(transform_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Plane");
+                        for plane in ImagePlane::ALL {
+                            if ui
+                                .selectable_label(edited.plane == plane, plane.label())
+                                .clicked()
+                                && edited.plane != plane
+                            {
+                                edited.plane = plane;
+                                changed = true;
+                            }
+                        }
+                    });
+
+                    ui.label("Location");
+                    ui.horizontal(|ui| {
+                        for value in [
+                            &mut edited.location.x,
+                            &mut edited.location.y,
+                            &mut edited.location.z,
+                        ] {
+                            changed |= ui
+                                .add(egui::DragValue::new(value).speed(0.05))
+                                .changed();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Rotation");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut edited.rotation_deg)
+                                    .speed(1.0)
+                                    .suffix("°"),
+                            )
+                            .changed();
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        let mut width = unit.from_meters(edited.width_m);
                         if ui
-                            .selectable_label(edited.plane == plane, plane.label())
-                            .clicked()
-                            && edited.plane != plane
+                            .add(
+                                egui::DragValue::new(&mut width)
+                                    .speed(0.02 * unit.per_meter() as f64)
+                                    .range(unit.from_meters(0.01)..=unit.from_meters(1000.0))
+                                    .suffix(format!(" {}", unit.suffix())),
+                            )
+                            .changed()
                         {
-                            edited.plane = plane;
+                            edited.width_m = unit.to_meters(width).max(0.01);
                             changed = true;
                         }
-                    }
+                    });
                 });
-
-                ui.label("Location");
-                ui.horizontal(|ui| {
-                    for value in [&mut edited.location.x, &mut edited.location.y, &mut edited.location.z] {
-                        changed |= ui
-                            .add(egui::DragValue::new(value).speed(0.05))
-                            .changed();
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Rotation");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut edited.rotation_deg)
-                                .speed(1.0)
-                                .suffix("°"),
-                        )
-                        .changed();
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Width");
-                    let mut width = unit.from_meters(edited.width_m);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut width)
-                                .speed(0.02 * unit.per_meter() as f64)
-                                .range(unit.from_meters(0.01)..=unit.from_meters(1000.0))
-                                .suffix(format!(" {}", unit.suffix())),
-                        )
-                        .changed()
-                    {
-                        edited.width_m = unit.to_meters(width).max(0.01);
-                        changed = true;
-                    }
-                });
+                if edited.locked {
+                    ui.label(
+                        egui::RichText::new("Locked — unlock to move, rotate or scale")
+                            .weak()
+                            .size(11.0),
+                    );
+                }
 
                 ui.horizontal(|ui| {
                     ui.label("Opacity");
@@ -2674,15 +2978,21 @@ fn reference_image_rows(
                     if ui.button("Cancel scale picking").clicked() {
                         calibrate.cancel();
                     }
-                } else if ui
-                    .button("Scale from 2 points…")
-                    .on_hover_text(
-                        "Click two points on the image in the viewport, then enter \
-                         the real distance between them",
-                    )
-                    .clicked()
-                {
-                    calibrate.start(id);
+                } else {
+                    let scale_btn = ui
+                        .add_enabled(
+                            !edited.locked,
+                            egui::Button::new("Scale from 2 points…"),
+                        )
+                        .on_hover_text(if edited.locked {
+                            "Unlock the image to scale it from two points"
+                        } else {
+                            "Click two points on the image in the viewport, then enter \
+                             the real distance between them"
+                        });
+                    if scale_btn.clicked() {
+                        calibrate.start(id);
+                    }
                 }
 
                 // AI markers: annotate the image for the AI assistant
@@ -2902,6 +3212,7 @@ enum PropertiesTab {
     Data,
     Modifiers,
     Material,
+    PbrLibrary,
     Physics,
 }
 
@@ -2912,6 +3223,7 @@ impl PropertiesTab {
             Self::Data => "Object Data",
             Self::Modifiers => "Modifiers",
             Self::Material => "Material",
+            Self::PbrLibrary => "PBR Library",
             Self::Physics => "Physics",
         }
     }
@@ -2923,6 +3235,7 @@ impl PropertiesTab {
             Self::Data => PieIcon::Data,
             Self::Modifiers => PieIcon::Modifier,
             Self::Material => PieIcon::MaterialColor,
+            Self::PbrLibrary => PieIcon::PbrLibrary,
             Self::Physics => PieIcon::Physics,
         }
     }
@@ -2933,7 +3246,8 @@ impl PropertiesTab {
             Self::Data => "Primitive / mesh / light parameters",
             Self::Modifiers => "Modifier stack (subdivision, boolean)",
             Self::Material => "PBR material, masters, world effects & MPC",
-            Self::Physics => "Dynamic body, density, initial force",
+            Self::PbrLibrary => "Browse free PBR collections (ambientCG, Poly Haven)",
+            Self::Physics => "Dynamic body, density, bounciness, initial force",
         }
     }
 }
@@ -3018,6 +3332,7 @@ struct PropDirty {
     dynamic: bool,
     density: bool,
     force: bool,
+    bounciness: bool,
     adorn_label: bool,
     adorn_dims: bool,
 }
@@ -3035,6 +3350,7 @@ impl PropDirty {
             || self.dynamic
             || self.density
             || self.force
+            || self.bounciness
             || self.adorn_label
             || self.adorn_dims
     }
@@ -3064,7 +3380,7 @@ fn apply_prop_dirty(
     primitive: Primitive,
     material: &Material,
     smooth: bool,
-    phys: (bool, f32, Vec3),
+    phys: (bool, f32, Vec3, f32),
     adorn: (bool, bool),
     pivot: Vec3,
     anchor: Vec3,
@@ -3074,7 +3390,7 @@ fn apply_prop_dirty(
     if dirty.material_any() {
         let ids: Vec<ObjectId> = targets.to_vec();
         for id in ids {
-            if scene.object(id).is_some_and(|o| o.primitive.is_light()) {
+            if scene.object(id).is_some_and(|o| o.primitive.is_gizmo()) {
                 continue;
             }
             let Some(mut m) = scene.object_material(id) else {
@@ -3082,6 +3398,8 @@ fn apply_prop_dirty(
             };
             if dirty.material_color {
                 m.base_color = material.base_color;
+                // Texture maps / UV scale share this dirty bit (Clear textures, UV scale).
+                m.textures = material.textures.clone();
             }
             if dirty.material_roughness {
                 m.roughness = material.roughness;
@@ -3119,14 +3437,18 @@ fn apply_prop_dirty(
         let Some(object) = scene.object_mut(id) else {
             continue;
         };
-        if dirty.location {
-            object.transform.location = transform.location;
-        }
-        if dirty.rotation {
-            object.transform.rotation = transform.rotation;
-        }
-        if dirty.scale {
-            object.transform.scale = transform.scale;
+        // locked objects keep their transform (UI disables the fields, but
+        // multi-select write must also skip any locked non-active targets)
+        if !object.locked {
+            if dirty.location {
+                object.transform.location = transform.location;
+            }
+            if dirty.rotation {
+                object.transform.rotation = transform.rotation;
+            }
+            if dirty.scale {
+                object.transform.scale = transform.scale;
+            }
         }
         if dirty.pivot {
             object.pivot = pivot;
@@ -3135,19 +3457,45 @@ fn apply_prop_dirty(
             object.anchor = anchor;
         }
         if dirty.primitive && std::mem::discriminant(&object.primitive) == active_disc {
+            if let (
+                Primitive::Cloth {
+                    segments_u: old_su,
+                    segments_v: old_sv,
+                    ..
+                },
+                Primitive::Cloth {
+                    segments_u: new_su,
+                    segments_v: new_sv,
+                    ..
+                },
+            ) = (object.primitive, primitive)
+            {
+                if old_su != new_su || old_sv != new_sv {
+                    object.cloth_anchors = crate::cloth_handles::remap_cloth_anchors(
+                        &object.cloth_anchors,
+                        old_su.max(1),
+                        old_sv.max(1),
+                        new_su.max(1),
+                        new_sv.max(1),
+                    );
+                }
+            }
             object.primitive = primitive;
         }
-        if dirty.smooth && !object.primitive.is_light() {
+        if dirty.smooth && !object.primitive.is_gizmo() {
             object.smooth = smooth;
         }
-        if dirty.dynamic && !object.primitive.is_light() {
+        if dirty.dynamic && !object.primitive.is_gizmo() {
             object.dynamic = phys.0;
         }
-        if dirty.density && !object.primitive.is_light() {
+        if dirty.density && !object.primitive.is_gizmo() {
             object.density = phys.1;
         }
-        if dirty.force && !object.primitive.is_light() && object.dynamic {
+        if dirty.force && !object.primitive.is_gizmo() && object.dynamic {
             object.initial_force = phys.2;
+        }
+        if dirty.bounciness && !object.primitive.is_gizmo() {
+            object.bounciness = phys.3;
         }
         if dirty.adorn_label {
             object.show_label = adorn.0;
@@ -3166,10 +3514,16 @@ fn properties(
     edit_point: Option<(ObjectId, Vec3)>,
     break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
     tab: &mut PropertiesTab,
+    pbr_library: &mut PbrLibraryPanel,
+    pick_boolean_tool: &mut Option<(ObjectId, usize)>,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
-        ui.weak("No active object");
-        return None;
+        // PBR library can be browsed without a selection (Apply still needs one).
+        theme::section_header(ui, "Properties");
+        let available = [PropertiesTab::PbrLibrary];
+        properties_tab_bar(ui, tab, &available);
+        pbr_library.section(ui, scene, selection);
+        return pbr_library.take_status();
     };
     let Some(object) = scene.object(active_id) else {
         return None;
@@ -3210,17 +3564,18 @@ fn properties(
         }
     }
 
-    // Which tabs apply to this object (lights/empties hide material, physics, …)
-    let is_light = object.primitive.is_light();
-    let is_empty = matches!(object.primitive, Primitive::Empty { .. });
-    let solid = !is_light && !is_empty;
+    // Which tabs apply to this object (lights/cameras/empties hide material, physics, …)
+    let is_gizmo = object.primitive.is_gizmo();
+    let solid = !is_gizmo;
     let mut available = vec![PropertiesTab::Transform, PropertiesTab::Data];
     if solid {
         available.push(PropertiesTab::Modifiers);
         available.push(PropertiesTab::Material);
+        available.push(PropertiesTab::PbrLibrary);
         available.push(PropertiesTab::Physics);
-    } else if !is_light {
-        // empties: no material/physics/modifiers
+    } else {
+        // Still allow browsing the free PBR collections on gizmos.
+        available.push(PropertiesTab::PbrLibrary);
     }
     properties_tab_bar(ui, tab, &available);
 
@@ -3229,10 +3584,10 @@ fn properties(
     let mut primitive = object.primitive;
     let mut material = scene
         .object_material(active_id)
-        .unwrap_or(object.material);
+        .unwrap_or_else(|| object.material.clone());
     let material_master = object.material_master;
     let mut smooth = object.smooth;
-    let mut phys = (object.dynamic, object.density, object.initial_force);
+    let mut phys = (object.dynamic, object.density, object.initial_force, object.bounciness);
     let mut adorn = (object.show_label, object.show_dimensions);
     let mut pivot = object.pivot;
     let mut anchor = object.anchor;
@@ -3246,33 +3601,64 @@ fn properties(
     let mut modifier_add: Option<modeler_core::ModifierKind> = None;
     let mut modifier_remove: Option<usize> = None;
     let mut modifier_apply: Option<usize> = None;
+    // Set when the Transform tab's Locked checkbox is toggled (applied after
+    // the UI so we don't mut-borrow the scene while `object` is live).
+    let mut lock_write: Option<bool> = None;
 
     match *tab {
         PropertiesTab::Transform => {
-            dirty.location |= vec3_row(ui, "Location", &mut transform.location, 0.05);
-
-            let (rx, ry, rz) = transform.rotation.to_euler(EulerRot::XYZ);
-            let mut degrees = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
-            let mut rot_changed = false;
-            ui.label("Rotation");
-            ui.horizontal(|ui| {
-                for value in &mut degrees {
-                    rot_changed |= ui
-                        .add(egui::DragValue::new(value).speed(1.0).suffix("°"))
-                        .changed();
-                }
-            });
-            if rot_changed {
-                transform.rotation = Quat::from_euler(
-                    EulerRot::XYZ,
-                    degrees[0].to_radians(),
-                    degrees[1].to_radians(),
-                    degrees[2].to_radians(),
-                );
-                dirty.rotation = true;
+            let mut locked_flag = object.locked;
+            if ui
+                .checkbox(&mut locked_flag, "Locked")
+                .on_hover_text(
+                    "Prevent move, rotate and scale (G/R/S, property drags, \
+                     End / Drop to floor). Unlock to transform again.",
+                )
+                .changed()
+            {
+                lock_write = Some(locked_flag);
             }
+            if locked_flag {
+                ui.label(
+                    egui::RichText::new("Unlock to edit location, rotation and scale")
+                        .weak()
+                        .size(11.0),
+                );
+            }
+            ui.add_enabled_ui(!locked_flag, |ui| {
+                dirty.location |= vec3_row(ui, "Location", &mut transform.location, 0.05);
 
-            dirty.scale |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+                let (rx, ry, rz) = transform.rotation.to_euler(EulerRot::XYZ);
+                let mut degrees = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
+                let mut rot_changed = false;
+                ui.label("Rotation");
+                ui.horizontal(|ui| {
+                    for (axis, value) in ["X", "Y", "Z"].iter().zip(degrees.iter_mut()) {
+                        ui.label(*axis);
+                        rot_changed |= ui
+                            .add(
+                                egui::DragValue::new(value)
+                                    .speed(1.0)
+                                    .suffix("°")
+                                    .fixed_decimals(1)
+                                    .min_decimals(0),
+                            )
+                            .changed();
+                    }
+                });
+                // (rotation labels improve scanability for human entry)
+                if rot_changed {
+                    transform.rotation = Quat::from_euler(
+                        EulerRot::XYZ,
+                        degrees[0].to_radians(),
+                        degrees[1].to_radians(),
+                        degrees[2].to_radians(),
+                    );
+                    dirty.rotation = true;
+                }
+
+                dirty.scale |= vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+            });
 
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Pivot & Anchor").strong());
@@ -3354,7 +3740,7 @@ fn properties(
                     !object.floor_outline.is_empty(),
                     Some((scene, active_id)),
                 );
-                if !primitive.is_light() {
+                if !primitive.is_gizmo() {
                     dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
                 }
 
@@ -3367,7 +3753,23 @@ fn properties(
                     }
                 }
 
-                if primitive.is_rope() {
+                // Clone soft-body pin data before any scene.object_mut below
+                // (we still hold an immutable `object` borrow from earlier).
+                let rope_start = object.rope_start;
+                let rope_end = object.rope_end;
+                let cloth_anchors = object.cloth_anchors.clone();
+                let is_rope = primitive.is_rope();
+                let is_cloth = primitive.is_cloth();
+                let (cloth_su, cloth_sv) = match primitive {
+                    Primitive::Cloth {
+                        segments_u,
+                        segments_v,
+                        ..
+                    } => (segments_u.clamp(1, 24), segments_v.clamp(1, 24)),
+                    _ => (8, 8),
+                };
+
+                if is_rope {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Anchors").strong());
                     ui.label(
@@ -3380,8 +3782,8 @@ fn properties(
                         .weak()
                         .size(11.0),
                     );
-                    let mut start = object.rope_start;
-                    let mut end = object.rope_end;
+                    let mut start = rope_start;
+                    let mut end = rope_end;
                     let mut rope_dirty = false;
                     rope_dirty |= rope_end_row(ui, scene, active_id, "Start", &mut start);
                     rope_dirty |= rope_end_row(ui, scene, active_id, "End", &mut end);
@@ -3395,9 +3797,123 @@ fn properties(
                         crate::rope_handles::snap_rope_rest_pose(scene, active_id);
                     }
                 }
+
+                if is_cloth {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Cloth anchors").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Drag numbered handles → object to pin · drop empty \
+                             to free · Alt+click cloth to add pin at nearest vertex",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                    let (su, sv) = (cloth_su, cloth_sv);
+                    let mut anchors = cloth_anchors;
+                    let mut dirty = false;
+                    let mut remove: Option<usize> = None;
+                    for (i, a) in anchors.iter_mut().enumerate() {
+                        let corner = corner_label(a.u, a.v, su, sv);
+                        ui.horizontal(|ui| {
+                            ui.label(match corner {
+                                Some(c) => format!("#{} ({c})", i + 1),
+                                None => format!("#{}", i + 1),
+                            });
+                            let mut col = a.u as i32;
+                            let mut row = a.v as i32;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut col)
+                                        .range(0..=su as i32)
+                                        .prefix("col "),
+                                )
+                                .on_hover_text("Grid column along width (0 = left)")
+                                .changed()
+                            {
+                                a.u = col as u32;
+                                dirty = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut row)
+                                        .range(0..=sv as i32)
+                                        .prefix("row "),
+                                )
+                                .on_hover_text("Grid row along height (0 = bottom)")
+                                .changed()
+                            {
+                                a.v = row as u32;
+                                dirty = true;
+                            }
+                            if ui.small_button("×").on_hover_text("Remove anchor").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        let mut end = modeler_core::RopeEnd {
+                            object: a.object,
+                            local_point: a.local_point,
+                        };
+                        if rope_end_row(ui, scene, active_id, "  Target", &mut end) {
+                            a.object = end.object;
+                            a.local_point = end.local_point;
+                            dirty = true;
+                        }
+                    }
+                    if let Some(i) = remove {
+                        anchors.remove(i);
+                        dirty = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Corners")
+                            .on_hover_text("Ensure free anchors on all four corners")
+                            .clicked()
+                        {
+                            for c in modeler_core::ClothAnchor::default_corners(su, sv) {
+                                if !anchors.iter().any(|a| a.u == c.u && a.v == c.v) {
+                                    anchors.push(c);
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        if ui
+                            .button("Pin top edge")
+                            .on_hover_text(
+                                "Add free anchors along the top row (high row). \
+                                 Attach them to a bar with the Target menus or handles.",
+                            )
+                            .clicked()
+                        {
+                            for u in 0..=su {
+                                if !anchors.iter().any(|a| a.u == u && a.v == sv) {
+                                    anchors.push(modeler_core::ClothAnchor::free(u, sv));
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        if ui
+                            .button("+ Anchor")
+                            .on_hover_text("Add free pin at top-center")
+                            .clicked()
+                        {
+                            let (u, v) = (su / 2, sv);
+                            if !anchors.iter().any(|a| a.u == u && a.v == v) {
+                                anchors.push(modeler_core::ClothAnchor::free(u, v));
+                                dirty = true;
+                            }
+                        }
+                    });
+                    if dirty {
+                        if let Some(object) = scene.object_mut(active_id) {
+                            object.cloth_anchors = anchors;
+                        }
+                        crate::cloth_handles::align_cloth_to_pins(scene, active_id);
+                    }
+                }
             }
 
-            let breakable = solid && !primitive.is_rope();
+            let breakable = solid && !primitive.is_soft_sim();
             if breakable {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Shatter").strong());
@@ -3501,11 +4017,7 @@ fn properties(
                                 .show_ui(ui, |ui| {
                                     for candidate in scene.objects() {
                                         if candidate.id == active_id
-                                            || candidate.primitive.is_light()
-                                            || matches!(
-                                                candidate.primitive,
-                                                Primitive::Empty { .. }
-                                            )
+                                            || candidate.primitive.is_gizmo()
                                         {
                                             continue;
                                         }
@@ -3522,7 +4034,32 @@ fn properties(
                                         }
                                     }
                                 });
+                            // Eyedropper: arm the viewport so the next click
+                            // on an object picks it as the tool. Clicking the
+                            // button again disarms it.
+                            let armed = *pick_boolean_tool == Some((active_id, index));
+                            if ui
+                                .selectable_label(armed, "⌖") // egui-safe glyph
+                                .on_hover_text(
+                                    "Pick the tool object by clicking it in \
+                                     the viewport (Esc cancels)",
+                                )
+                                .clicked()
+                            {
+                                *pick_boolean_tool =
+                                    (!armed).then_some((active_id, index));
+                            }
                         });
+                        if *pick_boolean_tool == Some((active_id, index)) {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Click an object in the viewport to use it \
+                                     as the tool — Esc cancels.",
+                                )
+                                .weak()
+                                .size(11.0),
+                            );
+                        }
                     }
                 });
                 if row_changed {
@@ -3544,8 +4081,9 @@ fn properties(
                     .button("+ Boolean")
                     .on_hover_text(
                         "Union / subtract / intersect another object, previewed \
-                         live — pick the tool object in the dropdown, or use \
-                         Object ▸ Boolean with two objects selected",
+                         live — pick the tool object in the dropdown or with \
+                         the eyedropper, or use Object ▸ Boolean with two \
+                         objects selected",
                     )
                     .clicked()
                 {
@@ -3558,8 +4096,8 @@ fn properties(
             if !object.modifiers.is_empty() {
                 ui.label(
                     egui::RichText::new(
-                        "live preview — editing and physics use the base \
-                         shape until applied",
+                        "live preview — physics and clicking follow the \
+                         modified shape; edit mode (Tab) uses the base shape",
                     )
                     .weak()
                     .size(11.0),
@@ -3655,6 +4193,75 @@ fn properties(
                 &mut material.emissive_strength,
                 0.0..=10.0,
             );
+
+            ui.separator();
+            ui.label(egui::RichText::new("PBR textures").strong());
+            if material.textures.has_any() {
+                let maps: Vec<&str> = [
+                    material.textures.albedo.as_ref().map(|_| "albedo"),
+                    material.textures.normal.as_ref().map(|_| "normal"),
+                    material.textures.roughness.as_ref().map(|_| "roughness"),
+                    material.textures.metallic.as_ref().map(|_| "metallic"),
+                    material.textures.occlusion.as_ref().map(|_| "AO"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                ui.label(
+                    egui::RichText::new(format!("Maps: {}", maps.join(", ")))
+                        .weak()
+                        .size(11.0),
+                );
+                let uv = &mut material.textures;
+                ui.horizontal(|ui| {
+                    ui.label("UV scale")
+                        .on_hover_text("Texture repeats per meter, per UV axis");
+                    let mut changed = ui
+                        .add(
+                            egui::DragValue::new(&mut uv.uv_scale[0])
+                                .speed(0.02)
+                                .range(0.01..=200.0)
+                                .prefix("U "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut uv.uv_scale[1])
+                                .speed(0.02)
+                                .range(0.01..=200.0)
+                                .prefix("V "),
+                        )
+                        .changed();
+                    if ui
+                        .small_button("=")
+                        .on_hover_text("Match V to U (square tiles)")
+                        .clicked()
+                    {
+                        uv.uv_scale[1] = uv.uv_scale[0];
+                        changed = true;
+                    }
+                    dirty.material_color |= changed;
+                });
+                dirty.material_color |=
+                    slider_row(ui, "UV rotate", &mut uv.uv_rotation, -180.0..=180.0);
+                if ui
+                    .small_button("Clear textures")
+                    .on_hover_text("Remove all texture maps; keep scalar values")
+                    .clicked()
+                {
+                    material.textures = modeler_core::MaterialTextures::default();
+                    dirty.material_color = true;
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "No maps — open the PBR Library tab to browse \
+                         ambientCG / Poly Haven and Apply.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            }
 
             ui.separator();
             ui.label("World effect");
@@ -3770,10 +4377,18 @@ fn properties(
             }
         }
 
+        PropertiesTab::PbrLibrary => {
+            pbr_library.section(ui, scene, selection);
+            if let Some(message) = pbr_library.take_status() {
+                return Some(message);
+            }
+        }
+
         PropertiesTab::Physics => {
             let mut dynamic = object.dynamic;
             let mut density = object.density;
             let mut force = object.initial_force;
+            let mut bounciness = object.bounciness;
             if ui
                 .checkbox(&mut dynamic, "Dynamic")
                 .on_hover_text("Falls and collides during simulation (▶)")
@@ -3781,9 +4396,80 @@ fn properties(
             {
                 dirty.dynamic = true;
             }
+
+            // Surface response. Deliberately NOT gated on Dynamic: a static
+            // floor's bounciness is what makes balls dropped on it bounce
+            // (contacts take the higher of the two values).
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Bounciness").on_hover_text(
+                    "Elasticity of the surface (coefficient of restitution): \
+                     0 is a dead thud, 1 is a superball. Works on static \
+                     objects too — set it on the floor to make everything \
+                     bounce off it",
+                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut bounciness)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    dirty.bounciness = true;
+                }
+                ui.label(egui::RichText::new(bounciness_label(bounciness)).weak().size(11.0));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                for (label, value, hint) in BOUNCE_PRESETS {
+                    if ui.small_button(*label).on_hover_text(*hint).clicked() {
+                        bounciness = *value;
+                        dirty.bounciness = true;
+                    }
+                }
+            });
+            if object.primitive.is_soft_sim() {
+                ui.label(
+                    egui::RichText::new(
+                        "Rope and cloth nodes always use a non-bouncy contact \
+                         for stability — Bounciness does not affect them.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            }
+            ui.add_space(4.0);
+
             ui.add_enabled_ui(dynamic, |ui| {
-                if slider_row(ui, "Density", &mut density, 0.1..=20.0) {
-                    dirty.density = true;
+                ui.horizontal(|ui| {
+                    ui.label("Density");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut density)
+                                .speed(0.05)
+                                .range(0.01..=1000.0)
+                                .fixed_decimals(2)
+                                .min_decimals(1)
+                                .suffix(" kg/m³"),
+                        )
+                        .changed()
+                    {
+                        dirty.density = true;
+                    }
+                });
+                // Soft bodies use their own particle mass; keep the field but
+                // explain so Density doesn't look broken.
+                if object.primitive.is_soft_sim() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Soft bodies (rope/cloth) use fixed particle mass \
+                             for stability — Density does not affect them.",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
                 }
                 ui.add_space(4.0);
                 ui.label("Initial force").on_hover_text(
@@ -3801,7 +4487,10 @@ fn properties(
                         .add(
                             egui::DragValue::new(&mut mag)
                                 .speed(0.5)
-                                .range(0.0..=10_000.0),
+                                .range(0.0..=10_000.0)
+                                .fixed_decimals(2)
+                                .min_decimals(0)
+                                .suffix(" N·s"),
                         )
                         .changed()
                     {
@@ -3824,7 +4513,15 @@ fn properties(
                     }
                 });
             });
-            phys = (dynamic, density, force);
+            phys = (dynamic, density, force, bounciness);
+        }
+    }
+
+    if let Some(locked) = lock_write {
+        for &id in selection.selected() {
+            if let Some(object) = scene.object_mut(id) {
+                object.locked = locked;
+            }
         }
     }
 
@@ -3947,6 +4644,29 @@ fn select_mode_button(ui: &mut egui::Ui, active: bool, mode: SelectMode) -> egui
     response
 }
 
+/// Bounciness shortcuts: real-world coefficients of restitution, ordered
+/// hard-and-dead → rubbery. Kept short so the row fits the standard panel
+/// width.
+const BOUNCE_PRESETS: &[(&str, f32, &str)] = &[
+    ("Clay", 0.0, "Dead thud — clay, sandbag, putty (0.00)"),
+    ("Wood", 0.25, "Wood, concrete, packed earth (0.25)"),
+    ("Steel", 0.5, "Hard but lively — steel, glass, marble (0.50)"),
+    ("Rubber", 0.8, "Rubber ball, tyre (0.80)"),
+    ("Super", 0.95, "Superball — barely loses energy (0.95)"),
+];
+
+/// Word for the current bounciness, so the number reads as a material feel.
+fn bounciness_label(value: f32) -> &'static str {
+    match value {
+        v if v < 0.05 => "dead",
+        v if v < 0.2 => "hard",
+        v if v < 0.4 => "firm",
+        v if v < 0.65 => "lively",
+        v if v < 0.9 => "rubbery",
+        _ => "superball",
+    }
+}
+
 fn vec3_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -3956,9 +4676,21 @@ fn vec3_row(
     let mut changed = false;
     ui.label(label);
     ui.horizontal(|ui| {
-        changed |= ui.add(egui::DragValue::new(&mut value.x).speed(speed)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut value.y).speed(speed)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut value.z).speed(speed)).changed();
+        for (axis, v) in [
+            ("X", &mut value.x),
+            ("Y", &mut value.y),
+            ("Z", &mut value.z),
+        ] {
+            ui.label(axis);
+            changed |= ui
+                .add(
+                    egui::DragValue::new(v)
+                        .speed(speed)
+                        .fixed_decimals(3)
+                        .min_decimals(1),
+                )
+                .changed();
+        }
     });
     changed
 }
@@ -3984,15 +4716,47 @@ fn int_row(ui: &mut egui::Ui, label: &str, value: &mut u32, range: std::ops::Ran
     .inner
 }
 
+/// Corner name for a cloth grid vertex, if it sits on a corner.
+fn corner_label(u: u32, v: u32, su: u32, sv: u32) -> Option<&'static str> {
+    match (u == 0, u == su, v == 0, v == sv) {
+        (true, _, true, _) => Some("BL"),
+        (_, true, true, _) => Some("BR"),
+        (true, _, _, true) => Some("TL"),
+        (_, true, _, true) => Some("TR"),
+        _ => None,
+    }
+}
+
+/// Float field with fixed display decimals so humans can read/type values
+/// (avoids `-0.899999976` noise from binary floats).
 fn float_row(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64) -> bool {
+    float_row_ex(ui, label, value, speed, 0.001..=1000.0, None)
+}
+
+fn float_row_ex(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    speed: f64,
+    range: std::ops::RangeInclusive<f64>,
+    suffix: Option<&str>,
+) -> bool {
     ui.horizontal(|ui| {
         ui.label(label);
-        ui.add(egui::DragValue::new(value).speed(speed).range(0.001..=1000.0)).changed()
+        let mut dv = egui::DragValue::new(value)
+            .speed(speed)
+            .range(range)
+            .fixed_decimals(3)
+            .min_decimals(1);
+        if let Some(s) = suffix {
+            dv = dv.suffix(s);
+        }
+        ui.add(dv).changed()
     })
     .inner
 }
 
-/// Combo for pinning a rope end to another scene object (or free).
+/// Combo for pinning a rope/cloth end to another scene object (or free).
 fn rope_end_row(
     ui: &mut egui::Ui,
     scene: &Scene,
@@ -4007,7 +4771,7 @@ fn rope_end_row(
             .object
             .and_then(|id| scene.object(id).map(|o| o.name.as_str()))
             .unwrap_or("(free)");
-        egui::ComboBox::from_id_salt(format!("rope-{label}-{}", rope_id.0))
+        let combo = egui::ComboBox::from_id_salt(format!("rope-{label}-{}", rope_id.0))
             .selected_text(current)
             .width(140.0)
             .show_ui(ui, |ui| {
@@ -4020,8 +4784,8 @@ fn rope_end_row(
                     changed = true;
                 }
                 for object in scene.objects() {
-                    if object.id == rope_id || object.primitive.is_rope() {
-                        continue; // don't self-pin or pin rope-to-rope (cycles)
+                    if object.id == rope_id || object.primitive.is_soft_sim() {
+                        continue; // don't self-pin or pin soft-to-soft (cycles)
                     }
                     let selected = end.object == Some(object.id);
                     if ui.selectable_label(selected, &object.name).clicked() && !selected {
@@ -4032,10 +4796,13 @@ fn rope_end_row(
                     }
                 }
             });
+        combo.response.on_hover_text(
+            "Ropes and cloth cannot be pin targets (would create soft-body cycles)",
+        );
     });
     if end.object.is_some() {
         ui.horizontal(|ui| {
-            ui.label(format!("  {label} point"));
+            ui.label(format!("  {label} attach (m)"));
             for (axis, v) in [
                 ("X", &mut end.local_point.x),
                 ("Y", &mut end.local_point.y),
@@ -4043,7 +4810,12 @@ fn rope_end_row(
             ] {
                 ui.label(axis);
                 if ui
-                    .add(egui::DragValue::new(v).speed(0.05))
+                    .add(
+                        egui::DragValue::new(v)
+                            .speed(0.01)
+                            .fixed_decimals(3)
+                            .min_decimals(1),
+                    )
                     .changed()
                 {
                     changed = true;
@@ -4163,6 +4935,25 @@ fn primitive_params(
                 .size(11.0),
             );
         }
+        Primitive::Camera {
+            fov_deg,
+            clip_start,
+            clip_end,
+        } => {
+            changed |= slider_row(ui, "FOV °", fov_deg, 1.0..=170.0);
+            changed |= float_row(ui, "Clip start", clip_start, 0.001);
+            *clip_start = clip_start.max(0.001);
+            changed |= float_row(ui, "Clip end", clip_end, 0.1);
+            *clip_end = clip_end.max(*clip_start + 0.01);
+            ui.label(
+                egui::RichText::new(
+                    "Looks along local −Z (rotate to aim). Press F12 for a live \
+                     view from this camera (updates in real time).",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
         Primitive::Rope {
             length,
             radius,
@@ -4171,7 +4962,14 @@ fn primitive_params(
             ui.horizontal(|ui| {
                 ui.label("Length");
                 changed |= ui
-                    .add(egui::DragValue::new(length).speed(0.02).range(0.05..=1000.0))
+                    .add(
+                        egui::DragValue::new(length)
+                            .speed(0.02)
+                            .range(0.05..=1000.0)
+                            .fixed_decimals(3)
+                            .min_decimals(1)
+                            .suffix(" m"),
+                    )
                     .changed();
                 // When both ends are pinned, snap design length to the pin span.
                 let both_pinned = rope_ctx.is_some_and(|(scene, id)| {
@@ -4205,15 +5003,67 @@ fn primitive_params(
                     }
                 }
             });
-            changed |= float_row(ui, "Radius", radius, 0.002);
+            changed |= float_row_ex(ui, "Radius", radius, 0.002, 0.001..=10.0, Some(" m"));
             changed |= int_row(ui, "Segments", segments, 2..=64);
             ui.label(
                 egui::RichText::new(
-                    "Drag the green (start) and blue (end) handles in the \
-                     viewport to place the ends. Anchor each end to another \
-                     object below, then press Play — the rope sags and \
-                     swings under gravity. Use Adjust length when both ends \
-                     are pinned to match the pin-to-pin distance.",
+                    "Drag green/blue handles onto objects to pin · Play to sag. \
+                     Adjust length when both ends are pinned.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Cloth {
+            width,
+            height,
+            segments_u,
+            segments_v,
+            stiffness,
+        } => {
+            changed |= float_row_ex(ui, "Width", width, 0.02, 0.05..=1000.0, Some(" m"));
+            changed |= float_row_ex(ui, "Height", height, 0.02, 0.05..=1000.0, Some(" m"));
+            changed |= int_row(ui, "Cols (along width)", segments_u, 1..=24);
+            changed |= int_row(ui, "Rows (along height)", segments_v, 1..=24);
+            ui.horizontal(|ui| {
+                ui.label("Stiffness");
+                changed |= ui
+                    .add(egui::Slider::new(stiffness, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text(
+                        "0 = soft drape · 1 = stiff / near-rigid fabric. \
+                         Change takes effect next Play.",
+                    )
+                    .changed();
+                *stiffness = stiffness.clamp(0.0, 1.0);
+                ui.label(
+                    egui::RichText::new(if *stiffness < 0.2 {
+                        "soft"
+                    } else if *stiffness < 0.55 {
+                        "medium"
+                    } else if *stiffness < 0.9 {
+                        "firm"
+                    } else {
+                        "stiff"
+                    })
+                    .weak()
+                    .size(11.0),
+                );
+            });
+            let cells = (*segments_u as u64) * (*segments_v as u64);
+            if cells > 100 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "High resolution ({cells} cells) — sim may run slower."
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            }
+            let _ = rope_ctx; // used by rope Adjust length; cloth remaps on apply
+            ui.label(
+                egui::RichText::new(
+                    "Sheet in local XY (default hangs vertically). Pin vertices \
+                     with handles / Alt+click, then Play.",
                 )
                 .weak()
                 .size(11.0),
@@ -4365,7 +5215,7 @@ mod multi_prop_tests {
             Primitive::Cube { size: 1.0 },
             &material,
             false,
-            (false, 1.0, Vec3::ZERO),
+            (false, 1.0, Vec3::ZERO, 0.0),
             (false, false),
             Vec3::ZERO,
             Vec3::ZERO,
@@ -4408,7 +5258,7 @@ mod multi_prop_tests {
             Primitive::Cube { size: 1.0 },
             &material,
             false,
-            (false, 1.0, Vec3::ZERO),
+            (false, 1.0, Vec3::ZERO, 0.0),
             (false, false),
             Vec3::ZERO,
             Vec3::ZERO,
@@ -4445,7 +5295,7 @@ mod multi_prop_tests {
             Primitive::Cube { size: 1.0 },
             &Material::default(),
             false,
-            (false, 1.0, Vec3::ZERO),
+            (false, 1.0, Vec3::ZERO, 0.0),
             (false, false),
             Vec3::ZERO,
             Vec3::ZERO,
@@ -4484,7 +5334,7 @@ mod multi_prop_tests {
             Primitive::Cube { size: 2.5 },
             &Material::default(),
             false,
-            (false, 1.0, Vec3::ZERO),
+            (false, 1.0, Vec3::ZERO, 0.0),
             (false, false),
             Vec3::ZERO,
             Vec3::ZERO,

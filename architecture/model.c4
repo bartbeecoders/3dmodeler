@@ -1,0 +1,287 @@
+// 3D Modeler — logical architecture of the box3d repository
+// Root: physics engine (C) + browser/native modeler (Rust workspace under 3dmodeler/)
+model {
+
+  user = person 'User / Designer' {
+    description 'Models scenes in the viewport, runs physics preview, saves .bee3d'
+  }
+
+  agent = person 'AI coding agent' {
+    description 'Claude Code, Cursor, etc. — drives the live scene via MCP'
+  }
+
+  chatUser = person 'Chat user' {
+    description 'Uses the in-app AI assistant panel to build/edit the scene in natural language'
+  }
+
+  // ─── Repository as a system of systems ─────────────────────────────
+  repo = system '3D Modeler workspace (box3d)' {
+    description '''
+      Combined workspace: Box3D rigid-body physics engine (C17) and the
+      3D Modeler product (Rust + WASM) that uses Box3D for picking and simulation.
+    '''
+
+    // ── Box3D physics engine ─────────────────────────────────────────
+    box3d = engine 'Box3D physics engine' {
+      #physics
+      description 'Portable C17 3D rigid body + collision library (libbox3d)'
+      metadata {
+        path 'src/, include/box3d/'
+        language 'C17'
+      }
+
+      publicApi = library 'Public C API' {
+        #physics
+        description 'Headers under include/box3d (b3* types, world, bodies, shapes, joints)'
+        metadata {
+          path 'include/box3d'
+        }
+      }
+
+      coreSim = component 'Simulation core' {
+        #physics
+        description 'World, islands, solver (Soft Step), contacts, joints, sensors, character mover'
+        metadata {
+          path 'src/physics_world.c, solver*, joint*, contact*, island*'
+        }
+      }
+
+      collision = component 'Collision' {
+        #physics
+        description 'Broad-phase dynamic tree, manifolds, hulls, meshes, height fields, casts'
+        metadata {
+          path 'src/broad_phase*, manifold*, mesh*, hull*, distance*'
+        }
+      }
+
+      threading = component 'Scheduler / SIMD' {
+        #physics
+        description 'Multithreading workers, parallel_for, SIMD helpers; serial when workerCount ≤ 1'
+        metadata {
+          path 'src/scheduler*, parallel_for*, simd*'
+        }
+      }
+
+      recording = component 'Recording / replay' {
+        #physics
+        description 'Deterministic recording and replay of simulation'
+        metadata {
+          path 'src/recording*'
+        }
+      }
+
+      publicApi -> coreSim
+      publicApi -> collision
+      coreSim -> collision
+      coreSim -> threading
+      coreSim -> recording
+    }
+
+    box3dSamples = app 'Box3D samples' {
+      #physics #native
+      description 'ImGui + sokol sample browser demonstrating engine features'
+      metadata {
+        path 'samples/'
+      }
+    }
+
+    box3dTests = app 'Box3D unit tests' {
+      #physics #native
+      description 'C test suite for core, collision, determinism, recording, …'
+      metadata {
+        path 'test/'
+      }
+    }
+
+    box3dBench = app 'Box3D benchmarks' {
+      #physics #native
+      description 'Performance harness (trees, piles, worlds)'
+      metadata {
+        path 'benchmark/'
+      }
+    }
+
+    box3dDocs = library 'Box3D API docs' {
+      #physics
+      description 'Doxygen-style markdown (overview, collision, simulation, …)'
+      metadata {
+        path 'docs/'
+      }
+    }
+
+    box3dSamples -> box3d.publicApi 'links libbox3d + sokol/imgui host'
+    box3dTests -> box3d.publicApi
+    box3dBench -> box3d.publicApi
+
+    // ── 3D Modeler product ───────────────────────────────────────────
+    modeler = system '3D Modeler' {
+      #modeler
+      description '''
+        Browser-hosted 3D modeler (Rust + WASM) with Blender-style UI,
+        physics preview via Box3D, MCP control, and AI chat.
+      '''
+      metadata {
+        path '3dmodeler/'
+        version '0.2.x'
+      }
+
+      core = library 'modeler-core' {
+        #modeler
+        description 'Scene document, meshes, materials, commands/undo, library — no rendering, no FFI'
+        metadata {
+          path '3dmodeler/crates/modeler-core'
+          crate 'modeler-core'
+        }
+
+        scene = component 'Scene graph' {
+          description 'Objects, hierarchy, transforms, primitives, walls, lights'
+        }
+        mesh = component 'Mesh / booleans' {
+          description 'Mesh generation, edit topology, boolmesh CSG'
+        }
+        cmds = component 'Command model' {
+          description 'Serializable edits; foundation for undo and external control'
+        }
+        assets = component 'Object library' {
+          description 'Reusable assets (.bee3d library entries)'
+        }
+
+        scene -> mesh
+        cmds -> scene
+        assets -> scene
+      }
+
+      box3dSys = library 'box3d-sys' {
+        #physics #modeler
+        description 'bindgen FFI to Box3D; native links libbox3d.a; wasm cross-compiles C + shims'
+        metadata {
+          path '3dmodeler/crates/box3d-sys'
+          crate 'box3d-sys'
+        }
+      }
+
+      appCrate = app 'modeler-app' {
+        #modeler #ui #native #wasm
+        description 'Viewport, tools, egui UI, physics mirror, native main + wasm entry'
+        metadata {
+          path '3dmodeler/crates/modeler-app'
+          crate 'modeler-app'
+        }
+
+        viewport = component 'Viewport / camera' {
+          #ui
+          description 'three-d WebGL2/OpenGL, Z-up, orbit/pan/zoom, shading modes, gizmo'
+        }
+        editorUi = component 'Editor UI (egui)' {
+          #ui
+          description 'Menus, outliner, properties, pie menus, themes, preferences'
+        }
+        tools = component 'Modeling tools' {
+          #ui
+          description 'G/R/S, wall/roof tools, edit mode, selection, reference images'
+        }
+        physicsMirror = component 'Physics mirror' {
+          #physics
+          description 'Static bodies for picking/overlap; dynamic rebuild on play @ 60 Hz'
+        }
+        commandExec = component 'Command executor' {
+          description 'Shared JSON command path for MCP + AI chat'
+        }
+        controlApi = component 'HTTP control API' {
+          #native
+          description 'localhost:8323 (MODELER_CONTROL_PORT) — native only'
+        }
+        ioLayer = component 'I/O' {
+          description '.bee3d save/load, OBJ export, recent files, file dialogs / browser download'
+        }
+        aiTools = component 'AI tool bridge' {
+          #ai
+          description 'In-app chat tools → same command executor as MCP'
+        }
+
+        viewport -> physicsMirror 'ray pick, outlines'
+        tools -> commandExec
+        editorUi -> commandExec
+        commandExec -> core
+        physicsMirror -> box3dSys
+        controlApi -> commandExec
+        aiTools -> commandExec
+        ioLayer -> core
+        viewport -> core 'render scene'
+      }
+
+      aiCrate = library 'modeler-ai' {
+        #ai #modeler
+        description 'Provider-agnostic chat + tool-use + model catalogs (no transport)'
+        metadata {
+          path '3dmodeler/crates/modeler-ai'
+          crate 'modeler-ai'
+        }
+      }
+
+      mcpCrate = app 'modeler-mcp' {
+        #ai #modeler #native
+        description 'MCP stdio server → HTTP control API on running modeler-app'
+        metadata {
+          path '3dmodeler/crates/modeler-mcp'
+          crate 'modeler-mcp'
+          bin 'modeler-mcp'
+        }
+      }
+
+      spike = app 'phase0-spike' {
+        #physics #wasm
+        description 'WASM feasibility: world + sphere + ray pick (native + wasm parity)'
+        metadata {
+          path '3dmodeler/crates/phase0-spike'
+        }
+      }
+
+      webDist = app 'Static web bundle' {
+        #wasm
+        description 'trunk release dist/ (~4 MB) for static hosting'
+        metadata {
+          path '3dmodeler/dist, crates/modeler-app trunk'
+        }
+      }
+
+      appCrate -> core 'scene document SSOT'
+      appCrate -> box3dSys 'physics FFI'
+      appCrate -> aiCrate 'chat providers'
+      mcpCrate -> appCrate 'HTTP POST commands / screenshots'
+      spike -> box3dSys
+      webDist -> appCrate 'trunk build wasm'
+      box3dSys -> box3d.publicApi 'FFI / link'
+    }
+  }
+
+  // Externals
+  llmProviders = external 'LLM providers' {
+    description 'Anthropic, OpenAI, OpenRouter, xAI, LM Studio, OpenAI-compatible endpoints'
+  }
+  threeD = external 'three-d + egui' {
+    description 'Mid-level WebGL2/OpenGL rendering and immediate-mode UI'
+  }
+  browser = external 'Web browser' {
+    description 'Hosts wasm build (no TCP control API)'
+  }
+  staticHost = external 'Static host' {
+    description 'GitHub Pages / Netlify / any static server'
+  }
+  sokol = external 'sokol + imgui' {
+    description 'Native graphics/UI for Box3D samples'
+  }
+
+  repo.modeler.appCrate -> threeD 'render + egui'
+  repo.modeler.appCrate -> llmProviders 'AI assistant (native + browser where CORS allows)'
+  repo.modeler.webDist -> browser 'wasm app'
+  repo.modeler.webDist -> staticHost 'deploy'
+  repo.box3dSamples -> sokol
+
+  // Actors
+  user -> repo.modeler.appCrate 'edit scene (native or browser)'
+  user -> repo.box3dSamples 'explore physics engine samples'
+  chatUser -> repo.modeler.appCrate 'AI panel'
+  agent -> repo.modeler.mcpCrate 'MCP stdio'
+  repo.modeler.mcpCrate -> repo.modeler.appCrate.controlApi 'HTTP :8323'
+}

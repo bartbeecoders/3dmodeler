@@ -21,6 +21,9 @@ Everything shipped across the 0.1.x series, now consolidated:
   CRUD.
 - **Physics poke** — in physics mode, hold LMB to charge (up to 300%) and
   release to kick objects.
+- **Bounciness** — per-object elasticity (Properties ▸ Physics) from a dead
+  clay thud to a superball, with material presets. Works on static objects
+  too, so a bouncy floor throws everything back.
 - **Pie menus** — Shift+A Add menu and the right-click object menu are
   pie/wheel menus, with pictograms in the Add menu.
 - **UI themes** — color theme picker (Dark/Light/Ocean and more) with accent
@@ -72,8 +75,10 @@ Everything shipped across the 0.1.x series, now consolidated:
   indented outliner, hierarchy-aware duplicate/physics/transforms).
 
 - Phase 10 complete: MCP server — coding agents (Claude Code, Cursor, …) can
-  inspect and edit the live scene, run the physics sim and take viewport
-  screenshots. See [docs/mcp.md](docs/mcp.md).
+  inspect and edit the live scene, run the physics sim, take viewport
+  screenshots (any axis view) and render from scene cameras — inline, as MCP
+  resources (`modeler://screenshot`, `modeler://render`) or saved to a file.
+  See [docs/mcp.md](docs/mcp.md).
 
 - Phase 11 complete: file storage — scenes save/load as `.bee3d` (JSON)
   through real file dialogs natively (or a download + file picker in the

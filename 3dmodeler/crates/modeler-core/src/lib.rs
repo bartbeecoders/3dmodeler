@@ -15,7 +15,8 @@ pub use glam;
 pub use library::{Library, LibraryAsset};
 pub use material::{
     resolve_authored, resolve_for_render, MasterMaterial, Material, MaterialFunction,
-    MaterialId, MaterialOverrides, MaterialParameterCollection, WorldPositionEffect,
+    MaterialId, MaterialOverrides, MaterialParameterCollection, MaterialTextures,
+    WorldPositionEffect,
 };
 pub use mesh::{MeshData, WallCutout};
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,17 @@ pub enum Primitive {
         spot_angle_deg: f32,
         shadows: bool,
     },
+    /// Render camera (Blender-style). The mesh is only a viewport gizmo
+    /// (pickable); like lights/empties it never collides or simulates.
+    /// Looks along local −Z with local +Y as up. F12 renders from its view.
+    Camera {
+        /// Vertical field of view in degrees (perspective).
+        fov_deg: f32,
+        /// Near clip plane in meters.
+        clip_start: f32,
+        /// Far clip plane in meters.
+        clip_end: f32,
+    },
     /// Physical rope: a flexible chain of segment bodies between two ends.
     /// In local space the rope runs along +X from the origin to
     /// `(length, 0, 0)`. Each end can be anchored to another object via
@@ -257,6 +269,29 @@ pub enum Primitive {
         /// Number of physics links (nodes = segments + 1). Clamped 2..=64.
         segments: u32,
     },
+    /// Soft cloth sheet in the local XY plane (width along X, height along Y).
+    /// A grid of particles is held by distance joints; pin any number of
+    /// vertices via `Object::cloth_anchors` (drag handles or the properties
+    /// panel). Clamped resolution keeps the node count reasonable.
+    Cloth {
+        /// Size along local X, meters.
+        width: f32,
+        /// Size along local Y, meters.
+        height: f32,
+        /// Grid cells along width (nodes = segments_u + 1). Clamped 1..=24.
+        segments_u: u32,
+        /// Grid cells along height (nodes = segments_v + 1). Clamped 1..=24.
+        segments_v: u32,
+        /// How rigid the fabric is: `0` = soft drape, `1` = stiff (near-rigid).
+        /// Default ~0.25. Older scene files without this field get the default.
+        #[serde(default = "default_cloth_stiffness")]
+        stiffness: f32,
+    },
+}
+
+/// Default cloth stiffness (soft enough to drape; 1.0 would be nearly rigid).
+fn default_cloth_stiffness() -> f32 {
+    0.25
 }
 
 /// One end of a `Primitive::Rope`: free, or pinned to a point on another object.
@@ -271,6 +306,45 @@ pub struct RopeEnd {
     /// `anchor` when attaching "to its anchor point".
     #[serde(default)]
     pub local_point: Vec3,
+}
+
+/// One pin on a `Primitive::Cloth`: a grid vertex, free or attached to another
+/// object (same drag-and-drop idea as rope ends, but many pins per cloth).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClothAnchor {
+    /// Grid column index `0..=segments_u`.
+    pub u: u32,
+    /// Grid row index `0..=segments_v`.
+    pub v: u32,
+    /// Object this vertex is pinned to. `None` = free.
+    #[serde(default)]
+    pub object: Option<ObjectId>,
+    /// Attachment point in the target object's local space.
+    #[serde(default)]
+    pub local_point: Vec3,
+}
+
+impl ClothAnchor {
+    pub fn free(u: u32, v: u32) -> Self {
+        Self {
+            u,
+            v,
+            object: None,
+            local_point: Vec3::ZERO,
+        }
+    }
+
+    /// Default four corner anchors for a cloth of the given resolution.
+    pub fn default_corners(segments_u: u32, segments_v: u32) -> Vec<Self> {
+        let su = segments_u.max(1);
+        let sv = segments_v.max(1);
+        vec![
+            Self::free(0, 0),
+            Self::free(su, 0),
+            Self::free(0, sv),
+            Self::free(su, sv),
+        ]
+    }
 }
 
 impl Primitive {
@@ -308,8 +382,38 @@ impl Primitive {
         matches!(self, Primitive::Light { .. })
     }
 
+    pub fn is_camera(&self) -> bool {
+        matches!(self, Primitive::Camera { .. })
+    }
+
+    /// Marker / gizmo objects: viewport-only meshes, no material stack,
+    /// physics bodies (while simulating), or modifiers.
+    pub fn is_gizmo(&self) -> bool {
+        self.is_light()
+            || self.is_camera()
+            || matches!(self, Primitive::Empty { .. })
+    }
+
+    /// Default perspective camera (45° FOV, Blender-like clips).
+    pub fn default_camera() -> Primitive {
+        Primitive::Camera {
+            fov_deg: 45.0,
+            clip_start: 0.1,
+            clip_end: 1000.0,
+        }
+    }
+
     pub fn is_rope(&self) -> bool {
         matches!(self, Primitive::Rope { .. })
+    }
+
+    pub fn is_cloth(&self) -> bool {
+        matches!(self, Primitive::Cloth { .. })
+    }
+
+    /// Soft multi-body sim primitives (rope / cloth): no single solid body.
+    pub fn is_soft_sim(&self) -> bool {
+        self.is_rope() || self.is_cloth()
     }
 
     /// Base object name, matching Blender's naming.
@@ -327,7 +431,9 @@ impl Primitive {
             Primitive::Roof { .. } => "Roof",
             Primitive::Empty { .. } => "Empty",
             Primitive::Light { kind, .. } => kind.label(),
+            Primitive::Camera { .. } => "Camera",
             Primitive::Rope { .. } => "Rope",
+            Primitive::Cloth { .. } => "Cloth",
         }
     }
 
@@ -368,9 +474,14 @@ impl Primitive {
                     (mesh::SPOT_GIZMO_LENGTH * mesh::SPOT_GIZMO_LENGTH + r * r).sqrt() + 0.01
                 }
             },
+            Primitive::Camera { .. } => mesh::CAMERA_GIZMO_EXTENT + 0.01,
             // origin at the start; far end + radius is the farthest point
             Primitive::Rope { length, radius, .. } => {
                 ((length * length) + 2.0 * radius * radius).sqrt()
+            }
+            // origin at sheet center
+            Primitive::Cloth { width, height, .. } => {
+                0.5 * (width * width + height * height).sqrt()
             }
         }
     }
@@ -414,9 +525,15 @@ impl Primitive {
                     Vec3::new(2.0 * r, 2.0 * r, mesh::SPOT_GIZMO_LENGTH)
                 }
             },
+            Primitive::Camera { .. } => Vec3::new(
+                2.0 * mesh::CAMERA_GIZMO_HALF_W,
+                2.0 * mesh::CAMERA_GIZMO_HALF_H,
+                mesh::CAMERA_GIZMO_BODY + mesh::CAMERA_GIZMO_LENS,
+            ),
             Primitive::Rope { length, radius, .. } => {
                 Vec3::new(length, 2.0 * radius, 2.0 * radius)
             }
+            Primitive::Cloth { width, height, .. } => Vec3::new(width, height, 0.0),
         }
     }
 
@@ -437,15 +554,20 @@ impl Primitive {
                 LightKind::Sun => mesh::SUN_GIZMO_EXTENT,
                 LightKind::Spot => mesh::SPOT_GIZMO_LENGTH,
             },
+            Primitive::Camera { .. } => mesh::CAMERA_GIZMO_HALF_H,
             Primitive::Rope { radius, .. } => radius,
+            Primitive::Cloth { .. } => 0.0,
         }
     }
 
     /// Generate the triangle mesh, flat- or smooth-shaded.
     pub fn generate(&self, smooth: bool) -> MeshData {
-        // light gizmos come with their own normals; the smooth flag is moot
+        // light / camera gizmos come with their own normals; smooth is moot
         if let Primitive::Light { kind, spot_angle_deg, .. } = *self {
             return mesh::light_gizmo(kind, spot_angle_deg);
+        }
+        if matches!(self, Primitive::Camera { .. }) {
+            return mesh::camera_gizmo();
         }
         let m = match *self {
             Primitive::Plane { size } => mesh::plane(size),
@@ -470,8 +592,15 @@ impl Primitive {
                 mesh::roof(kind, width, depth, height, overhang, ridge_x)
             }
             Primitive::Empty { size } => mesh::empty_axes(size),
-            Primitive::Light { .. } => unreachable!("handled above"),
+            Primitive::Light { .. } | Primitive::Camera { .. } => unreachable!("handled above"),
             Primitive::Rope { length, radius, .. } => mesh::rope(length, radius),
+            Primitive::Cloth {
+                width,
+                height,
+                segments_u,
+                segments_v,
+                stiffness: _,
+            } => mesh::cloth(width, height, segments_u, segments_v),
         };
         if smooth {
             m
@@ -534,6 +663,11 @@ pub struct Object {
     pub primitive: Primitive,
     pub smooth: bool,
     pub visible: bool,
+    /// When true, interactive and property transforms (move / rotate / scale)
+    /// leave this object alone. Visibility, materials and mesh edits still
+    /// work. Saved with the scene; defaults false for old files.
+    #[serde(default)]
+    pub locked: bool,
     /// Inline material, or snapshot used when a master is missing.
     pub material: Material,
     /// When set, this object is a **material instance** of the named master
@@ -550,6 +684,17 @@ pub struct Object {
     /// Only used for dynamic bodies; ignored (and not drawn) when static.
     #[serde(default)]
     pub initial_force: Vec3,
+    /// Elasticity (coefficient of restitution), 0..=1: how hard or rubbery
+    /// the surface is in a collision. 0 = dead thud (clay, sandbag), 0.5 =
+    /// hard but lively (wood, steel), 0.9 = superball. Applies to STATIC
+    /// bodies too — a bouncy ball dropped on a dead floor still bounces
+    /// because contacts take the higher of the two values. Impacts slower
+    /// than ~1 m/s never bounce (engine threshold), which keeps resting
+    /// stacks from jittering.
+    /// Defaults to 0 (like Blender's rigid body), so scenes saved before
+    /// this field existed load with unchanged behaviour.
+    #[serde(default)]
+    pub bounciness: f32,
     /// Hierarchy: this object follows its parent's transform.
     #[serde(default)]
     pub parent: Option<ObjectId>,
@@ -592,6 +737,13 @@ pub struct Object {
     /// primitive's generated mesh. Local space, saved with the scene.
     #[serde(default)]
     pub edited_mesh: Option<MeshData>,
+    /// Extra materials for edit-mode face assignments: slot k here is
+    /// referenced as k + 1 by `edited_mesh.tri_materials` (slot 0 is the
+    /// object's own material). Rendered as authored — no master link, MPC
+    /// or world effects. Editors must bump `mesh_revision` when the
+    /// assignment changes so the render cache resyncs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub face_materials: Vec<Material>,
     /// LEGACY subdivision-surface levels: superseded by a
     /// `ModifierKind::Subdivision` entry in `modifiers`. Old scene files
     /// still carry it; `Scene::restore` migrates it into the stack and
@@ -617,6 +769,12 @@ pub struct Object {
     /// Not saved; the renderer uses these to draw the draped cord.
     #[serde(skip)]
     pub rope_nodes: Option<Vec<Vec3>>,
+    /// Cloth pin points (grid vertices). Only meaningful for `Primitive::Cloth`.
+    #[serde(default)]
+    pub cloth_anchors: Vec<ClothAnchor>,
+    /// Live world-space cloth grid (row-major) while simulating. Not saved.
+    #[serde(skip)]
+    pub cloth_nodes: Option<Vec<Vec3>>,
 }
 
 impl Object {
@@ -645,6 +803,24 @@ impl Object {
                     let origin = nodes[0];
                     let local: Vec<Vec3> = nodes.iter().map(|p| *p - origin).collect();
                     return mesh::rope_polyline(&local, radius);
+                }
+                self.primitive.generate(self.smooth)
+            }
+            (None, Primitive::Cloth {
+                segments_u,
+                segments_v,
+                ..
+            }) => {
+                if let Some(nodes) = self.cloth_nodes.as_ref() {
+                    let su = segments_u.clamp(1, 24);
+                    let sv = segments_v.clamp(1, 24);
+                    let expected = ((su + 1) * (sv + 1)) as usize;
+                    if nodes.len() >= expected {
+                        let origin = nodes[0];
+                        let local: Vec<Vec3> =
+                            nodes[..expected].iter().map(|p| *p - origin).collect();
+                        return mesh::cloth_from_grid(&local, su, sv);
+                    }
                 }
                 self.primitive.generate(self.smooth)
             }
@@ -836,6 +1012,11 @@ pub struct ReferenceImage {
     /// 0 = invisible, 1 = opaque.
     pub opacity: f32,
     pub visible: bool,
+    /// When true, the image cannot be moved, rotated or rescaled (G-move,
+    /// property drags, two-point calibrate). Visibility and markers still
+    /// work. Saved with the scene; defaults false for old files.
+    #[serde(default)]
+    pub locked: bool,
     /// Mirror the image horizontally. Back/left elevations are drawn as seen
     /// from behind/left, so they must be mirrored to read correctly from
     /// their viewing direction.
@@ -1019,12 +1200,14 @@ impl Scene {
             primitive,
             smooth: false, // Blender adds meshes flat-shaded
             visible: true,
+            locked: false,
             material: Material::default(),
             material_master: None,
             material_overrides: MaterialOverrides::default(),
             dynamic: false,
             density: 1.0,
             initial_force: Vec3::ZERO,
+            bounciness: 0.0,
             parent: None,
             folder: None,
             show_label: false,
@@ -1035,20 +1218,56 @@ impl Scene {
             cutouts: Vec::new(),
             floor_outline: Vec::new(),
             edited_mesh: None,
+            face_materials: Vec::new(),
             subdivision: 0,
             modifiers: Vec::new(),
             mesh_revision: 0,
             rope_start: RopeEnd::default(),
             rope_end: RopeEnd::default(),
             rope_nodes: None,
+            cloth_anchors: Vec::new(),
+            cloth_nodes: None,
         });
-        // Ropes are physical by default — they only do something useful under gravity.
+        // Ropes / cloth are physical by default — they only do something useful under gravity.
         if primitive.is_rope() {
             if let Some(object) = self.objects.last_mut() {
                 object.dynamic = true;
                 object.smooth = true;
                 // brown cord
                 object.material.base_color = [0.45, 0.28, 0.12];
+            }
+        }
+        if let Primitive::Cloth {
+            segments_u,
+            segments_v,
+            ..
+        } = primitive
+        {
+            if let Some(object) = self.objects.last_mut() {
+                object.dynamic = true;
+                object.smooth = true;
+                // fabric teal
+                object.material.base_color = [0.25, 0.45, 0.55];
+                object.cloth_anchors =
+                    ClothAnchor::default_corners(segments_u, segments_v);
+                // Hang vertically by default: rotate +90° about X so local Y
+                // (height) maps to world +Z — top edge is the high edge.
+                object.transform.rotation =
+                    Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            }
+        }
+        // Default camera: a few meters back on −Y, looking toward +Y / origin
+        // (local −Z → world +Y, local +Y → world +Z via +90° about X).
+        if matches!(primitive, Primitive::Camera { .. }) {
+            if let Some(object) = self.objects.last_mut() {
+                object.material.base_color = [0.15, 0.15, 0.18];
+                if object.transform.location.length_squared() < 1e-8
+                    && object.transform.rotation == Quat::IDENTITY
+                {
+                    object.transform.location = Vec3::new(0.0, -8.0, 2.0);
+                    object.transform.rotation =
+                        Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+                }
             }
         }
         self.index.insert(id, self.objects.len() - 1);
@@ -1183,7 +1402,7 @@ impl Scene {
     /// rebind the object as an instance (no overrides).
     pub fn create_master_from_object(&mut self, object_id: ObjectId, name: &str) -> Option<MaterialId> {
         let mat = self.object_material(object_id)?;
-        let id = self.add_master(name, mat);
+        let id = self.add_master(name, mat.clone());
         if let Some(object) = self.object_mut(object_id) {
             object.material = mat;
             object.material_master = Some(id);
@@ -1194,7 +1413,7 @@ impl Scene {
 
     /// Bind `object_id` as an instance of `master_id`, clearing overrides.
     pub fn assign_master(&mut self, object_id: ObjectId, master_id: MaterialId) -> bool {
-        let Some(master) = self.master(master_id).map(|m| m.material) else {
+        let Some(master) = self.master(master_id).map(|m| m.material.clone()) else {
             return false;
         };
         let Some(object) = self.object_mut(object_id) else {
@@ -1270,6 +1489,59 @@ impl Scene {
         if object.material_master.is_some() {
             object.material_overrides = overrides;
         }
+        true
+    }
+
+    /// Assign a material to a set of triangles of the object's edited mesh
+    /// (edit-mode "apply to face"). `tris` are triangle indices (index
+    /// buffer position / 3). The material lands in a `face_materials` slot
+    /// (reusing an existing slot when it's identical) and the triangles'
+    /// `tri_materials` entries point at it. Requires `edited_mesh` — callers
+    /// bake the primitive first, exactly like the first edit-mode edit does.
+    pub fn set_face_material(&mut self, id: ObjectId, tris: &[usize], material: Material) -> bool {
+        let material = material.clamped();
+        let Some(object) = self.object_mut(id) else {
+            return false;
+        };
+        let Some(mesh) = &mut object.edited_mesh else {
+            return false;
+        };
+        let tri_count = mesh.indices.len() / 3;
+        if tris.iter().any(|&t| t >= tri_count) {
+            return false;
+        }
+        let slot = match object.face_materials.iter().position(|m| *m == material) {
+            Some(i) => i + 1,
+            None => {
+                object.face_materials.push(material);
+                object.face_materials.len()
+            }
+        };
+        if mesh.tri_materials.len() != tri_count {
+            mesh.tri_materials = vec![0; tri_count];
+        }
+        for &t in tris {
+            mesh.tri_materials[t] = slot as u32;
+        }
+        object.mesh_revision += 1;
+        true
+    }
+
+    /// Drop all edit-mode face material assignments of an object.
+    pub fn clear_face_materials(&mut self, id: ObjectId) -> bool {
+        let Some(object) = self.object_mut(id) else {
+            return false;
+        };
+        if object.face_materials.is_empty()
+            && object.edited_mesh.as_ref().is_none_or(|m| m.tri_materials.is_empty())
+        {
+            return false;
+        }
+        object.face_materials.clear();
+        if let Some(mesh) = &mut object.edited_mesh {
+            mesh.tri_materials.clear();
+        }
+        object.mesh_revision += 1;
         true
     }
 
@@ -1533,6 +1805,49 @@ impl Scene {
             Vec3::new(length, 0.0, 0.0)
         };
         self.world_transform(rope_id).transform_point(local)
+    }
+
+    /// World-space rest position of a cloth grid vertex `(u, v)`.
+    pub fn cloth_vertex_world(&self, cloth_id: ObjectId, u: u32, v: u32) -> Vec3 {
+        let Some(object) = self.object(cloth_id) else {
+            return Vec3::ZERO;
+        };
+        let (width, height, su, sv) = match object.primitive {
+            Primitive::Cloth {
+                width,
+                height,
+                segments_u,
+                segments_v,
+                ..
+            } => (
+                width.max(0.05),
+                height.max(0.05),
+                segments_u.clamp(1, 24),
+                segments_v.clamp(1, 24),
+            ),
+            _ => return self.world_transform(cloth_id).location,
+        };
+        let local = mesh::cloth_vertex_local(width, height, su, sv, u, v);
+        self.world_transform(cloth_id).transform_point(local)
+    }
+
+    /// World-space position of a cloth anchor handle: pin on the target when
+    /// attached, otherwise the rest-pose grid vertex.
+    pub fn cloth_anchor_world(&self, cloth_id: ObjectId, anchor_index: usize) -> Vec3 {
+        let Some(object) = self.object(cloth_id) else {
+            return Vec3::ZERO;
+        };
+        let Some(anchor) = object.cloth_anchors.get(anchor_index).copied() else {
+            return Vec3::ZERO;
+        };
+        if let Some(target) = anchor.object {
+            if self.object(target).is_some() {
+                return self
+                    .world_transform(target)
+                    .transform_point(anchor.local_point);
+            }
+        }
+        self.cloth_vertex_world(cloth_id, anchor.u, anchor.v)
     }
 
     /// Attach `child` to `parent`: move the child so its anchor point lands
@@ -2212,6 +2527,41 @@ mod tests {
     }
 
     #[test]
+    fn cloth_primitive_has_mesh_and_corner_anchors() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(
+            Primitive::Cloth {
+                width: 2.0,
+                height: 1.5,
+                segments_u: 4,
+                segments_v: 3,
+                stiffness: 0.25,
+            },
+            Transform::default(),
+        );
+        let object = scene.object(id).unwrap();
+        assert_eq!(object.primitive.base_name(), "Cloth");
+        assert!(object.dynamic);
+        assert_eq!(object.cloth_anchors.len(), 4);
+        let mesh = object.render_mesh();
+        // (4+1)*(3+1) = 20 vertices
+        assert_eq!(mesh.positions.len(), 20);
+        let bar = scene.add_object(
+            Primitive::Cube { size: 1.0 },
+            Transform {
+                location: Vec3::new(0.0, 0.0, 2.0),
+                ..Default::default()
+            },
+        );
+        if let Some(o) = scene.object_mut(id) {
+            o.cloth_anchors[0].object = Some(bar);
+            o.cloth_anchors[0].local_point = Vec3::new(0.0, 0.0, -0.5);
+        }
+        let pin = scene.cloth_anchor_world(id, 0);
+        assert!((pin - Vec3::new(0.0, 0.0, 1.5)).length() < 1e-4, "{pin:?}");
+    }
+
+    #[test]
     fn rope_primitive_has_mesh_and_anchors() {
         let mut scene = Scene::new();
         let id = scene.add_object(
@@ -2311,6 +2661,40 @@ mod tests {
     }
 
     #[test]
+    fn camera_has_gizmo_default_pose_and_survives_json() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::default_camera(), Transform::default());
+        let object = scene.object(id).unwrap();
+        assert!(object.primitive.is_camera());
+        assert!(object.primitive.is_gizmo());
+        assert_eq!(object.name, "Camera");
+        // default placement looks from −Y toward the origin
+        assert!((object.transform.location - Vec3::new(0.0, -8.0, 2.0)).length() < 1e-4);
+        let mesh = object.render_mesh();
+        assert!(!mesh.indices.is_empty());
+        let extent = mesh
+            .positions
+            .iter()
+            .map(|p| p.length())
+            .fold(0.0f32, f32::max);
+        assert!(extent <= object.bounding_radius() + 1e-4);
+
+        let data = Scene::from_json(&scene.to_json()).unwrap();
+        match data.objects[0].primitive {
+            Primitive::Camera {
+                fov_deg,
+                clip_start,
+                clip_end,
+            } => {
+                assert!((fov_deg - 45.0).abs() < 1e-5);
+                assert!((clip_start - 0.1).abs() < 1e-5);
+                assert!((clip_end - 1000.0).abs() < 1e-5);
+            }
+            other => panic!("expected a camera, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn folders_organize_roots_and_survive_json() {
         let mut scene = Scene::new();
         let a = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
@@ -2398,6 +2782,7 @@ mod tests {
             aspect: 0.5,
             opacity: 0.6,
             visible: true,
+            locked: false,
             flip_h: false,
             flip_v: false,
             data_base64: "aGVsbG8=".into(),
@@ -2439,6 +2824,7 @@ mod tests {
             aspect: 0.5,
             opacity: 0.5,
             visible: true,
+            locked: false,
             flip_h: false,
             flip_v: false,
             data_base64: String::new(),
@@ -2477,6 +2863,7 @@ mod tests {
             aspect: 0.5,
             opacity: 0.5,
             visible: true,
+            locked: false,
             flip_h: true,
             flip_v: true,
             data_base64: String::new(),
@@ -2554,5 +2941,54 @@ mod tests {
         let (center, radius) = scene.bounds().unwrap();
         assert!((center - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5);
         assert!((radius - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn face_material_assignment() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let mut red = Material::default();
+        red.base_color = [1.0, 0.0, 0.0];
+
+        // needs an edited mesh (callers bake first)
+        assert!(!scene.set_face_material(id, &[0, 1], red.clone()));
+        let mesh = scene.object(id).unwrap().render_mesh();
+        let tri_count = mesh.indices.len() / 3;
+        scene.object_mut(id).unwrap().edited_mesh = Some(mesh);
+
+        // out-of-range triangles are rejected
+        assert!(!scene.set_face_material(id, &[tri_count], red.clone()));
+
+        let rev = scene.object(id).unwrap().mesh_revision;
+        assert!(scene.set_face_material(id, &[0, 1], red.clone()));
+        let object = scene.object(id).unwrap();
+        assert_eq!(object.face_materials.len(), 1);
+        let tm = &object.edited_mesh.as_ref().unwrap().tri_materials;
+        assert_eq!(tm.len(), tri_count);
+        assert_eq!((tm[0], tm[1], tm[2]), (1, 1, 0));
+        assert!(object.mesh_revision > rev, "render caches must resync");
+
+        // identical material re-applied to another face reuses its slot
+        assert!(scene.set_face_material(id, &[4, 5], red.clone()));
+        assert_eq!(scene.object(id).unwrap().face_materials.len(), 1);
+        // a different material gets a new slot
+        let mut green = red.clone();
+        green.base_color = [0.0, 1.0, 0.0];
+        assert!(scene.set_face_material(id, &[4, 5], green));
+        let object = scene.object(id).unwrap();
+        assert_eq!(object.face_materials.len(), 2);
+        assert_eq!(object.edited_mesh.as_ref().unwrap().tri_materials[4], 2);
+
+        // survives a save/load round-trip
+        let restored = Scene::from_json(&scene.to_json()).unwrap();
+        let object = &restored.objects[0];
+        assert_eq!(object.face_materials.len(), 2);
+        assert_eq!(object.edited_mesh.as_ref().unwrap().tri_materials[0], 1);
+
+        assert!(scene.clear_face_materials(id));
+        let object = scene.object(id).unwrap();
+        assert!(object.face_materials.is_empty());
+        assert!(object.edited_mesh.as_ref().unwrap().tri_materials.is_empty());
+        assert!(!scene.clear_face_materials(id), "second clear is a no-op");
     }
 }

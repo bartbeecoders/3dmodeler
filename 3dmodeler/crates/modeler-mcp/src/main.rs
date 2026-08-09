@@ -5,8 +5,13 @@
 //! control API on localhost (see modeler-app/src/control.rs).
 //!
 //! Hand-rolled on purpose: the protocol subset MCP clients need — initialize,
-//! tools/list, tools/call, ping — is small, and this keeps the binary free of
-//! async runtimes.
+//! tools/list, tools/call, resources/list, resources/read, ping — is small,
+//! and this keeps the binary free of async runtimes.
+//!
+//! Pictures of the scene (viewport screenshots, camera renders) are offered
+//! three ways, because clients differ: inline image content, MCP resources
+//! (`modeler://screenshot`, `modeler://render`), or written to `save_path`
+//! for agents that read images from disk.
 
 // the tool_definitions() json! literal nests deeply (wall cutout schemas)
 #![recursion_limit = "256"]
@@ -53,8 +58,28 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "screenshot",
-            "description": "Render the current viewport and return it as a PNG image. Use it to visually inspect the scene you are building.",
-            "inputSchema": {"type": "object", "properties": {}}
+            "description": "Render the current viewport and return it as a PNG image. Use it to visually inspect the scene you are building. Optionally switch to an axis view and/or fit the view first (same as the numpad keys in the app — this moves the user's viewport camera). With save_path the PNG is written to that file and only the path is returned, for agents that read images from disk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom"], "description": "Switch the viewport to this orthographic axis view before capturing"},
+                    "frame": {"type": "string", "enum": ["all", "selection"], "description": "Fit the view to the whole scene or to the selection before capturing"},
+                    "save_path": {"type": "string", "description": "Write the PNG here (absolute path recommended) instead of returning the image inline"}
+                }
+            }
+        },
+        {
+            "name": "render",
+            "description": "Render off-screen from a scene camera object (what F12 shows in the app) and return the PNG — the framed shot, not the editing viewport with its grid and gizmos. Defaults to the selected camera, else the first one. Resolution is free (16–4096 px per side); the viewport is left untouched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "camera": {"type": "string", "description": "Camera object name (or id as string); defaults to the selected/first camera"},
+                    "width": {"type": "integer", "description": "Output width in pixels (default 960)"},
+                    "height": {"type": "integer", "description": "Output height in pixels (default 540)"},
+                    "save_path": {"type": "string", "description": "Write the PNG here instead of returning the image inline"}
+                }
+            }
         },
         {
             "name": "set_view",
@@ -69,23 +94,31 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "add_object",
-            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (viewport Shaded mode with Scene lighting): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled.",
+            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (viewport Shaded mode with Scene lighting): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled. 'camera' adds a render camera (looks along local -Z; F12 in the app renders from it); fov_deg/clip_start/clip_end configure the lens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "rope", "light", "sun", "spot"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "rope", "cloth", "light", "sun", "spot", "camera"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
+                    "fov_deg": {"type": "number", "description": "Camera only: vertical field of view in degrees (default 45)"},
+                    "clip_start": {"type": "number", "description": "Camera only: near clip plane in meters (default 0.1)"},
+                    "clip_end": {"type": "number", "description": "Camera only: far clip plane in meters (default 1000)"},
                     "length": {"type": "number", "description": "Wall or rope: length in meters (wall default 2, rope default 2)"},
-                    "height": {"type": "number", "description": "Wall only: height in meters (default 2.5)"},
+                    "height": {"type": "number", "description": "Wall or cloth: height in meters (wall default 2.5, cloth default 2)"},
+                    "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
                     "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},
                     "segments": {"type": "integer", "description": "Rope only: number of physics links 2–64 (default 12)"},
+                    "segments_u": {"type": "integer", "description": "Cloth only: grid cells along width 1–24 (default 8)"},
+                    "segments_v": {"type": "integer", "description": "Cloth only: grid cells along height 1–24 (default 8)"},
+                    "stiffness": {"type": "number", "description": "Cloth only: fabric stiffness 0 (soft drape) .. 1 (stiff), default 0.25"},
                     "rope_start": {"description": "Rope only: object name/id to pin the start end to, or null for free"},
                     "rope_end": {"description": "Rope only: object name/id to pin the end to, or null for free"},
                     "rope_start_point": {"type": "array", "items": {"type": "number"}, "description": "Rope only: [x,y,z] local attach point on the start target (default: its anchor)"},
                     "rope_end_point": {"type": "array", "items": {"type": "number"}, "description": "Rope only: [x,y,z] local attach point on the end target (default: its anchor)"},
+                    "cloth_anchors": {"type": "array", "description": "Cloth only: pin list [{u, v, object?, local_point?}]", "items": {"type": "object"}},
                     "cutouts": {"type": "array", "items": {"type": "object", "properties": {
                         "offset": {"type": "number", "description": "Distance from the wall start to the opening's left edge, meters"},
                         "width": {"type": "number"},
@@ -101,6 +134,7 @@ fn tool_definitions() -> Value {
                     "dynamic": {"type": "boolean", "description": "Falls & collides when the physics simulation plays"},
                     "density": {"type": "number"},
                     "initial_force": {"type": "array", "items": {"type": "number"}, "description": "World-space impulse [x,y,z] (N·s) applied once when simulation starts (dynamic only)"},
+                    "bounciness": {"type": "number", "description": "Elasticity (coefficient of restitution) 0-1: 0 = dead thud (clay), 0.25 wood, 0.5 steel, 0.8 rubber, 0.95 superball. Applies to static objects too — set it on the floor to make everything bounce off it"},
                     "show_label": {"type": "boolean", "description": "Show the name as a viewport label"},
                     "show_dimensions": {"type": "boolean", "description": "Show W×D×H dimensions in the viewport"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space pivot point: interactive rotations (R) spin the object around it"},
@@ -256,15 +290,20 @@ fn tool_definitions() -> Value {
                     "scale": {"type": "array", "items": {"type": "number"}},
                     "color": {"type": "array", "items": {"type": "number"}, "description": "[r, g, b] 0..1; on lights this sets the light color"},
                     "light_kind": {"type": "string", "enum": ["point", "sun", "spot"], "description": "Lights only: change the light kind"},
+                    "fov_deg": {"type": "number", "description": "Camera only: vertical field of view in degrees"},
+                    "clip_start": {"type": "number", "description": "Camera only: near clip plane in meters"},
+                    "clip_end": {"type": "number", "description": "Camera only: far clip plane in meters"},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows"},
                     "smooth": {"type": "boolean"},
                     "subdivision": {"type": "integer", "description": "Subdivision-surface levels 0-4 (Catmull-Clark, applied at render time; 0 = off)"},
                     "visible": {"type": "boolean"},
+                    "locked": {"type": "boolean", "description": "When true, move/rotate/scale are blocked until unlocked"},
                     "dynamic": {"type": "boolean"},
                     "density": {"type": "number"},
                     "initial_force": {"type": "array", "items": {"type": "number"}, "description": "World-space impulse [x,y,z] N·s at play (dynamic only)"},
+                    "bounciness": {"type": "number", "description": "Elasticity 0-1: 0 dead/clay, 0.25 wood, 0.5 steel, 0.8 rubber, 0.95 superball. Works on static objects too"},
                     "show_label": {"type": "boolean"},
                     "show_dimensions": {"type": "boolean"},
                     "pivot": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] local-space rotation pivot"},
@@ -370,6 +409,7 @@ fn tool_definitions() -> Value {
                     "width_m": {"type": "number", "description": "World width in meters (default 2; height follows the aspect ratio)"},
                     "opacity": {"type": "number", "description": "0..1, default 0.5"},
                     "visible": {"type": "boolean"},
+                    "locked": {"type": "boolean", "description": "When true, move/rotate/scale are blocked until unlocked"},
                     "flip_h": {"type": "boolean", "description": "Mirror horizontally — needed for back/left elevations so they read correctly from their viewing direction"},
                     "flip_v": {"type": "boolean", "description": "Mirror vertically (e.g. an upside-down scan or a plan viewed from below)"}
                 }
@@ -377,7 +417,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "update_reference_image",
-            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility, mirroring (flip_h/flip_v) or name. Reference it by name or id (see get_scene).",
+            "description": "Change a reference image's plane, location, rotation_deg, width_m, opacity, visibility, lock, mirroring (flip_h/flip_v) or name. Reference it by name or id (see get_scene). Transform fields are rejected while locked=true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -389,6 +429,7 @@ fn tool_definitions() -> Value {
                     "width_m": {"type": "number"},
                     "opacity": {"type": "number"},
                     "visible": {"type": "boolean"},
+                    "locked": {"type": "boolean", "description": "When true, move/rotate/scale are blocked until unlocked"},
                     "flip_h": {"type": "boolean"},
                     "flip_v": {"type": "boolean"}
                 },
@@ -524,11 +565,70 @@ fn tool_definitions() -> Value {
     ])
 }
 
+/// Decode a base64 PNG from an app image response.
+fn png_bytes(body: &Value) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(body["png_base64"].as_str().unwrap_or_default())
+        .map_err(|e| format!("the app returned a malformed PNG: {e}"))
+}
+
+/// Turn an image response into MCP tool content: written to `save_path` when
+/// one was given (agents that read images from disk), otherwise inline.
+fn image_content(body: &Value, save_path: Option<&str>) -> Value {
+    let Some(path) = save_path else {
+        return json!({
+            "content": [{
+                "type": "image",
+                "data": body["png_base64"].as_str().unwrap_or_default(),
+                "mimeType": "image/png"
+            }]
+        });
+    };
+    let bytes = match png_bytes(body) {
+        Ok(bytes) => bytes,
+        Err(e) => return json!({"content": [{"type": "text", "text": e}], "isError": true}),
+    };
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, &bytes) {
+        return json!({
+            "content": [{"type": "text", "text": format!("could not write {}: {e}", path.display())}],
+            "isError": true
+        });
+    }
+    let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let size = format!(
+        "{}x{}",
+        body["width"].as_u64().unwrap_or(0),
+        body["height"].as_u64().unwrap_or(0)
+    );
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("saved {} ({size} PNG, {} bytes)", full.display(), bytes.len())
+        }]
+    })
+}
+
 /// Execute one MCP tool call and produce the MCP result content.
 fn handle_tool_call(name: &str, arguments: &Value) -> Value {
+    let save_path = arguments["save_path"].as_str().map(str::to_string);
     let command = match name {
         "get_scene" => json!({"cmd": "get_scene"}),
-        "screenshot" => json!({"cmd": "screenshot"}),
+        "screenshot" | "render" => {
+            let mut command = arguments.clone();
+            if !command.is_object() {
+                command = json!({});
+            }
+            if let Some(map) = command.as_object_mut() {
+                map.remove("save_path");
+            }
+            command["cmd"] = json!(name);
+            command
+        }
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
         "add_object" | "add_floor" | "add_roof" | "break_into_bricks" | "break_into_balls"
@@ -561,11 +661,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
             "isError": true
         }),
         Ok(mut body) => {
-            if name == "screenshot" {
-                let data = body["png_base64"].as_str().unwrap_or_default().to_string();
-                return json!({
-                    "content": [{"type": "image", "data": data, "mimeType": "image/png"}]
-                });
+            if name == "screenshot" || name == "render" {
+                return image_content(&body, save_path.as_deref());
             }
             // strip the transport field; return the payload as pretty JSON
             if let Some(map) = body.as_object_mut() {
@@ -578,6 +675,82 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
             };
             json!({"content": [{"type": "text", "text": text}]})
         }
+    }
+}
+
+/// Screenshots and camera renders are also published as MCP resources, so
+/// clients that browse resources (rather than call tools) can pull the
+/// current viewport or a framed camera shot straight into context.
+fn resource_definitions() -> Value {
+    json!([
+        {
+            "uri": "modeler://screenshot",
+            "name": "Viewport screenshot",
+            "description": "The modeler viewport as it looks right now, as a PNG.",
+            "mimeType": "image/png"
+        },
+        {
+            "uri": "modeler://render",
+            "name": "Camera render",
+            "description": "Off-screen render from the scene's active (or first) camera — the framed shot, without grid or gizmos.",
+            "mimeType": "image/png"
+        }
+    ])
+}
+
+fn resource_templates() -> Value {
+    json!([
+        {
+            "uriTemplate": "modeler://screenshot/{view}",
+            "name": "Viewport screenshot from an axis view",
+            "description": "Switches the viewport to an orthographic axis view (front, back, left, right, top, bottom), fits the whole scene, and captures it — like pressing the numpad keys in the app.",
+            "mimeType": "image/png"
+        },
+        {
+            "uriTemplate": "modeler://render/{camera}",
+            "name": "Camera render by name",
+            "description": "Off-screen render from the named camera object.",
+            "mimeType": "image/png"
+        }
+    ])
+}
+
+/// Decode %XX escapes so camera names with spaces work in a resource URI.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map a `modeler://` URI to the app command that produces its image.
+fn resource_command(uri: &str) -> Result<Value, String> {
+    let path = uri
+        .strip_prefix("modeler://")
+        .ok_or_else(|| format!("unknown resource '{uri}'"))?;
+    let (kind, rest) = match path.split_once('/') {
+        Some((kind, rest)) => (kind, Some(percent_decode(rest))),
+        None => (path, None),
+    };
+    match (kind, rest.as_deref()) {
+        ("screenshot", None) => Ok(json!({"cmd": "screenshot"})),
+        ("screenshot", Some(view)) => Ok(json!({"cmd": "screenshot", "view": view, "frame": "all"})),
+        ("render", None) => Ok(json!({"cmd": "render"})),
+        ("render", Some(camera)) => Ok(json!({"cmd": "render", "camera": camera})),
+        _ => Err(format!(
+            "unknown resource '{uri}' (modeler://screenshot[/view], modeler://render[/camera])"
+        )),
     }
 }
 
@@ -619,13 +792,34 @@ fn main() {
                     "protocolVersion": message["params"]["protocolVersion"]
                         .as_str()
                         .unwrap_or(PROTOCOL_VERSION),
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                     "serverInfo": {"name": "modeler-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Controls a running 3D modeler (Z-up, meters). Start with get_scene to see the current contents, use screenshot to look at the viewport."
+                    "instructions": "Controls a running 3D modeler (Z-up, meters). Start with get_scene to see the current contents, use screenshot to look at the viewport (view/frame arguments give you front/top/… axis shots) and render for a camera's framed shot. Both are also readable as resources: modeler://screenshot[/front|top|…] and modeler://render[/CameraName]."
                 }),
             ),
             "ping" => respond(&id, json!({})),
             "tools/list" => respond(&id, json!({"tools": tool_definitions()})),
+            "resources/list" => respond(&id, json!({"resources": resource_definitions()})),
+            "resources/templates/list" => {
+                respond(&id, json!({"resourceTemplates": resource_templates()}))
+            }
+            "resources/read" => {
+                let uri = message["params"]["uri"].as_str().unwrap_or_default();
+                match resource_command(uri).and_then(|command| {
+                    let body = call_modeler(command)?;
+                    png_bytes(&body).map(|_| body)
+                }) {
+                    Err(e) => respond_error(&id, -32602, &e),
+                    Ok(body) => respond(
+                        &id,
+                        json!({"contents": [{
+                            "uri": uri,
+                            "mimeType": "image/png",
+                            "blob": body["png_base64"].as_str().unwrap_or_default()
+                        }]}),
+                    ),
+                }
+            }
             "tools/call" => {
                 let name = message["params"]["name"].as_str().unwrap_or_default();
                 let arguments = &message["params"]["arguments"];
@@ -636,5 +830,84 @@ fn main() {
             _ if id.is_null() => {}
             other => respond_error(&id, -32601, &format!("method not found: {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_uris_map_to_commands() {
+        assert_eq!(
+            resource_command("modeler://screenshot").unwrap(),
+            json!({"cmd": "screenshot"})
+        );
+        assert_eq!(
+            resource_command("modeler://screenshot/front").unwrap(),
+            json!({"cmd": "screenshot", "view": "front", "frame": "all"})
+        );
+        assert_eq!(
+            resource_command("modeler://render").unwrap(),
+            json!({"cmd": "render"})
+        );
+        // camera names with spaces arrive percent-encoded
+        assert_eq!(
+            resource_command("modeler://render/Key%20Cam").unwrap(),
+            json!({"cmd": "render", "camera": "Key Cam"})
+        );
+        assert!(resource_command("modeler://scene").is_err());
+        assert!(resource_command("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn every_listed_resource_uri_resolves() {
+        for resource in resource_definitions().as_array().unwrap() {
+            let uri = resource["uri"].as_str().unwrap();
+            assert!(resource_command(uri).is_ok(), "{uri} is not readable");
+        }
+    }
+
+    #[test]
+    fn save_path_is_stripped_from_the_app_command() {
+        // the app would reject unknown keys; save_path is ours, not its
+        let arguments = json!({"view": "top", "save_path": "/tmp/x.png"});
+        let mut command = arguments.clone();
+        command.as_object_mut().unwrap().remove("save_path");
+        command["cmd"] = json!("screenshot");
+        assert_eq!(command, json!({"cmd": "screenshot", "view": "top"}));
+    }
+
+    #[test]
+    fn image_content_returns_inline_png_without_save_path() {
+        let body = json!({"png_base64": "AAAA", "width": 8, "height": 4});
+        let result = image_content(&body, None);
+        assert_eq!(result["content"][0]["type"], "image");
+        assert_eq!(result["content"][0]["data"], "AAAA");
+        assert_eq!(result["content"][0]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn image_content_writes_the_file_and_reports_the_path() {
+        use base64::Engine;
+        let dir = std::env::temp_dir().join("modeler-mcp-test");
+        let path = dir.join("shot.png");
+        let _ = std::fs::remove_file(&path);
+        let png = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4]);
+        let body = json!({"png_base64": png, "width": 8, "height": 4});
+        let result = image_content(&body, path.to_str());
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result["content"][0]["type"], "text");
+        assert!(text.contains("8x4 PNG, 4 bytes"), "{text}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8, 2, 3, 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn malformed_png_from_the_app_is_an_error_not_a_panic() {
+        let body = json!({"png_base64": "not base64!!"});
+        let result = image_content(&body, Some("/tmp/never-written.png"));
+        assert_eq!(result["isError"], json!(true));
+        assert!(!std::path::Path::new("/tmp/never-written.png").exists());
     }
 }

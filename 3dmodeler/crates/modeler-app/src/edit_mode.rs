@@ -19,7 +19,7 @@ use crate::mesh_edit;
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
-use modeler_core::{MeshData, ObjectId, Scene, Transform};
+use modeler_core::{Material, MeshData, ObjectId, Scene, Transform};
 use three_d::{Event, Key, MouseButton, Viewport};
 
 const VERTEX_PICK_PX: f32 = 14.0;
@@ -368,6 +368,51 @@ impl EditMode {
                     / group.verts.len().max(1) as f32
             }
         })
+    }
+
+    /// The selected face's index, when the current selection is a face.
+    pub fn selected_face(&self) -> Option<usize> {
+        match self.selected? {
+            Element::Face(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Apply a material to the selected face (PBR library apply while a
+    /// face is selected). Bakes the primitive into an editable mesh first —
+    /// exactly like the first geometry edit does — so the face → triangle
+    /// mapping targets the stored mesh. Returns false when nothing is
+    /// applied (no face selected, or the assignment failed).
+    pub fn apply_material_to_selected_face(
+        &mut self,
+        scene: &mut Scene,
+        material: Material,
+    ) -> bool {
+        let Some(id) = self.active else { return false };
+        let face = match self.selected {
+            Some(Element::Face(f)) => f,
+            _ => return false,
+        };
+        let Some(tris) = self.topo.as_ref().and_then(|t| {
+            t.faces.get(face).map(|g| g.tris.clone())
+        }) else {
+            return false;
+        };
+        // first face assignment bakes the primitive into an editable mesh
+        if scene.object(id).is_some_and(|o| o.edited_mesh.is_none()) {
+            let mesh = scene.object(id).unwrap().render_mesh();
+            if let Some(object) = scene.object_mut(id) {
+                object.edited_mesh = Some(mesh);
+            }
+        }
+        let applied = scene.set_face_material(id, &tris, material);
+        if applied {
+            // set_face_material bumped mesh_revision; the topology is
+            // unchanged (same mesh), so adopt the new revision instead of
+            // rebuilding and losing the selection on the next sync.
+            self.topo_revision = scene.object(id).map_or(self.topo_revision, |o| o.mesh_revision);
+        }
+        applied
     }
 
     /// Right-click pick for the context menu: select the element under the
@@ -1374,6 +1419,38 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f3
 mod tests {
     use super::*;
     use modeler_core::Primitive;
+
+    #[test]
+    fn apply_material_to_selected_face_bakes_and_assigns() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 1.0 }, Transform::default());
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        let mut red = Material::default();
+        red.base_color = [1.0, 0.0, 0.0];
+
+        // nothing selected → no-op
+        assert!(!edit.apply_material_to_selected_face(&mut scene, red.clone()));
+        assert!(scene.object(id).unwrap().edited_mesh.is_none());
+
+        let face = 0;
+        let face_tris = edit.topo.as_ref().unwrap().faces[face].tris.clone();
+        edit.selected = Some(Element::Face(face));
+        assert!(edit.apply_material_to_selected_face(&mut scene, red));
+
+        // the primitive was baked and exactly the face's triangles assigned
+        let object = scene.object(id).unwrap();
+        let mesh = object.edited_mesh.as_ref().expect("baked on apply");
+        assert_eq!(object.face_materials.len(), 1);
+        for (ti, &slot) in mesh.tri_materials.iter().enumerate() {
+            assert_eq!(slot, u32::from(face_tris.contains(&ti)), "tri {ti}");
+        }
+
+        // topology revision adopted: the next sync keeps the selection
+        edit.sync(&mut scene);
+        assert_eq!(edit.selected, Some(Element::Face(face)), "selection survives");
+    }
 
     #[test]
     fn cube_topology_welds_to_blender_counts() {

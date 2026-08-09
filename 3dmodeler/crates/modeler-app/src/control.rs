@@ -21,8 +21,9 @@ type Reply = Sender<Value>;
 
 pub struct ControlServer {
     requests: Receiver<(Value, Reply)>,
-    /// Screenshot requests wait until after the next render.
-    pub pending_screenshots: Vec<Reply>,
+    /// Image requests (`screenshot`, `render`) wait until after the next
+    /// render; the command is kept so the render loop can read its arguments.
+    pub pending_screenshots: Vec<(Value, Reply)>,
     port: u16,
     commands_handled: u64,
     last_command: Option<std::time::Instant>,
@@ -100,12 +101,32 @@ impl ControlServer {
         library_doc: &mut Library,
         shade_mode: &mut crate::scene_render::ShadeMode,
         lighting_mode: &mut crate::scene_render::LightingMode,
+        camera: &mut crate::camera::BlenderCamera,
     ) {
         while let Ok((command, reply)) = self.requests.try_recv() {
             self.commands_handled += 1;
             self.last_command = Some(std::time::Instant::now());
             if command["cmd"] == "screenshot" {
-                self.pending_screenshots.push(reply);
+                // view/frame arguments must land before this frame renders
+                let mut command = command;
+                let moved_camera = command.get("view").is_some() || command.get("frame").is_some();
+                if let Some(error) =
+                    commands::apply_view_args(&command, camera, scene, selection)
+                {
+                    let _ = reply.send(error);
+                    continue;
+                }
+                if moved_camera {
+                    // the egui overlay (view name, gizmo) was already laid out
+                    // for the old camera this frame — capture the next one
+                    command["settle_frames"] = json!(1);
+                }
+                self.pending_screenshots.push((command, reply));
+                continue;
+            }
+            // off-screen camera render: served after the frame, from the GPU
+            if command["cmd"] == "render" {
+                self.pending_screenshots.push((command, reply));
                 continue;
             }
             // viewport view state lives in the render loop, not the scene

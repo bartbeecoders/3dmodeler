@@ -7,8 +7,8 @@
 //! 4. **World-position effects** — height snow, gradients, world-up tint
 //! 5. **Material Parameter Collections (MPC)** — global wetness / snow / tint
 
-use glam::Vec3;
-use serde::{Deserialize, Serialize};
+use glam::{Mat3, Vec2, Vec3};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Stable id for a master material asset in the scene library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -23,13 +23,115 @@ fn one() -> f32 {
 fn default_occlusion() -> f32 {
     1.0
 }
+fn uv_one() -> [f32; 2] {
+    [1.0, 1.0]
+}
+
+/// Accept both the legacy scalar `uv_scale` and the current `[u, v]` pair so
+/// older scenes / PBR collections keep loading.
+fn de_uv_scale<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UvScale {
+        Uniform(f32),
+        Pair([f32; 2]),
+    }
+    Ok(match UvScale::deserialize(d)? {
+        UvScale::Uniform(s) => [s, s],
+        UvScale::Pair(p) => p,
+    })
+}
+
+/// Optional texture maps for the metal/rough PBR workflow.
+///
+/// Values are **cache keys** owned by the app (`modeler-app` texture cache /
+/// PBR library), not raw image bytes — scene files stay small and maps can
+/// be shared across objects. Empty / all-`None` means solid-color shading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterialTextures {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub albedo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occlusion: Option<String>,
+    /// UV tiling scale per axis (1 = one texture repeat per meter of
+    /// box-projected UV). A bare number is still accepted on load and read as
+    /// a uniform scale.
+    #[serde(default = "uv_one", deserialize_with = "de_uv_scale")]
+    pub uv_scale: [f32; 2],
+    /// Map rotation in degrees, counter-clockwise around the tile center.
+    #[serde(default)]
+    pub uv_rotation: f32,
+}
+
+impl Default for MaterialTextures {
+    fn default() -> Self {
+        Self {
+            albedo: None,
+            normal: None,
+            roughness: None,
+            metallic: None,
+            occlusion: None,
+            uv_scale: uv_one(),
+            uv_rotation: 0.0,
+        }
+    }
+}
+
+impl MaterialTextures {
+    pub fn is_empty(&self) -> bool {
+        self.albedo.is_none()
+            && self.normal.is_none()
+            && self.roughness.is_none()
+            && self.metallic.is_none()
+            && self.occlusion.is_none()
+    }
+
+    pub fn has_any(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// UV scale with degenerate / negative-zero values pushed out of the way.
+    pub fn uv_scale_clamped(&self) -> [f32; 2] {
+        let fix = |s: f32| {
+            if !s.is_finite() || s.abs() < 0.01 {
+                1.0
+            } else {
+                s
+            }
+        };
+        [fix(self.uv_scale[0]), fix(self.uv_scale[1])]
+    }
+
+    /// Texture matrix for `uv' = (M * vec3(uv, 1)).xy`, column-major so it can
+    /// be handed straight to a `mat3` uniform.
+    ///
+    /// Scale then rotation, both about the tile center (0.5, 0.5), so turning
+    /// the dial spins the pattern in place instead of swinging it off the face.
+    pub fn uv_matrix(&self) -> [[f32; 3]; 3] {
+        let [sx, sy] = self.uv_scale_clamped();
+        let center = Vec2::splat(0.5);
+        let m = Mat3::from_scale_angle_translation(
+            Vec2::new(sx, sy),
+            self.uv_rotation.to_radians(),
+            center,
+        ) * Mat3::from_translation(-center);
+        m.to_cols_array_2d()
+    }
+}
 
 /// Principled-style PBR parameters (metal/rough workflow).
 ///
 /// Fields that three-d can shade today are applied at render time; coat /
 /// sheen / specular are first-class authoring data and are approximated into
-/// the GPU material where possible.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// the GPU material where possible. Texture maps (when present) override the
+/// corresponding scalar lobes in the viewport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     pub base_color: [f32; 3],
     pub roughness: f32,
@@ -59,6 +161,9 @@ pub struct Material {
     /// Per-material world-space shading effect.
     #[serde(default)]
     pub world_effect: WorldPositionEffect,
+    /// Optional texture maps (albedo / normal / roughness / metallic / AO).
+    #[serde(default)]
+    pub textures: MaterialTextures,
 }
 
 impl Default for Material {
@@ -77,29 +182,35 @@ impl Default for Material {
             sheen: 0.0,
             occlusion: 1.0,
             world_effect: WorldPositionEffect::None,
+            textures: MaterialTextures::default(),
         }
     }
 }
 
 impl Material {
     /// Clamp every channel into a sane authoring range.
-    pub fn clamped(mut self) -> Self {
-        for c in &mut self.base_color {
+    pub fn clamped(&self) -> Self {
+        let mut m = self.clone();
+        for c in &mut m.base_color {
             *c = c.clamp(0.0, 1.0);
         }
-        self.roughness = self.roughness.clamp(0.0, 1.0);
-        self.metallic = self.metallic.clamp(0.0, 1.0);
-        self.specular = self.specular.clamp(0.0, 1.0);
-        for c in &mut self.emissive {
+        m.roughness = m.roughness.clamp(0.0, 1.0);
+        m.metallic = m.metallic.clamp(0.0, 1.0);
+        m.specular = m.specular.clamp(0.0, 1.0);
+        for c in &mut m.emissive {
             *c = (*c).max(0.0);
         }
-        self.emissive_strength = self.emissive_strength.max(0.0);
-        self.alpha = self.alpha.clamp(0.0, 1.0);
-        self.coat = self.coat.clamp(0.0, 1.0);
-        self.coat_roughness = self.coat_roughness.clamp(0.0, 1.0);
-        self.sheen = self.sheen.clamp(0.0, 1.0);
-        self.occlusion = self.occlusion.clamp(0.0, 1.0);
-        self
+        m.emissive_strength = m.emissive_strength.max(0.0);
+        m.alpha = m.alpha.clamp(0.0, 1.0);
+        m.coat = m.coat.clamp(0.0, 1.0);
+        m.coat_roughness = m.coat_roughness.clamp(0.0, 1.0);
+        m.sheen = m.sheen.clamp(0.0, 1.0);
+        m.occlusion = m.occlusion.clamp(0.0, 1.0);
+        m.textures.uv_scale = m.textures.uv_scale_clamped();
+        if !m.textures.uv_rotation.is_finite() {
+            m.textures.uv_rotation = 0.0;
+        }
+        m
     }
 
     /// Shader-facing approximation of advanced lobes for engines without
@@ -109,7 +220,7 @@ impl Material {
     /// - Sheen lifts albedo
     /// - Specular > 0.5 slightly lowers roughness on dielectrics
     /// - Occlusion multiplies albedo toward a contact-shadow look
-    pub fn for_shading(self) -> Material {
+    pub fn for_shading(&self) -> Material {
         let mut m = self.clamped();
         // Clear coat: smooth, reflective top layer
         if m.coat > 1e-4 {
@@ -201,7 +312,8 @@ impl WorldPositionEffect {
     }
 
     /// Apply this effect given the object's world-space origin and +Z axis.
-    pub fn apply(self, mut material: Material, world_origin: Vec3, world_up: Vec3) -> Material {
+    pub fn apply(self, material: &Material, world_origin: Vec3, world_up: Vec3) -> Material {
+        let mut material = material.clone();
         match self {
             Self::None => material,
             Self::HeightSnow { start, end, color } => {
@@ -320,6 +432,9 @@ impl MaterialOverrides {
             sheen: self.sheen.unwrap_or(base.sheen),
             occlusion: self.occlusion.unwrap_or(base.occlusion),
             world_effect: self.world_effect.unwrap_or(base.world_effect),
+            // Textures always come from the master/inline material — instance
+            // overrides only tweak scalar lobes.
+            textures: base.textures.clone(),
         }
     }
 
@@ -485,9 +600,9 @@ impl MaterialFunction {
     }
 
     /// Apply the function. Presets replace most fields (keep base color when
-    /// sensible); modifiers layer onto `base`.
+    /// sensible); modifiers layer onto `base`. Texture maps are preserved.
     pub fn apply(self, base: &Material) -> Material {
-        let mut m = *base;
+        let mut m = base.clone();
         match self {
             Self::Plastic => {
                 m.metallic = 0.0;
@@ -645,7 +760,7 @@ pub fn resolve_for_render(
             end,
             color: [0.92, 0.95, 1.0],
         };
-        let snowed = layer.apply(m, world_origin, world_up);
+        let snowed = layer.apply(&m, world_origin, world_up);
         for i in 0..3 {
             m.base_color[i] =
                 m.base_color[i] * (1.0 - snow) + snowed.base_color[i] * snow;
@@ -654,7 +769,8 @@ pub fn resolve_for_render(
         m.metallic *= 1.0 - snow * 0.85;
     }
 
-    m = m.world_effect.apply(m, world_origin, world_up);
+    let effect = m.world_effect;
+    m = effect.apply(&m, world_origin, world_up);
     m.for_shading()
 }
 
@@ -712,7 +828,7 @@ mod tests {
             end: 1.0,
             color: [1.0, 1.0, 1.0],
         };
-        let out = effect.apply(m, Vec3::new(0.0, 0.0, 1.0), Vec3::Z);
+        let out = effect.apply(&m, Vec3::new(0.0, 0.0, 1.0), Vec3::Z);
         assert!((out.base_color[0] - 1.0).abs() < 1e-4);
     }
 
@@ -729,6 +845,69 @@ mod tests {
             &[],
         );
         assert_eq!(r.base_color, [0.1, 0.2, 0.3]);
+    }
+
+    /// Map a uv through the texture matrix the same way the shader does.
+    fn map_uv(t: &MaterialTextures, uv: [f32; 2]) -> [f32; 2] {
+        let m = t.uv_matrix();
+        let x = m[0][0] * uv[0] + m[1][0] * uv[1] + m[2][0];
+        let y = m[0][1] * uv[0] + m[1][1] * uv[1] + m[2][1];
+        [x, y]
+    }
+
+    #[test]
+    fn uv_scale_tiles_around_the_center() {
+        let t = MaterialTextures {
+            uv_scale: [4.0, 2.0],
+            ..Default::default()
+        };
+        // the tile center is the fixed point of the transform
+        let c = map_uv(&t, [0.5, 0.5]);
+        assert!((c[0] - 0.5).abs() < 1e-5 && (c[1] - 0.5).abs() < 1e-5);
+        // one unit of UV now spans 4 repeats across U, 2 across V
+        let a = map_uv(&t, [0.0, 0.0]);
+        let b = map_uv(&t, [1.0, 1.0]);
+        assert!((b[0] - a[0] - 4.0).abs() < 1e-4);
+        assert!((b[1] - a[1] - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn uv_rotation_spins_about_the_center() {
+        let t = MaterialTextures {
+            uv_rotation: 90.0,
+            ..Default::default()
+        };
+        let c = map_uv(&t, [0.5, 0.5]);
+        assert!((c[0] - 0.5).abs() < 1e-5 && (c[1] - 0.5).abs() < 1e-5);
+        // +90° CCW takes the +U offset onto +V
+        let p = map_uv(&t, [1.0, 0.5]);
+        assert!((p[0] - 0.5).abs() < 1e-5, "{p:?}");
+        assert!((p[1] - 1.0).abs() < 1e-5, "{p:?}");
+    }
+
+    #[test]
+    fn legacy_scalar_uv_scale_loads_as_uniform() {
+        let json = r#"{"albedo":"a.jpg","uv_scale":3.0}"#;
+        let t: MaterialTextures = serde_json::from_str(json).unwrap();
+        assert_eq!(t.uv_scale, [3.0, 3.0]);
+        assert_eq!(t.uv_rotation, 0.0);
+
+        let json = r#"{"albedo":"a.jpg","uv_scale":[3.0,1.5],"uv_rotation":45.0}"#;
+        let t: MaterialTextures = serde_json::from_str(json).unwrap();
+        assert_eq!(t.uv_scale, [3.0, 1.5]);
+        assert_eq!(t.uv_rotation, 45.0);
+    }
+
+    #[test]
+    fn degenerate_uv_scale_is_clamped_away() {
+        let m = Material {
+            textures: MaterialTextures {
+                uv_scale: [0.0, f32::NAN],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(m.clamped().textures.uv_scale, [1.0, 1.0]);
     }
 
     #[test]

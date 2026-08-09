@@ -14,12 +14,24 @@ pub struct MeshData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     pub indices: Vec<u32>,
+    /// Optional per-vertex UVs (same length as `positions` when present).
+    /// Older scene files omit this; call [`MeshData::ensure_uvs`] before
+    /// sampling textures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uvs: Vec<Vec2>,
     /// Edges cut by the user (loop cut), as position-index pairs. Purely
     /// topological: the welded edit-mode view keeps coplanar faces separated
     /// across these edges, which would otherwise merge back into one face
     /// group and make the cut unselectable. Renderers ignore them.
     #[serde(default)]
     pub seams: Vec<(u32, u32)>,
+    /// Per-triangle material slot (edit-mode face materials): 0 = the
+    /// object's own material, k > 0 = `Object::face_materials[k - 1]`.
+    /// Empty means "all triangles slot 0". Only meaningful while its length
+    /// equals the triangle count — mesh surgery that rebuilds the index
+    /// buffer drops it, and renderers must ignore a stale length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tri_materials: Vec<u32>,
 }
 
 impl MeshData {
@@ -43,6 +55,13 @@ impl MeshData {
         out.positions.reserve(self.indices.len());
         out.normals.reserve(self.indices.len());
         out.indices.reserve(self.indices.len());
+        let has_uvs = self.uvs.len() == self.positions.len();
+        if has_uvs {
+            out.uvs.reserve(self.indices.len());
+        }
+        if self.tri_materials.len() == self.indices.len() / 3 {
+            out.tri_materials = self.tri_materials.clone(); // tri order is preserved
+        }
         for tri in self.indices.chunks_exact(3) {
             let a = self.positions[tri[0] as usize];
             let b = self.positions[tri[1] as usize];
@@ -51,9 +70,41 @@ impl MeshData {
             let base = out.positions.len() as u32;
             out.positions.extend_from_slice(&[a, b, c]);
             out.normals.extend_from_slice(&[n, n, n]);
+            if has_uvs {
+                out.uvs.extend_from_slice(&[
+                    self.uvs[tri[0] as usize],
+                    self.uvs[tri[1] as usize],
+                    self.uvs[tri[2] as usize],
+                ]);
+            }
             out.indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
         out
+    }
+
+    /// Fill missing UVs with a simple box/triplanar projection (meters → UV).
+    /// Existing UVs of matching length are left alone.
+    pub fn ensure_uvs(&mut self) {
+        if self.uvs.len() == self.positions.len() {
+            return;
+        }
+        self.uvs.clear();
+        self.uvs.reserve(self.positions.len());
+        for (i, p) in self.positions.iter().enumerate() {
+            let n = self.normals.get(i).copied().unwrap_or(Vec3::Z);
+            let an = n.abs();
+            let uv = if an.z >= an.x && an.z >= an.y {
+                // Top / bottom → XY
+                Vec2::new(p.x, p.y)
+            } else if an.y >= an.x {
+                // Front / back → XZ
+                Vec2::new(p.x, p.z)
+            } else {
+                // Left / right → YZ
+                Vec2::new(p.y, p.z)
+            };
+            self.uvs.push(uv);
+        }
     }
 
     /// Recompute normals from the current positions: every vertex gets the
@@ -148,6 +199,74 @@ pub const SPOT_GIZMO_LENGTH: f32 = 0.7;
 pub fn spot_gizmo_radius(spot_angle_deg: f32) -> f32 {
     ((0.5 * spot_angle_deg.clamp(1.0, 160.0)).to_radians().tan() * SPOT_GIZMO_LENGTH)
         .clamp(0.02, 4.0)
+}
+
+// Camera gizmo (viewport marker). Body sits near the origin; the lens pyramid
+// points along local −Z (view direction). Half-width / height describe the
+// body box; the lens reaches farther along −Z.
+pub const CAMERA_GIZMO_HALF_W: f32 = 0.22;
+pub const CAMERA_GIZMO_HALF_H: f32 = 0.16;
+pub const CAMERA_GIZMO_BODY: f32 = 0.28; // extent of body along +Z from origin
+pub const CAMERA_GIZMO_LENS: f32 = 0.45; // lens reach along −Z
+pub const CAMERA_GIZMO_EXTENT: f32 = 0.60; // bounding radius (lens corner)
+
+/// Camera gizmo: a small box body with a frustum pyramid pointing along −Z
+/// (the view direction). Pickable like empties and light gizmos.
+pub fn camera_gizmo() -> MeshData {
+    let mut m = MeshData::default();
+    let hw = CAMERA_GIZMO_HALF_W;
+    let hh = CAMERA_GIZMO_HALF_H;
+    let body_z = CAMERA_GIZMO_BODY;
+    // body: axis-aligned box centered on origin, slightly behind the lens
+    axis_box(
+        &mut m,
+        Vec3::new(-hw, -hh, -0.05),
+        Vec3::new(hw, hh, body_z),
+    );
+    // lens pyramid: apex at origin (sensor), open base along −Z
+    let lens = CAMERA_GIZMO_LENS;
+    let lw = hw * 1.35;
+    let lh = hh * 1.35;
+    let apex = Vec3::ZERO;
+    let corners = [
+        Vec3::new(-lw, -lh, -lens),
+        Vec3::new(lw, -lh, -lens),
+        Vec3::new(lw, lh, -lens),
+        Vec3::new(-lw, lh, -lens),
+    ];
+    // four side faces
+    for i in 0..4 {
+        let p0 = corners[i];
+        let p1 = corners[(i + 1) % 4];
+        let n = (p0 - apex).cross(p1 - apex).normalize_or_zero();
+        let v = m.positions.len() as u32;
+        m.positions.extend_from_slice(&[apex, p0, p1]);
+        m.normals.extend_from_slice(&[n, n, n]);
+        m.indices.extend_from_slice(&[v, v + 1, v + 2]);
+    }
+    // open base ring (flat “film plane” face, normal −Z)
+    let center = Vec3::new(0.0, 0.0, -lens);
+    let down = -Vec3::Z;
+    let v0 = m.positions.len() as u32;
+    m.positions.push(center);
+    m.normals.push(down);
+    for p in &corners {
+        m.positions.push(*p);
+        m.normals.push(down);
+    }
+    for i in 0..4u32 {
+        let a = v0 + 1 + i;
+        let b = v0 + 1 + (i + 1) % 4;
+        m.indices.extend_from_slice(&[v0, b, a]);
+    }
+    // film-back detail on +Z face of the body (small raised plate)
+    let t = 0.02;
+    axis_box(
+        &mut m,
+        Vec3::new(-hw * 0.55, -hh * 0.55, body_z),
+        Vec3::new(hw * 0.55, hh * 0.55, body_z + t),
+    );
+    m
 }
 
 /// Light gizmo: an emissive viewport marker (bulb + rays / cone). Like the
@@ -784,7 +903,7 @@ pub fn ico_sphere(subdivisions: u32, radius: f32) -> MeshData {
         normals: positions.clone(),
         positions: positions.into_iter().map(|p| p * radius).collect(),
         indices: faces.into_flattened(),
-        seams: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -869,6 +988,94 @@ pub fn rope(length: f32, radius: f32) -> MeshData {
     let length = length.max(0.01);
     let radius = radius.max(0.001);
     rope_polyline(&[Vec3::ZERO, Vec3::new(length, 0.0, 0.0)], radius)
+}
+
+/// Local-space position of cloth grid vertex `(u, v)` on a sheet of size
+/// `width` × `height` in the XY plane, centered at the origin.
+/// `segments_u` / `segments_v` are the number of cells (nodes = segments + 1).
+pub fn cloth_vertex_local(
+    width: f32,
+    height: f32,
+    segments_u: u32,
+    segments_v: u32,
+    u: u32,
+    v: u32,
+) -> Vec3 {
+    let su = segments_u.max(1);
+    let sv = segments_v.max(1);
+    let u = u.min(su) as f32;
+    let v = v.min(sv) as f32;
+    Vec3::new(
+        -0.5 * width + (u / su as f32) * width,
+        -0.5 * height + (v / sv as f32) * height,
+        0.0,
+    )
+}
+
+/// Flat cloth sheet in the XY plane (Z-up world): width along X, height along Y.
+pub fn cloth(width: f32, height: f32, segments_u: u32, segments_v: u32) -> MeshData {
+    let width = width.max(0.05);
+    let height = height.max(0.05);
+    let su = segments_u.clamp(1, 32);
+    let sv = segments_v.clamp(1, 32);
+    let nu = su + 1;
+    let nv = sv + 1;
+    let mut positions = Vec::with_capacity((nu * nv) as usize);
+    for v in 0..nv {
+        for u in 0..nu {
+            positions.push(cloth_vertex_local(width, height, su, sv, u, v));
+        }
+    }
+    cloth_from_grid(&positions, su, sv)
+}
+
+/// Cloth mesh from a row-major grid of vertex positions
+/// (`(segments_u+1) * (segments_v+1)` points). Used for the live sim drape.
+pub fn cloth_from_grid(positions: &[Vec3], segments_u: u32, segments_v: u32) -> MeshData {
+    let su = segments_u.clamp(1, 32);
+    let sv = segments_v.clamp(1, 32);
+    let nu = (su + 1) as usize;
+    let nv = (sv + 1) as usize;
+    let expected = nu * nv;
+    if positions.len() < expected {
+        return cloth(1.0, 1.0, su, sv);
+    }
+    let mut m = MeshData::default();
+    m.positions.extend_from_slice(&positions[..expected]);
+    m.normals = vec![Vec3::Z; expected];
+    // two triangles per cell, CCW when viewed from +Z; stride = nu = su+1
+    let stride = nu as u32;
+    // Double-sided: front and back faces so draping cloth is visible from below
+    for v in 0..sv {
+        for u in 0..su {
+            let i00 = u + v * stride;
+            let i10 = i00 + 1;
+            let i01 = i00 + stride;
+            let i11 = i01 + 1;
+            m.indices.extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
+            m.indices.extend_from_slice(&[i00, i11, i10, i00, i01, i11]);
+        }
+    }
+    // face normals averaged to vertices (front-facing contribution dominates)
+    for n in &mut m.normals {
+        *n = Vec3::ZERO;
+    }
+    for tri in m.indices.chunks_exact(3) {
+        let a = m.positions[tri[0] as usize];
+        let b = m.positions[tri[1] as usize];
+        let c = m.positions[tri[2] as usize];
+        let n = (b - a).cross(c - a);
+        m.normals[tri[0] as usize] += n;
+        m.normals[tri[1] as usize] += n;
+        m.normals[tri[2] as usize] += n;
+    }
+    for n in &mut m.normals {
+        *n = n.normalize_or_zero();
+        if n.length_squared() < 1e-12 {
+            *n = Vec3::Z;
+        }
+    }
+    m
 }
 
 /// Tube mesh along an arbitrary polyline (local space). Degenerate or
