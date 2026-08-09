@@ -10,19 +10,26 @@
 //! Two things here differ from the `three_d` camera it replaces, and both are
 //! deliberate.
 //!
-//! **Depth is `[0, 1]`, not `[-1, 1]`.** cgmath — and so three-d — emits
-//! OpenGL's symmetric clip range. WebGPU, and therefore wgpu and Aether, use
-//! `[0, 1]`. The wrong choice here does not fail to compile and does not look
-//! obviously broken: the near half of the depth buffer is simply thrown away,
-//! which reads as z-fighting and vanishing back faces rather than as a matrix
-//! bug. [`Mat4::perspective_rh`] and [`Mat4::orthographic_rh`] are the `[0, 1]`
-//! constructors; the `_gl` suffixed ones are the range we are leaving.
+//! **Depth is reverse-Z: the near plane maps to 1 and the far plane to 0.**
+//! cgmath — and so three-d — emits OpenGL's symmetric `[-1, 1]`. Aether's
+//! `CONTRACT.md` rule 1 makes reverse-Z non-negotiable and every one of its
+//! pipelines compares depth with `Greater`, so a camera built the ordinary way
+//! sorts the scene inside out. That failure does not look like a matrix bug: it
+//! reads as z-fighting and as near geometry disappearing behind far geometry.
+//!
+//! The matrices therefore come from [`aether_math`] rather than from glam or
+//! from anything written here — the convention needs exactly one definition,
+//! and it belongs with the pipelines that depend on it. Both functions assume a
+//! right-handed view space looking down `-Z`, which is what
+//! [`Mat4::look_at_rh`] produces.
 //!
 //! **Orthographic height is absolute world units.** three-d multiplied the
 //! height it was given by the camera-to-target distance, so every call site had
 //! to pass a height *per unit distance* and explain itself in a comment. Here
 //! the height is the world-space height of the visible box, and the caller that
 //! wants ortho to frame the same content as perspective computes that directly.
+
+use aether_math::{ortho_reverse_z, perspective_reverse_z};
 
 use super::math::{Angle, Mat4, Vec3, Viewport};
 
@@ -106,12 +113,12 @@ impl Camera {
         let aspect = viewport.aspect();
         let projection = match projection_kind {
             Projection::Perspective { fov_y } => {
-                Mat4::perspective_rh(fov_y.radians(), aspect, z_near, z_far)
+                perspective_reverse_z(fov_y.radians(), aspect, z_near, z_far)
             }
             Projection::Orthographic { height } => {
                 let half_h = 0.5 * height;
                 let half_w = half_h * aspect;
-                Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, z_near, z_far)
+                ortho_reverse_z(-half_w, half_w, -half_h, half_h, z_near, z_far)
             }
         };
         Self {
@@ -200,15 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn depth_is_the_webgpu_range_not_the_opengl_one() {
-        // The bug this guards: cgmath's `perspective` — and so three-d's — maps
-        // the near plane to -1. Under wgpu that half of the range is clipped
-        // away, which looks like z-fighting and disappearing geometry rather
-        // than like a wrong matrix.
+    fn depth_is_reverse_z_as_every_aether_pipeline_expects() {
+        // The bug this guards: the ordinary conventions both map the near plane
+        // to the *low* end — cgmath (and so three-d) to -1, glam's
+        // `perspective_rh` to 0. Aether compares depth with `Greater`, so
+        // either one sorts the scene inside out: near geometry loses to far
+        // geometry and vanishes, which does not read as a matrix bug.
         let (near, far) = (1.0, 51.0);
         let cam = Camera::new_perspective(
             vp(),
-            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::ZERO,
             Vec3::new(0.0, -1.0, 0.0),
             Vec3::Z,
             degrees(45.0),
@@ -217,8 +225,25 @@ mod tests {
         );
         let at_near = ndc(&cam, Vec3::new(0.0, -near, 0.0)).z;
         let at_far = ndc(&cam, Vec3::new(0.0, -far, 0.0)).z;
-        assert!(at_near.abs() < 1e-4, "near plane mapped to {at_near}, expected 0");
-        assert!((at_far - 1.0).abs() < 1e-4, "far plane mapped to {at_far}, expected 1");
+        assert!((at_near - 1.0).abs() < 1e-4, "near plane mapped to {at_near}, expected 1");
+        assert!(at_far.abs() < 1e-4, "far plane mapped to {at_far}, expected 0");
+    }
+
+    #[test]
+    fn orthographic_depth_runs_the_same_way_as_perspective() {
+        // Two projections disagreeing about which end is near is the same bug,
+        // visible only when the user presses numpad 1 and the scene inverts.
+        let cam = Camera::new_orthographic(
+            vp(),
+            Vec3::ZERO,
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::Z,
+            4.0,
+            1.0,
+            51.0,
+        );
+        assert!((ndc(&cam, Vec3::new(0.0, -1.0, 0.0)).z - 1.0).abs() < 1e-4);
+        assert!(ndc(&cam, Vec3::new(0.0, -51.0, 0.0)).z.abs() < 1e-4);
     }
 
     #[test]
