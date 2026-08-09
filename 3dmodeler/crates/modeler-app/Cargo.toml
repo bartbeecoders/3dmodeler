@@ -8,7 +8,24 @@ description = "3D modeler application: viewport, tools, UI (native + browser)"
 modeler-core = { path = "../modeler-core" }
 modeler-ai = { path = "../modeler-ai" }
 box3d-sys = { path = "../box3d-sys" }
-three-d = { version = "0.19", features = ["egui-gui"] }
+
+# Aether: the renderer, its editor overlay, and the maths both it and
+# modeler-core already speak. Path dependencies because the engine is developed
+# alongside this app rather than published.
+aether-render = { path = "../../../../Physics3D/crates/aether-render" }
+aether-assets = { path = "../../../../Physics3D/crates/aether-assets" }
+aether-math = { path = "../../../../Physics3D/crates/aether-math" }
+wgpu = "26"
+
+# egui at the version three-d used to pin, so the widget code in ui.rs and the
+# tool panels is unchanged; only the painter moves from glow to wgpu.
+#
+# Deliberately NOT egui-wgpu: no published version targets wgpu 26, which is
+# what the engine uses (0.32 -> wgpu 25, 0.33 -> 27, 0.34 -> 29), and two wgpu
+# crates in one binary are two unrelated sets of types. See gfx/egui_paint.rs.
+egui = { version = "0.34", features = ["bytemuck"] } # bytemuck: upload the font atlas without copying it
+bytemuck = { version = "1", features = ["derive"] }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -16,9 +33,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 hayro = "0.7" # pure-Rust PDF rasterizer: reference setup imports plan-set PDFs
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-winit = "0.28" # same version as three-d's (we own the event loop for OS file drops)
-glutin = "0.30" # same version as three-d's (we own GL context creation — see gl_window.rs)
-raw-window-handle = "0.5"
+# winit 0.30, not 0.28: wgpu 26 needs raw-window-handle 0.6 and winit 0.28
+# provides 0.5. The old glutin GL-context dance goes away with it.
+winit = "0.30"
+egui-winit = { version = "0.34", default-features = false, features = ["links"] }
+pollster = "0.4"
 tiny_http = "0.12"
 rfd = "0.15"
 dirs = "5"
