@@ -20,12 +20,16 @@
 pub mod camera;
 pub mod egui_paint;
 pub mod event;
+pub mod frame;
 pub mod math;
 
 pub use egui_paint::EguiPainter;
 
 pub use camera::{Camera, Projection};
 pub use event::{Event, Key, Modifiers, MouseButton};
+pub use frame::{FrameInput, FrameOutput};
+#[cfg(not(target_arch = "wasm32"))]
+pub use frame::FrameInputGenerator;
 pub use math::{
     degrees, radians, vec2, vec3, vec4, Angle, Magnitude, Mat3, Mat4, PhysicalPoint, Quat, Srgba,
     ToVec, Vec2, Vec3, Vec4, Viewport,
