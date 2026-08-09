@@ -8,12 +8,12 @@ From a machine that has the [LikeC4](https://likec4.dev) CLI (or the likec4 mono
 
 ```bash
 # if likec4 is installed globally / via npx
-npx likec4 serve /run/media/bart/Development/Projects/box3d/architecture
+npx likec4 serve /run/media/bart/Development/dev/bartbeecoders/3dModeler/architecture
 
 # from the likec4-ai monorepo
-./scripts/start.sh --no-mcp /run/media/bart/Development/Projects/box3d/architecture
+./scripts/start.sh --no-mcp /run/media/bart/Development/dev/bartbeecoders/3dModeler/architecture
 # or with Node 22+:
-node packages/likec4/bin/likec4.mjs serve /run/media/bart/Development/Projects/box3d/architecture
+node packages/likec4/bin/likec4.mjs serve /run/media/bart/Development/dev/bartbeecoders/3dModeler/architecture
 ```
 
 ## Views
