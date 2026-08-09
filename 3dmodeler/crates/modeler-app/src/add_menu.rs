@@ -9,11 +9,11 @@
 //! see main.rs) so a commit click never falls through to viewport picking;
 //! the actual commit happens on the next `ui` call via `pending_click`.
 
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::object_ops::event_pos_to_egui;
 use crate::pie::{self, PieIcon, PieSlot};
 use modeler_core::{Primitive, Scene, Transform};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton, Viewport};
 
 #[derive(Clone, Copy)]
 enum PieItem {

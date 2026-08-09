@@ -12,11 +12,11 @@
 //! when simulation starts. Visual length is `impulse * VISUAL_SCALE` meters.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::selection::Selection;
 use modeler_core::glam::Vec3;
 use modeler_core::{ObjectId, Scene};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton, Viewport};
 
 /// World meters of arrow per unit of impulse. A force of (0, 0, 10) draws a
 /// 1 m arrow; scale is also used when converting a dragged tip back to force.
@@ -119,7 +119,7 @@ impl ForceHandles {
                         }
                         let tip = Self::tip_world(origin, force);
                         let Some((sx, sy)) =
-                            camera.project(viewport, three_d::vec3(tip.x, tip.y, tip.z))
+                            camera.project(viewport, tip)
                         else {
                             continue;
                         };
@@ -194,7 +194,7 @@ impl ForceHandles {
             .with_clip_rect(clip);
         let pointer = ctx.pointer_hover_pos();
         let project = |p: Vec3| -> Option<egui::Pos2> {
-            let (x, y) = camera.project(viewport, three_d::vec3(p.x, p.y, p.z))?;
+            let (x, y) = camera.project(viewport, p)?;
             Some(egui::Pos2::new(
                 x / device_pixel_ratio,
                 (viewport.height as f32 - y) / device_pixel_ratio,

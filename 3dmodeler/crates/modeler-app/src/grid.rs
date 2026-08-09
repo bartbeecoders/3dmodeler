@@ -3,7 +3,7 @@
 //! Built from thin quads so it needs no custom shader. A shader-based
 //! infinite grid with distance fade is a polish item for later.
 
-use three_d::*;
+use crate::gfx::*;
 
 const EXTENT: f32 = 50.0;
 const MAJOR_EVERY: i32 = 10;

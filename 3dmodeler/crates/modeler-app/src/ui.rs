@@ -27,8 +27,8 @@ use modeler_core::{
     Library, Material, MaterialFunction, ObjectId, Primitive, Scene, Transform,
     WorldPositionEffect,
 };
-use three_d::egui;
-use three_d::Event;
+use crate::gfx::egui;
+use crate::gfx::Event;
 
 /// Master-material actions queued while the properties panel draws.
 enum MasterAction {
@@ -2757,13 +2757,13 @@ fn view_menu(
     ui.separator();
     if ui.button("Frame Selection  (.)").clicked() {
         if let Some((center, radius)) = crate::selection_bounds(scene, selection) {
-            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+            camera.frame(center, radius);
         }
         close = true;
     }
     if ui.button("Frame All  (Home)").clicked() {
         if let Some((center, radius)) = scene.bounds() {
-            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+            camera.frame(center, radius);
         }
         close = true;
     }

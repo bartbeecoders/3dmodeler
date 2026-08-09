@@ -6,12 +6,12 @@
 //! (mesh identities, world transforms, selection tiers) changes — orbiting
 //! the camera costs one uniform upload, not an O(edges) re-projection.
 
+use crate::gfx::*;
 use crate::scene_render::{hash_primitive, WireframeCache};
 use crate::selection::Selection;
 use modeler_core::Scene;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use three_d::*;
 
 const VERTEX_SHADER: &str = "
 uniform mat4 viewProjection;
@@ -154,7 +154,7 @@ impl WireRender {
             ));
             self.program.use_vertex_attribute("position", positions);
             self.program.draw_with(render_states, viewport, || unsafe {
-                use three_d::context::HasContext as _;
+                use crate::gfx::context::HasContext as _;
                 self.context
                     .draw_arrays(three_d::context::LINES, first as i32, count as i32);
             });

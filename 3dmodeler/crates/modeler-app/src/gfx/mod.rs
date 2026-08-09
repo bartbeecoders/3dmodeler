@@ -10,18 +10,21 @@
 //! | module | what it owns |
 //! |---|---|
 //! | [`math`] | vectors, angles, colours, viewport — on glam |
+//! | [`camera`] | the view and projection matrices a draw call needs |
 //! | [`event`] | input events, shaped as the tools already match on them |
 //!
 //! Re-exported flat, because the call sites say `use crate::gfx::*` where they
 //! used to say `use three_d::*` and the point is that the rest of the file did
 //! not have to change.
 
+pub mod camera;
 pub mod egui_paint;
 pub mod event;
 pub mod math;
 
 pub use egui_paint::EguiPainter;
 
+pub use camera::{Camera, Projection};
 pub use event::{Event, Key, Modifiers, MouseButton};
 pub use math::{
     degrees, radians, vec2, vec3, vec4, Angle, Magnitude, Mat3, Mat4, PhysicalPoint, Quat, Srgba,

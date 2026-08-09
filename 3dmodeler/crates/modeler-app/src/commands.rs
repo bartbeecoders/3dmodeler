@@ -1125,7 +1125,7 @@ pub fn apply_view_args(
             }
         };
         if let Some((center, radius)) = bounds {
-            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+            camera.frame(center, radius);
         }
     }
     None

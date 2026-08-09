@@ -8,13 +8,13 @@
 //! playback) just update the transformation matrix and meshes are
 //! regenerated only when primitive parameters, shading or material change.
 
+use crate::gfx::*;
 use crate::selection::Selection;
 use modeler_core::glam;
 use modeler_core::{LightKind, MeshData, Material, ObjectId, Primitive, Scene, Transform};
 use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use three_d::*;
 
 /// Resolve the object's full render material (master + MPC + world effects).
 fn render_material(scene: &Scene, id: ObjectId) -> Material {
@@ -310,7 +310,7 @@ fn to_cpu_mesh(data: &MeshData) -> CpuMesh {
         Some(
             data.uvs
                 .iter()
-                .map(|u| three_d::vec2(u.x, u.y))
+                .map(|u| crate::gfx::vec2(u.x, u.y))
                 .collect(),
         )
     } else {

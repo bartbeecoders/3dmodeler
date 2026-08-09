@@ -10,11 +10,11 @@
 //! on the web backend, which breaks AZERTY and friends.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::{Quat, Vec3};
 use modeler_core::{ObjectId, Scene, Transform};
-use three_d::{Event, Key, MouseButton, Viewport};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
@@ -99,14 +99,6 @@ fn axis_vec(i: usize) -> Vec3 {
 
 fn axis_name(i: usize) -> &'static str {
     ["X", "Y", "Z"][i]
-}
-
-fn gv(v: three_d::Vec3) -> Vec3 {
-    Vec3::new(v.x, v.y, v.z)
-}
-
-fn cg(v: Vec3) -> three_d::Vec3 {
-    three_d::vec3(v.x, v.y, v.z)
 }
 
 impl ModalTransform {
@@ -456,7 +448,6 @@ impl ModalTransform {
         let Some(state) = &mut self.state else { return };
 
         let (right, up, forward) = camera.screen_basis();
-        let (right, up, forward) = (gv(right), gv(up), gv(forward));
         let dx = state.cur_mouse.0 - state.start_mouse.0;
         let dy = state.cur_mouse.1 - state.start_mouse.1;
         let numeric = Self::numeric_value(state);
@@ -477,7 +468,7 @@ impl ModalTransform {
 
         match state.kind {
             Kind::Grab => {
-                let wpp = camera.world_per_pixel_at(viewport, cg(state.pivot));
+                let wpp = camera.world_per_pixel_at(viewport, state.pivot);
                 let mut delta = right * (dx * wpp) + up * (dy * wpp);
                 match state.constraint {
                     Constraint::Free => {}
@@ -495,7 +486,7 @@ impl ModalTransform {
                 state.snap_target = None;
                 let mut vertex_snapped = false;
                 if snap_to_vertex && numeric.is_none() {
-                    let screen_of = |p: Vec3| camera.world_to_screen(viewport, cg(p));
+                    let screen_of = |p: Vec3| camera.world_to_screen(viewport, p);
                     if let Some((raw, target)) = vertex_snap_delta(
                         &state.snap_candidates,
                         &state.snap_sources,
@@ -561,7 +552,7 @@ impl ModalTransform {
                 }
             }
             Kind::Rotate => {
-                let pivot_screen = camera.world_to_screen(viewport, cg(state.pivot));
+                let pivot_screen = camera.world_to_screen(viewport, state.pivot);
                 let a0 = (state.start_mouse.1 - pivot_screen.1)
                     .atan2(state.start_mouse.0 - pivot_screen.0);
                 let a1 =
@@ -603,7 +594,7 @@ impl ModalTransform {
                 }
             }
             Kind::Scale => {
-                let pivot_screen = camera.world_to_screen(viewport, cg(state.pivot));
+                let pivot_screen = camera.world_to_screen(viewport, state.pivot);
                 let d0 = ((state.start_mouse.0 - pivot_screen.0).powi(2)
                     + (state.start_mouse.1 - pivot_screen.1).powi(2))
                 .sqrt()

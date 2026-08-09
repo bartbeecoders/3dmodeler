@@ -6,11 +6,11 @@
 //! inverts, like the modal operators). The roof kind comes from the Add
 //! menu entry that armed the tool; the sidebar can change it afterwards.
 
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::selection::Selection;
 use crate::wall_tool::ground_point;
 use modeler_core::glam::{Vec2, Vec3};
 use modeler_core::{ObjectId, Primitive, RoofKind, Scene, Transform};
-use three_d::{Event, Key, MouseButton, Viewport};
 
 const MIN_SIDE: f32 = 0.1; // meters; smaller rectangles cancel the roof
 

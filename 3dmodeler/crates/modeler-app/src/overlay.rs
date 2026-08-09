@@ -3,14 +3,14 @@
 //! Also hosts the ruler tool state (Add ▸ Measure).
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::Viewport;
 use crate::modal::{GuideKind, Guides};
 use crate::ref_image::{CalibrateTool, MarkerTool};
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::Scene;
-use three_d::egui;
-use three_d::Viewport;
 
 const MEASURE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 210, 90);
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 235);
@@ -65,7 +65,7 @@ fn to_egui(
     device_pixel_ratio: f32,
     p: Vec3,
 ) -> Option<egui::Pos2> {
-    let (x, y) = camera.project(viewport, three_d::vec3(p.x, p.y, p.z))?;
+    let (x, y) = camera.project(viewport, p)?;
     Some(egui::Pos2::new(
         x / device_pixel_ratio,
         (viewport.height as f32 - y) / device_pixel_ratio,
@@ -117,7 +117,7 @@ pub fn draw_modal_guides(
     // axis for the screen direction and extend across the whole viewport.
     let step = camera.world_per_pixel_at(
         viewport,
-        three_d::vec3(guides.pivot.x, guides.pivot.y, guides.pivot.z),
+        guides.pivot,
     ) * 100.0;
     for &i in &guides.axes {
         let axis = [Vec3::X, Vec3::Y, Vec3::Z][i];

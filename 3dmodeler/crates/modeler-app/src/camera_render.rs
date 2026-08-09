@@ -4,10 +4,10 @@
 //! (look along local −Z, up = local +Y) and draws solid scene meshes into
 //! a reusable texture — no grid, outlines, reference images, or gizmo markers.
 
+use crate::gfx::*;
 use crate::scene_render::{SceneLights, SceneRender};
 use modeler_core::glam::Vec3;
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
-use three_d::*;
 
 /// Live camera preview resolution (physical pixels).
 pub const LIVE_WIDTH: u32 = 960;

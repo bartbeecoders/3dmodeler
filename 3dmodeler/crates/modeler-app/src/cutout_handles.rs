@@ -14,12 +14,12 @@
 //! one step (see `dragging()` in main.rs's `undo.on_frame` call).
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::{ObjectId, Primitive, Scene};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton, Viewport};
 
 /// Handle disc radius / pick radius, logical points.
 const HANDLE_RADIUS: f32 = 8.0;
@@ -108,7 +108,7 @@ impl CutoutHandles {
                     for (id, i, world_pos, _) in Self::handles(scene, selection) {
                         let Some((sx, sy)) = camera.project(
                             viewport,
-                            three_d::vec3(world_pos.x, world_pos.y, world_pos.z),
+                            world_pos,
                         ) else {
                             continue;
                         };
@@ -196,7 +196,7 @@ impl CutoutHandles {
 
         for (id, i, world_pos, is_window) in handles {
             let Some((sx, sy)) =
-                camera.project(viewport, three_d::vec3(world_pos.x, world_pos.y, world_pos.z))
+                camera.project(viewport, world_pos)
             else {
                 continue;
             };

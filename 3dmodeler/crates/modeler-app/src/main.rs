@@ -25,6 +25,7 @@ mod force_handles;
 mod rope_handles;
 mod cloth_handles;
 mod edit_mode;
+mod gfx;
 #[cfg(not(target_arch = "wasm32"))]
 mod gl_window;
 mod grid;
@@ -54,11 +55,11 @@ mod undo;
 mod wall_tool;
 mod wire_render;
 
+use crate::gfx::*;
 use camera::BlenderCamera;
 use modeler_core::glam;
 use modeler_core::Scene;
 use selection::Selection;
-use three_d::*;
 
 fn info(msg: &str) {
     #[cfg(target_arch = "wasm32")]

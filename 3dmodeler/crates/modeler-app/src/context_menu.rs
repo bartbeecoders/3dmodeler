@@ -19,6 +19,8 @@
 //! the Shift+A wheel, clicks are consumed in `handle_events` (runs after the
 //! egui pass) and committed on the next `ui` call via `pending_click`.
 
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton};
 use crate::library::LibraryPanel;
 use crate::modal::{self, ModalTransform};
 use crate::object_ops::{self, BreakKind};
@@ -26,8 +28,6 @@ use crate::pie::{self, PieIcon, PieSlot};
 use crate::selection::Selection;
 use modeler_core::glam::Vec3;
 use modeler_core::{Material, ObjectId, Primitive, Scene, WallCutout};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton};
 
 #[derive(Clone, Copy)]
 pub enum Target {

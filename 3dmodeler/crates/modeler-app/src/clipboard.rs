@@ -14,7 +14,7 @@
 //! Copying OUT of fields still needs upstream integration support (egui's
 //! copy command is consumed inside three-d) — paste is the important half.
 
-use three_d::Event;
+use crate::gfx::Event;
 
 /// Call once at startup. Registers the browser paste listener on wasm;
 /// a no-op natively.
@@ -57,7 +57,7 @@ pub fn inject_paste(events: &mut Vec<Event>, field_focused: bool) {
 /// paste should happen.
 #[cfg(not(target_arch = "wasm32"))]
 fn take_paste_chord(events: &mut [Event], field_focused: bool) -> bool {
-    use three_d::Key;
+    use crate::gfx::Key;
     let mut requested = false;
     for event in events.iter_mut() {
         if let Event::KeyPress { kind, modifiers, handled } = event {
@@ -112,7 +112,7 @@ mod web {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use three_d::{Key, Modifiers};
+    use crate::gfx::{Key, Modifiers};
 
     fn ctrl_v(handled: bool) -> Event {
         Event::KeyPress {

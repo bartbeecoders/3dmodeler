@@ -2,15 +2,14 @@
 //! Clicking a ball snaps the view to look along that axis.
 
 use crate::camera::BlenderCamera;
-use three_d::egui;
-use three_d::InnerSpace;
+use crate::gfx::egui;
 
 const RADIUS: f32 = 40.0; // widget radius in ui points
 const BALL_RADIUS: f32 = 8.0;
 
 struct AxisBall {
     label: &'static str,
-    world: three_d::Vec3,
+    world: crate::gfx::Vec3,
     color: egui::Color32,
     /// (yaw°, pitch°) that makes the camera look along -world (from the ball side)
     view: (f32, f32),
@@ -18,7 +17,7 @@ struct AxisBall {
 }
 
 fn balls() -> [AxisBall; 6] {
-    use three_d::vec3;
+    use crate::gfx::vec3;
     let red = egui::Color32::from_rgb(230, 100, 90);
     let green = egui::Color32::from_rgb(130, 190, 80);
     let blue = egui::Color32::from_rgb(90, 140, 230);

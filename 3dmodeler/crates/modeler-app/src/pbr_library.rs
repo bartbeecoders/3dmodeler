@@ -15,13 +15,13 @@
 //! | [3D Textures](https://3dtextures.me) | Free | none | Listed for discovery |
 //! | [FreePBR](https://freepbr.com) | Free | none | Listed for discovery |
 
+use crate::gfx::egui;
 use crate::net::{self, BytesTask, HttpTask};
 use crate::selection::Selection;
 use modeler_core::{Material, MaterialTextures, Scene};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use three_d::egui;
 
 const USER_AGENT: &str = "box3d-modeler/0.2 (PBR library; https://github.com)";
 
@@ -1476,7 +1476,7 @@ impl PbrLibraryPanel {
 
 /// Decode a cached map into a three-d `CpuTexture`.
 pub fn cpu_texture_from_key(key: &str) -> Option<three_d::CpuTexture> {
-    use three_d::{CpuTexture, TextureData};
+    use crate::gfx::{CpuTexture, TextureData};
     let bytes = load_texture_bytes(key)?;
     let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -1496,7 +1496,7 @@ pub fn pack_orm(
     roughness: Option<&three_d::CpuTexture>,
     metallic: Option<&three_d::CpuTexture>,
 ) -> Option<three_d::CpuTexture> {
-    use three_d::{CpuTexture, TextureData};
+    use crate::gfx::{CpuTexture, TextureData};
     let (w, h, rough_px) = match roughness {
         Some(t) => {
             let TextureData::RgbaU8(px) = &t.data else {

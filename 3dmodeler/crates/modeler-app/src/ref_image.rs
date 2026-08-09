@@ -7,13 +7,13 @@
 //! axis plane, the async file picker (same pattern as io.rs — a blocking
 //! dialog inside the render loop would freeze winit), and calibration.
 
+use crate::gfx::*;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use modeler_core::glam;
 use modeler_core::{MarkerKind, ReferenceImage, Scene};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use three_d::*;
 
 // ---------------------------------------------------------------- import --
 

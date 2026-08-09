@@ -8,8 +8,8 @@
 //! only have a `Ui` at hand (outliner drag highlight, section headers) can
 //! read it back without threading `Settings` through every call.
 
+use crate::gfx::egui;
 use serde::{Deserialize, Serialize};
-use three_d::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Theme {

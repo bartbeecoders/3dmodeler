@@ -8,11 +8,11 @@
 //! the front elevation, and every other image inherits that scale from its
 //! own pixel size. Individual images can still be re-calibrated afterwards.
 
+use crate::gfx::egui;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use modeler_core::glam::Vec3;
 use modeler_core::{ImagePlane, ReferenceImage, Scene};
-use three_d::egui;
 
 use crate::ref_image;
 use crate::settings::Settings;
