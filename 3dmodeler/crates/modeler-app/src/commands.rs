@@ -221,6 +221,16 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                         t.erosion_stale(seed, resolution, size, height)
                     }),
                 })),
+            // water table (set with water, remove with clear_water)
+            "water": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.water.as_ref())
+                .map(|w| json!({
+                    "enabled": w.enabled,
+                    "level": w.level,
+                    "opacity": w.opacity,
+                })),
             // the full stack (round-trippable through update_object {terrain: ...})
             "layers": object
                 .terrain
@@ -632,6 +642,45 @@ fn apply_object_params(
                             .map_err(|e| format!("bad 'terrain_color': {e}"))?,
                     );
                 }
+            }
+            // water table: true/false toggles it, an object sets fields
+            // ({level, shallow, deep, depth_falloff, foam_width, opacity,
+            // roughness, ripple, enabled}; unset fields keep defaults). The
+            // sheet is real geometry, so this remeshes.
+            let mut water_touched = false;
+            if let Some(v) = params.get("water").filter(|v| !v.is_null()) {
+                let data = object.terrain.get_or_insert_with(Default::default);
+                if let Some(b) = v.as_bool() {
+                    match &mut data.water {
+                        Some(water) => water.enabled = b,
+                        None if b => data.water = Some(Default::default()),
+                        None => {}
+                    }
+                } else {
+                    // start from the current settings so partial updates work
+                    let mut base =
+                        serde_json::to_value(data.water.unwrap_or_default())
+                            .unwrap_or_default();
+                    if let (Some(base), Some(patch)) = (base.as_object_mut(), v.as_object())
+                    {
+                        for (k, val) in patch {
+                            base.insert(k.clone(), val.clone());
+                        }
+                    }
+                    data.water = Some(
+                        serde_json::from_value(base)
+                            .map_err(|e| format!("bad 'water': {e}"))?,
+                    );
+                }
+                water_touched = true;
+            }
+            if params.get("clear_water").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    water_touched |= data.water.take().is_some();
+                }
+            }
+            if water_touched {
+                object.mesh_revision += 1;
             }
         }
         // prop parameters (props only)

@@ -89,6 +89,8 @@ fn object_properties() -> Value {
         "erosion_enabled": {"type": "boolean", "description": "terrain only: toggle the baked erosion without discarding it"},
         "clear_erosion": {"type": "boolean", "description": "terrain only: true discards the baked erosion layer"},
         "terrain_color": {"description": "terrain only: biome coloring by height/slope (grass, rock on steep faces, snow, sand). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (Meadow), false (plain material color), or a full settings object as reported in the terrain stack"},
+        "water": {"description": "terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
+        "clear_water": {"type": "boolean", "description": "terrain only: true removes the water layer entirely"},
         "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "props only: retype a nature prop"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},

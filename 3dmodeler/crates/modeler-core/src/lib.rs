@@ -922,7 +922,7 @@ impl Object {
                 mesh::floor_polygon(&self.floor_outline, thickness)
             }
             (None, Primitive::Terrain { size, resolution, height, seed }) => {
-                let mesh = self.terrain_mesh(size, resolution, height, seed);
+                let mesh = self.terrain_mesh(size, resolution, height, seed, true);
                 if self.smooth { mesh } else { mesh.into_flat() }
             }
             // live draped rope: nodes are world-space; return a LOCAL mesh
@@ -973,21 +973,34 @@ impl Object {
                 mesh::floor_polygon(&self.floor_outline, thickness)
             }
             (None, Primitive::Terrain { size, resolution, height, seed }) => {
-                self.terrain_mesh(size, resolution, height, seed)
+                // no water sheet in the collider: rays, physics and the
+                // sculpt brush all reach the ground through the water
+                self.terrain_mesh(size, resolution, height, seed, false)
             }
             (None, primitive) => primitive.generate(true),
         }
     }
 
     /// The terrain mesh from this object's own stack (default stack when
-    /// unset), shared-vertex topology.
-    fn terrain_mesh(&self, size: f32, resolution: u32, height: f32, seed: u32) -> MeshData {
-        match &self.terrain {
-            Some(data) => terrain::generate_mesh(data, size, resolution, height, seed),
+    /// unset), shared-vertex topology. `with_water` adds the translucent
+    /// water sheet (render meshes only).
+    fn terrain_mesh(
+        &self,
+        size: f32,
+        resolution: u32,
+        height: f32,
+        seed: u32,
+        with_water: bool,
+    ) -> MeshData {
+        let default_stack;
+        let data = match &self.terrain {
+            Some(data) => data,
             None => {
-                terrain::generate_mesh(&TerrainData::default(), size, resolution, height, seed)
+                default_stack = TerrainData::default();
+                &default_stack
             }
-        }
+        };
+        terrain::generate_mesh_ex(data, size, resolution, height, seed, with_water)
     }
 
     /// Radius of the bounding sphere around the local origin.

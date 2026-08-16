@@ -3897,6 +3897,9 @@ fn properties(
                     ui.add_space(6.0);
                     let color_dirty = terrain_color_ui(ui, &mut stack);
                     ui.add_space(6.0);
+                    let (water_dirty, water_remesh) =
+                        terrain_water_ui(ui, &mut stack, &primitive);
+                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Scatter props").strong());
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("scatter-kind")
@@ -3955,8 +3958,9 @@ fn properties(
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Terrain layers").strong());
                     let stack_changed = terrain_stack_ui(ui, &mut stack);
-                    if erosion_dirty || color_dirty || stack_changed {
-                        edited_terrain = Some((stack, erosion_remesh || stack_changed));
+                    if erosion_dirty || color_dirty || water_dirty || stack_changed {
+                        edited_terrain =
+                            Some((stack, erosion_remesh || water_remesh || stack_changed));
                     }
                 }
 
@@ -5225,6 +5229,92 @@ fn terrain_color_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) ->
             });
     }
     changed
+}
+
+/// Water section of the Data tab. Returns `(dirty, remesh)`: level and
+/// ripple edits move the sheet's geometry (remesh); tint, foam, opacity and
+/// roughness only restamp the bake / material.
+fn terrain_water_ui(
+    ui: &mut egui::Ui,
+    stack: &mut modeler_core::TerrainData,
+    primitive: &Primitive,
+) -> (bool, bool) {
+    use modeler_core::terrain::WaterLayer;
+
+    let mut dirty = false;
+    let mut remesh = false;
+    ui.label(egui::RichText::new("Water").strong());
+    let mut on = stack.water.is_some_and(|w| w.enabled);
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut on, "Enabled")
+            .on_hover_text(
+                "A still water surface at a fixed height — fills lakes, \
+                 basins and carved river beds below the level",
+            )
+            .changed()
+        {
+            match &mut stack.water {
+                // keep the tuned settings across off/on toggles
+                Some(water) => water.enabled = on,
+                None => stack.water = on.then(WaterLayer::default),
+            }
+            dirty = true;
+            remesh = true;
+        }
+    });
+    if let Some(water) = stack.water.as_mut().filter(|w| w.enabled) {
+        let height = match primitive {
+            Primitive::Terrain { height, .. } => height.max(1.0) as f64,
+            _ => 50.0,
+        };
+        remesh |= float_row_ex(
+            ui,
+            "Level",
+            &mut water.level,
+            0.05,
+            (-0.5 * height)..=height,
+            Some(" m"),
+        );
+        ui.horizontal(|ui| {
+            dirty |= ui.color_edit_button_rgb(&mut water.shallow).changed();
+            ui.label("Shallow");
+            dirty |= ui.color_edit_button_rgb(&mut water.deep).changed();
+            ui.label("Deep");
+        });
+        egui::CollapsingHeader::new("Surface")
+            .id_salt("terrain-water-settings")
+            .show(ui, |ui| {
+                dirty |= float_row_ex(
+                    ui,
+                    "Deep below",
+                    &mut water.depth_falloff,
+                    0.1,
+                    0.1..=50.0,
+                    Some(" m"),
+                );
+                dirty |= float_row_ex(
+                    ui,
+                    "Foam width",
+                    &mut water.foam_width,
+                    0.05,
+                    0.0..=10.0,
+                    Some(" m"),
+                );
+                dirty |= slider_row(ui, "Opacity", &mut water.opacity, 0.05..=1.0);
+                dirty |= slider_row(ui, "Roughness", &mut water.roughness, 0.02..=1.0);
+                remesh |= float_row_ex(
+                    ui,
+                    "Ripple",
+                    &mut water.ripple,
+                    0.01,
+                    0.0..=2.0,
+                    Some(" m"),
+                );
+            });
+    }
+    dirty |= remesh;
+    (dirty, remesh)
 }
 
 /// Editor for a terrain's noise-layer stack (Data tab). Mutates `stack` in

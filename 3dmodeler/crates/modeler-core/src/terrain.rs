@@ -469,6 +469,11 @@ pub struct TerrainData {
     /// surface it was baked against has changed since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub erosion: Option<ErosionLayer>,
+    /// Still water table: a surface at a fixed height filling every basin
+    /// and carved channel below it. Purely visual — no height or collision
+    /// impact — so it stays out of `BaseKey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub water: Option<WaterLayer>,
     /// Memoized stack evaluation, so sculpt strokes don't re-run the noise
     /// layers every frame. Never serialized, never cloned, always equal.
     #[serde(skip)]
@@ -1181,6 +1186,128 @@ impl TerrainData {
         }
         Some((tex as u32, tex as u32, out))
     }
+
+    /// Bake the water surface tint into an sRGB RGBA8 image covering the
+    /// terrain footprint (same texel convention as [`Self::bake_color`]).
+    /// Shallow fades to deep with depth below the level; a noise-broken
+    /// foam band hugs the shoreline. Returns `None` when water is off.
+    pub fn bake_water_color(
+        &self,
+        seed: u32,
+        resolution: u32,
+        size: f32,
+        height: f32,
+        tex_res: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let water = self.water.filter(|w| w.enabled)?;
+        let grid = self.eval_grid(seed, resolution, size, height);
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let tex = tex_res.clamp(64, 4096) as usize;
+
+        let mix3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+            let t = t.clamp(0.0, 1.0);
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ]
+        };
+        let falloff = water.depth_falloff.max(0.05);
+        let mut out = vec![0u8; tex * tex * 4];
+        for ty in 0..tex {
+            let v = (ty as f32 + 0.5) / tex as f32;
+            for tx in 0..tex {
+                let u = (tx as f32 + 0.5) / tex as f32;
+                let depth = water.level - sample_grid_normalized(&grid, res as usize, u, v);
+                let mut rgb =
+                    mix3(water.shallow, water.deep, smoothstep((0.0, falloff), depth));
+                if water.foam_width > 1e-3 {
+                    // the band waves in and out with noise so the shoreline
+                    // doesn't read as a hard contour line
+                    let p = Vec2::new((u - 0.5) * size, (v - 0.5) * size);
+                    let ripple = vnoise_d(p / 3.0, seed.wrapping_add(0x0aa0)).0;
+                    let w = water.foam_width * (0.55 + 0.45 * ripple);
+                    let foam = 1.0 - smoothstep((0.0, w.max(0.02)), depth);
+                    rgb = mix3(rgb, [0.93, 0.96, 0.97], foam * 0.85);
+                }
+                let o = (ty * tex + tx) * 4;
+                out[o] = (rgb[0] * 255.0 + 0.5) as u8;
+                out[o + 1] = (rgb[1] * 255.0 + 0.5) as u8;
+                out[o + 2] = (rgb[2] * 255.0 + 0.5) as u8;
+                out[o + 3] = 255;
+            }
+        }
+        Some((tex as u32, tex as u32, out))
+    }
+}
+
+/// A still water table over the terrain: a flat (gently rippled) surface at
+/// `level` meters above the base plane, meshed only over ground that sits
+/// below it — so it fills lakes, basins and carved river beds. Rendered as
+/// its own translucent submesh; never collides and never moves heights.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaterLayer {
+    pub enabled: bool,
+    /// Surface height, meters above the terrain base plane (z = 0).
+    /// Negative reaches into channels carved below the base.
+    pub level: f32,
+    /// sRGB tint where the water is shallow.
+    pub shallow: [f32; 3],
+    /// sRGB tint at `depth_falloff` meters and deeper.
+    pub deep: [f32; 3],
+    /// Meters of depth over which shallow fades to deep.
+    pub depth_falloff: f32,
+    /// Width of the foam band along the shoreline, meters (0 = none).
+    pub foam_width: f32,
+    /// Surface opacity 0..1 (the renderer dithers it; TAA resolves).
+    pub opacity: f32,
+    /// Micro-roughness: low values give mirror-like reflections.
+    pub roughness: f32,
+    /// Static ripple amplitude in meters (0 = glass flat).
+    pub ripple: f32,
+}
+
+impl Default for WaterLayer {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: 0.4,
+            shallow: [0.22, 0.55, 0.60],
+            deep: [0.03, 0.15, 0.28],
+            depth_falloff: 3.0,
+            foam_width: 0.6,
+            opacity: 0.55,
+            roughness: 0.08,
+            ripple: 0.06,
+        }
+    }
+}
+
+impl WaterLayer {
+    /// Hash of every field, for render-cache stamping (same idea as
+    /// [`TerrainColor::stamp`]).
+    pub fn stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.enabled.hash(&mut h);
+        for c in [self.shallow, self.deep] {
+            for v in c {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        for v in [
+            self.level,
+            self.depth_falloff,
+            self.foam_width,
+            self.opacity,
+            self.roughness,
+            self.ripple,
+        ] {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
 }
 
 // --- prop scattering -----------------------------------------------------
@@ -1531,6 +1658,7 @@ impl Default for TerrainData {
             erosion: None,
             color: Some(TerrainColor::default()),
             paint: None,
+            water: None,
             cache: Default::default(),
             layers: vec![
                 TerrainLayer::new(LayerKind::DomainWarp { scale: 90.0, strength: 14.0, octaves: 3 }),
@@ -1573,7 +1701,7 @@ impl TerrainData {
             ("Hills", TerrainData::default()),
             (
                 "Alpine",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 120.0, strength: 18.0, octaves: 3 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Ridged { scale: 130.0, octaves: 6, gain: 0.52, lacunarity: 2.1, sharpness: 2.0 }, BlendMode::Add, 0.85),
@@ -1583,7 +1711,7 @@ impl TerrainData {
             ),
             (
                 "Dunes",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Billow { scale: 120.0, octaves: 3, gain: 0.5, lacunarity: 2.0 }, BlendMode::Add, 0.25),
                         layer(LayerKind::DomainWarp { scale: 60.0, strength: 6.0, octaves: 2 }, BlendMode::Add, 1.0),
@@ -1593,7 +1721,7 @@ impl TerrainData {
             ),
             (
                 "Archipelago",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Constant { value: 1.0 }, BlendMode::Subtract, 0.35),
                         layer(LayerKind::DomainWarp { scale: 100.0, strength: 20.0, octaves: 3 }, BlendMode::Add, 1.0),
@@ -1603,7 +1731,7 @@ impl TerrainData {
             ),
             (
                 "Canyon",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         // high base plateau, stepped strata, then the river
                         // digs deep through all of it
@@ -1616,7 +1744,7 @@ impl TerrainData {
             ),
             (
                 "Volcanic",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Ridged { scale: 80.0, octaves: 5, gain: 0.5, lacunarity: 2.2, sharpness: 2.4 }, BlendMode::Add, 0.6),
                         masked(
@@ -1628,7 +1756,7 @@ impl TerrainData {
             ),
             (
                 "Rolling",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 80.0, strength: 10.0, octaves: 2 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Fbm { scale: 60.0, octaves: 5, gain: 0.45, lacunarity: 2.0, erosion: 0.5, warp: 0.0 }, BlendMode::Add, 0.4),
@@ -1637,7 +1765,7 @@ impl TerrainData {
             ),
             (
                 "Craters",
-                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Fbm { scale: 70.0, octaves: 4, gain: 0.5, lacunarity: 2.0, erosion: 0.0, warp: 0.0 }, BlendMode::Add, 0.2),
                         layer(LayerKind::Crater { scale: 35.0, density: 0.6, depth: 0.7, rim: 0.3 }, BlendMode::Add, 0.6),
@@ -2032,6 +2160,20 @@ fn sample_kind(kind: &LayerKind, pw: Vec2, seed: u32) -> f32 {
 /// Build the terrain mesh: a smooth-shaded grid with analytic-difference
 /// normals and world-meter UVs (matching the box-projection convention).
 pub fn generate_mesh(data: &TerrainData, size: f32, resolution: u32, height: f32, seed: u32) -> MeshData {
+    generate_mesh_ex(data, size, resolution, height, seed, true)
+}
+
+/// [`generate_mesh`] with the water surface optional: collision meshing
+/// passes `include_water = false` so rays and physics reach the ground
+/// through the water.
+pub fn generate_mesh_ex(
+    data: &TerrainData,
+    size: f32,
+    resolution: u32,
+    height: f32,
+    seed: u32,
+    include_water: bool,
+) -> MeshData {
     let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize;
     let n = res + 1;
     let step = size / res as f32;
@@ -2076,7 +2218,90 @@ pub fn generate_mesh(data: &TerrainData, size: f32, resolution: u32, height: f32
             mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
         }
     }
+    if include_water {
+        if let Some(water) = data.water.filter(|w| w.enabled) {
+            append_water_surface(&mut mesh, &heights, &water, size, res, seed);
+        }
+    }
     mesh
+}
+
+/// Appends the water sheet as material-slot-1 triangles: one flat (gently
+/// rippled) cell per terrain cell whose lowest corner sits below the water
+/// level. Vertices are emitted only where used and share the terrain's
+/// 0..1 UV mapping so the baked water tint lines up texel-for-texel.
+fn append_water_surface(
+    mesh: &mut MeshData,
+    heights: &[f32],
+    water: &WaterLayer,
+    size: f32,
+    res: usize,
+    seed: u32,
+) {
+    let n = res + 1;
+    let wet = |ix: usize, iy: usize| heights[iy * n + ix] < water.level;
+    // a cell carries water when any corner is submerged: reaching one cell
+    // past the exact shoreline lets the sheet run into the bank instead of
+    // stopping short of it
+    let cell_wet = |ix: usize, iy: usize| {
+        wet(ix, iy) || wet(ix + 1, iy) || wet(ix, iy + 1) || wet(ix + 1, iy + 1)
+    };
+    if !(0..res).any(|iy| (0..res).any(|ix| cell_wet(ix, iy))) {
+        return; // level below every point: no sheet at all
+    }
+
+    let ripple_z = |ix: usize, iy: usize| {
+        if water.ripple <= 1.0e-4 {
+            return water.level;
+        }
+        let p = Vec2::new(ix as f32, iy as f32) * (size / res as f32);
+        // two octaves of value noise (each in [-1, 1]), wavelengths ~2.5 m
+        // and ~1 m: reads as gentle chop at any terrain size, no animation
+        let a = vnoise_d(p / 2.5, seed.wrapping_add(0x0aa1)).0;
+        let b = vnoise_d(p / 1.1, seed.wrapping_add(0x0aa2)).0;
+        water.level + (a + 0.5 * b) * (water.ripple / 1.5)
+    };
+
+    // emit only the vertices wet cells actually reference
+    let mut remap: Vec<u32> = vec![u32::MAX; n * n];
+    let emit = |mesh: &mut MeshData, remap: &mut Vec<u32>, ix: usize, iy: usize| -> u32 {
+        let slot = iy * n + ix;
+        if remap[slot] != u32::MAX {
+            return remap[slot];
+        }
+        let x = (ix as f32 / res as f32 - 0.5) * size;
+        let y = (iy as f32 / res as f32 - 0.5) * size;
+        let z = ripple_z(ix, iy);
+        // ripple slope for the normal (finite differences on the noise)
+        let step = size / res as f32;
+        let dzdx = (ripple_z((ix + 1).min(res), iy) - ripple_z(ix.saturating_sub(1), iy))
+            / (2.0 * step);
+        let dzdy = (ripple_z(ix, (iy + 1).min(res)) - ripple_z(ix, iy.saturating_sub(1)))
+            / (2.0 * step);
+        mesh.positions.push(Vec3::new(x, y, z));
+        mesh.normals.push(Vec3::new(-dzdx, -dzdy, 1.0).normalize());
+        mesh.uvs.push(Vec2::new(ix as f32 / res as f32, iy as f32 / res as f32));
+        let index = mesh.positions.len() as u32 - 1;
+        remap[slot] = index;
+        index
+    };
+
+    // the terrain triangles so far are all slot 0; the sheet is slot 1
+    let ground_tris = mesh.indices.len() / 3;
+    mesh.tri_materials = vec![0; ground_tris];
+    for iy in 0..res {
+        for ix in 0..res {
+            if !cell_wet(ix, iy) {
+                continue;
+            }
+            let a = emit(mesh, &mut remap, ix, iy);
+            let b = emit(mesh, &mut remap, ix + 1, iy);
+            let c = emit(mesh, &mut remap, ix + 1, iy + 1);
+            let d = emit(mesh, &mut remap, ix, iy + 1);
+            mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+            mesh.tri_materials.extend_from_slice(&[1, 1]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2147,7 +2372,7 @@ mod tests {
 
     #[test]
     fn empty_stack_is_flat() {
-        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(), layers: Vec::new() };
         for v in data.eval_grid(1, 16, 10.0, 5.0) {
             assert_eq!(v, 0.0);
         }
@@ -2161,7 +2386,7 @@ mod tests {
         top_up.blend = BlendMode::Add;
         top_up.amount = 1.0;
         top_up.mask.height = Some(Band { min: 0.75, max: 2.0, falloff: 0.01, invert: false });
-        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
+        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(),
             layers: vec![
                 TerrainLayer {
                     amount: 0.5,
@@ -2198,7 +2423,7 @@ mod tests {
 
     #[test]
     fn raise_brush_lifts_the_surface_inside_the_radius_only() {
-        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(), layers: Vec::new() };
         let mut sculpt = SculptLayer::new(32);
         sculpt.brush(
             BrushMode::Raise,
@@ -2221,7 +2446,7 @@ mod tests {
     #[test]
     fn flatten_brush_pulls_toward_the_target() {
         let mut data =
-            TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(), layers: Vec::new() };
         // constant 0.5 → flat 5 m surface at height 10
         data.layers.push(TerrainLayer {
             amount: 0.5,
@@ -2292,7 +2517,7 @@ mod tests {
     #[test]
     fn shape_stamp_lands_where_placed() {
         let mut data =
-            TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(), layers: Vec::new() };
         let mut layer = TerrainLayer::new(LayerKind::Shape {
             shape: ShapeKind::Mountain,
             x: 20.0,
@@ -2452,7 +2677,7 @@ mod tests {
 
     #[test]
     fn paint_brush_claims_channel_and_shows_in_the_bake() {
-        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, water: None, cache: Default::default(), layers: Vec::new() };
         data.color = Some(TerrainColor::default());
         let mut paint = PaintLayer::new(32);
         // paint snow (channel 4) into a patch until fully opaque
@@ -2573,5 +2798,72 @@ mod tests {
             let grid = data.eval_grid(5, 32, 60.0, 8.0);
             assert!(grid.iter().all(|v| v.is_finite()), "preset {name} produced NaN");
         }
+    }
+
+    /// A partially submerged terrain grows a slot-1 water sheet in the
+    /// render mesh — and never in the collision variant.
+    #[test]
+    fn water_sheet_is_render_only_slot_1() {
+        let mut data = TerrainData::default();
+        let dry = generate_mesh(&data, 50.0, 32, 8.0, 1);
+        // put the level mid-relief so some cells are wet and some dry
+        let grid = data.eval_grid(1, 32, 50.0, 8.0);
+        let (lo, hi) = grid.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
+        data.water = Some(WaterLayer { level: (lo + hi) * 0.5, ..Default::default() });
+
+        let wet = generate_mesh(&data, 50.0, 32, 8.0, 1);
+        assert!(wet.indices.len() > dry.indices.len(), "no sheet appended");
+        assert_eq!(wet.tri_materials.len(), wet.indices.len() / 3);
+        let water_tris = wet.tri_materials.iter().filter(|&&m| m == 1).count();
+        assert!(water_tris > 0, "sheet triangles must be slot 1");
+        assert!(
+            water_tris < wet.tri_materials.len(),
+            "a mid-relief level must leave dry ground"
+        );
+        // every sheet vertex is used and sits near the level (± ripple)
+        let ripple = data.water.unwrap().ripple + 1.0e-4;
+        let level = data.water.unwrap().level;
+        for p in &wet.positions[dry.positions.len()..] {
+            assert!((p.z - level).abs() <= ripple, "sheet vertex at z {}", p.z);
+        }
+
+        let collision = generate_mesh_ex(&data, 50.0, 32, 8.0, 1, false);
+        assert_eq!(collision.indices.len(), dry.indices.len());
+        assert!(collision.tri_materials.iter().all(|&m| m == 0) || collision.tri_materials.is_empty());
+    }
+
+    #[test]
+    fn water_below_everything_adds_nothing() {
+        let mut data = TerrainData::default();
+        data.water = Some(WaterLayer { level: -1000.0, ..Default::default() });
+        let mesh = generate_mesh(&data, 50.0, 16, 8.0, 1);
+        let dry = generate_mesh_ex(&data, 50.0, 16, 8.0, 1, false);
+        assert_eq!(mesh.indices.len(), dry.indices.len());
+    }
+
+    #[test]
+    fn water_serde_roundtrip() {
+        let mut data = TerrainData::default();
+        data.water = Some(WaterLayer { level: 1.25, opacity: 0.7, ..Default::default() });
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TerrainData = serde_json::from_str(&json).unwrap();
+        assert_eq!(data, back);
+        // absent field stays None for old files
+        let old: TerrainData = serde_json::from_str("{\"layers\":[]}").unwrap();
+        assert!(old.water.is_none());
+    }
+
+    #[test]
+    fn water_bake_dimensions_and_gate() {
+        let mut data = TerrainData::default();
+        assert!(data.bake_water_color(1, 32, 50.0, 8.0, 128).is_none());
+        data.water = Some(WaterLayer::default());
+        let (w, h, px) = data.bake_water_color(1, 32, 50.0, 8.0, 128).unwrap();
+        assert_eq!((w, h), (128, 128));
+        assert_eq!(px.len(), 128 * 128 * 4);
+        data.water.as_mut().unwrap().enabled = false;
+        assert!(data.bake_water_color(1, 32, 50.0, 8.0, 128).is_none());
     }
 }

@@ -543,6 +543,19 @@ fn gpu_material(
     m
 }
 
+/// The synthesized material for a terrain's water sheet (mesh slot 1). The
+/// baked tint texture carries the colors; this sets the surface response:
+/// glossy non-metal, dither-transparent through `alpha`.
+fn water_material(water: &modeler_core::terrain::WaterLayer) -> Material {
+    let mut m = Material::default();
+    m.base_color = water.deep; // fallback for looks that skip the bake
+    m.roughness = water.roughness.clamp(0.02, 1.0);
+    m.metallic = 0.0;
+    m.specular = 0.9;
+    m.alpha = water.opacity.clamp(0.05, 1.0);
+    m
+}
+
 /// Hash of everything [`gpu_material`] reads, so two objects that would produce
 /// the same engine material share one. `tex_hash` is the bridged texture
 /// identity (set key / bake stamp), 0 when untextured.
@@ -643,6 +656,16 @@ impl SceneRender {
                 scale: world.scale,
             };
 
+            // terrain water rides in the mesh as slot-1 triangles even though
+            // the object has no face_materials — its material is synthesized
+            // from the WaterLayer below
+            let water = object
+                .terrain
+                .as_ref()
+                .and_then(|data| data.water)
+                .filter(|w| w.enabled)
+                .filter(|_| matches!(object.primitive, Primitive::Terrain { .. }));
+
             let key = mesh_key(scene, object);
             live_meshes.insert(key);
             if !self.meshes.contains_key(&key) {
@@ -650,8 +673,11 @@ impl SceneRender {
                 if data.indices.is_empty() {
                     continue;
                 }
-                let (mesh, slots) =
-                    to_aether_mesh(&data, object.name.clone(), object.face_materials.len());
+                let slot_count = object
+                    .face_materials
+                    .len()
+                    .max(if water.is_some() { 1 } else { 0 });
+                let (mesh, slots) = to_aether_mesh(&data, object.name.clone(), slot_count);
                 let handle = self.scene.add_mesh(gpu, &mesh);
                 self.meshes.insert(key, CachedMesh { handle, slots });
             }
@@ -698,6 +724,35 @@ impl SceneRender {
             } else {
                 None
             };
+            // Water tint bake, same debounced path as the biome color.
+            let water_bake: Option<(crate::texture_bridge::TextureSet, u64)> = if flat_look {
+                None
+            } else if let (
+                Primitive::Terrain { size, resolution, height, seed },
+                Some(data),
+                Some(layer),
+            ) = (object.primitive, object.terrain.as_ref(), water)
+            {
+                let stamp = {
+                    let mut h = DefaultHasher::new();
+                    object.mesh_revision.hash(&mut h);
+                    hash_primitive(&mut h, &object.primitive);
+                    layer.stamp().hash(&mut h);
+                    h.finish()
+                };
+                let set = bridge.resolve_baked_albedo(
+                    renderer,
+                    &format!("terrain-water:{}", object.id.0),
+                    stamp,
+                    || {
+                        data.bake_water_color(seed, resolution, size, height, 512)
+                            .expect("water is Some and enabled")
+                    },
+                );
+                Some((set, stamp))
+            } else {
+                None
+            };
 
             let mut upsert = |this: &mut Self,
                               slot: u32,
@@ -709,6 +764,9 @@ impl SceneRender {
                     (None, 0)
                 } else if slot == 0 && terrain_bake.is_some() {
                     let (set, stamp) = terrain_bake.as_ref().unwrap();
+                    (Some(*set), *stamp)
+                } else if slot == 1 && water_bake.is_some() {
+                    let (set, stamp) = water_bake.as_ref().unwrap();
                     (Some(*set), *stamp)
                 } else {
                     match crate::texture_bridge::TextureBridge::set_key(&material.textures)
@@ -776,6 +834,7 @@ impl SceneRender {
                 for (slot, range) in &slots {
                     let material = match slot {
                         0 => own.clone(),
+                        1 if water.is_some() => water_material(&water.unwrap()),
                         k => object
                             .face_materials
                             .get(*k as usize - 1)
