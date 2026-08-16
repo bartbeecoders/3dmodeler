@@ -69,6 +69,23 @@ impl Default for FrameOutput {
     }
 }
 
+/// Everything a frame needs to put pixels on the screen.
+///
+/// Under three-d the frame *was* the target — `frame_input.screen()` handed
+/// back something with `clear` and `render` on it. wgpu splits that into a
+/// device, a queue, an encoder to record into and a view to record against, and
+/// they have to be acquired and submitted around the frame rather than inside
+/// it. This is those four, so the frame body still reads as one place where the
+/// drawing happens.
+pub struct FramePaint<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    /// Commands recorded here are submitted after the frame returns.
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    /// The swapchain image this frame is drawn into.
+    pub view: &'a wgpu::TextureView,
+}
+
 /// Turns winit window events into [`FrameInput`].
 ///
 /// Feed it every `WindowEvent` with [`Self::handle_winit_window_event`], then

@@ -100,7 +100,6 @@ impl ControlServer {
         physics: &mut PhysicsMirror,
         library_doc: &mut Library,
         shade_mode: &mut crate::scene_render::ShadeMode,
-        lighting_mode: &mut crate::scene_render::LightingMode,
         camera: &mut crate::camera::BlenderCamera,
     ) {
         while let Ok((command, reply)) = self.requests.try_recv() {
@@ -131,7 +130,7 @@ impl ControlServer {
             }
             // viewport view state lives in the render loop, not the scene
             if command["cmd"] == "set_view" {
-                let _ = reply.send(commands::set_view(&command, shade_mode, lighting_mode));
+                let _ = reply.send(commands::set_view(&command, shade_mode));
                 continue;
             }
             let response = commands::execute(&command, scene, selection, physics, library_doc);

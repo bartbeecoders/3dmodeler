@@ -17,7 +17,7 @@ use crate::io;
 use crate::overlay::MeasureTool;
 use crate::ref_image::{self, CalibrateTool, MarkerTool};
 use crate::ref_setup::RefSetupDialog;
-use crate::scene_render::{LightingMode, ShadeMode};
+use crate::scene_render::ShadeMode;
 use crate::selection::Selection;
 use crate::settings::{Settings, SettingsWindow};
 use crate::theme::{self, Theme};
@@ -241,7 +241,6 @@ impl UiState {
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
-        lighting_mode: &mut LightingMode,
         xray: &mut bool,
         modal_status: &Option<String>,
         fps: f32,
@@ -331,12 +330,12 @@ impl UiState {
         }
         let menu_offset = self.menu_bar(
             ctx, scene, selection, camera, modal, physics, undo, measure, settings,
-            wall_tool, roof_tool, snap_to_grid, shade_mode, lighting_mode, xray,
+            wall_tool, roof_tool, snap_to_grid, shade_mode, xray,
         );
         let top_offset = menu_offset
             + self.toolbar(
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
-                snap_to_vertex, shade_mode, lighting_mode, xray, edit,
+                snap_to_vertex, shade_mode, xray, edit,
             );
         let bottom_offset = self.status_bar(
             ctx, scene, physics, measure, calibrate, marker_tool, snap_to_grid, settings,
@@ -406,7 +405,6 @@ impl UiState {
         roof_tool: &mut crate::roof_tool::RoofTool,
         snap_to_grid: &mut bool,
         shade_mode: &mut ShadeMode,
-        lighting_mode: &mut LightingMode,
         xray: &mut bool,
     ) -> f32 {
         let mut bar_height = 24.0;
@@ -475,7 +473,7 @@ impl UiState {
                                 ),
                                 Menu::View => view_menu(
                                     ui, camera, scene, selection, settings, snap_to_grid,
-                                    shade_mode, lighting_mode, xray,
+                                    shade_mode, xray,
                                     &mut self.chat_panel.open,
                                 ),
                                 Menu::Help => {
@@ -521,7 +519,6 @@ impl UiState {
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
-        lighting_mode: &mut LightingMode,
         xray: &mut bool,
         edit: Option<&mut EditMode>,
     ) -> f32 {
@@ -641,7 +638,17 @@ impl UiState {
                 for (mode, label, tip) in [
                     (ShadeMode::Wireframe, "Wire", "Wireframe: only object edges"),
                     (ShadeMode::Solid, "Solid", "Solid: neutral studio shading, materials ignored"),
-                    (ShadeMode::Shaded, "Shaded", "Shaded: full materials and lights"),
+                    (
+                        ShadeMode::MaterialPreview,
+                        "Material",
+                        "Material preview: full materials under studio lighting",
+                    ),
+                    (
+                        ShadeMode::Rendered,
+                        "Rendered",
+                        "Rendered: the scene's light objects illuminate the viewport, \
+                         with shadows (Add ▸ Light)",
+                    ),
                 ] {
                     if ui
                         .selectable_label(*shade_mode == mode, label)
@@ -655,32 +662,8 @@ impl UiState {
                     ui,
                     xray,
                     "X-ray",
-                    "X-ray: see through objects (solid and shaded modes)",
+                    "X-ray: see through objects (every mode but wireframe)",
                 );
-                // lighting mode (shaded only): studio rig or scene lights
-                if *shade_mode == ShadeMode::Shaded {
-                    for (mode, label, tip) in [
-                        (
-                            LightingMode::Studio,
-                            "Studio",
-                            "Studio lighting: built-in key + fill rig, scene lights ignored",
-                        ),
-                        (
-                            LightingMode::Scene,
-                            "Lights",
-                            "Scene lights: the scene's light objects illuminate the \
-                             viewport, with shadows (Add ▸ Light)",
-                        ),
-                    ] {
-                        if ui
-                            .selectable_label(*lighting_mode == mode, label)
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
-                            *lighting_mode = mode;
-                        }
-                    }
-                }
                 ui.separator();
 
                 // simulation controls
@@ -2647,7 +2630,6 @@ fn view_menu(
     settings: &mut Settings,
     snap_to_grid: &mut bool,
     shade_mode: &mut ShadeMode,
-    lighting_mode: &mut LightingMode,
     xray: &mut bool,
     chat_open: &mut bool,
 ) -> bool {
@@ -2666,7 +2648,8 @@ fn view_menu(
         for (mode, label) in [
             (ShadeMode::Wireframe, "Wireframe"),
             (ShadeMode::Solid, "Solid"),
-            (ShadeMode::Shaded, "Shaded"),
+            (ShadeMode::MaterialPreview, "Material"),
+            (ShadeMode::Rendered, "Rendered"),
         ] {
             if ui.selectable_label(*shade_mode == mode, label).clicked() {
                 *shade_mode = mode;
@@ -2690,22 +2673,6 @@ fn view_menu(
         .weak()
         .size(11.0),
     );
-    ui.separator();
-    ui.label(egui::RichText::new("Lighting (shaded)").weak().size(11.0));
-    ui.horizontal(|ui| {
-        for (mode, label) in [
-            (LightingMode::Studio, "Studio"),
-            (LightingMode::Scene, "Scene lights"),
-        ] {
-            if ui
-                .selectable_label(*lighting_mode == mode, label)
-                .clicked()
-            {
-                *lighting_mode = mode;
-                *shade_mode = ShadeMode::Shaded;
-            }
-        }
-    });
     ui.separator();
     ui.label(egui::RichText::new("Color theme").weak().size(11.0));
     ui.horizontal(|ui| {
@@ -5102,7 +5069,7 @@ fn primitive_params(
             ui.label(
                 egui::RichText::new(
                     "Sun and Spot shine along the object's -Z axis (rotate to \
-                     aim). Lights show in Shaded mode with Scene lighting.",
+                     aim). Lights show in the Rendered viewport mode.",
                 )
                 .weak()
                 .size(11.0),

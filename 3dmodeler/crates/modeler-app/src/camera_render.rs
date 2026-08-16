@@ -1,11 +1,30 @@
 //! Off-screen render from a scene camera object (Blender F12 / live view).
 //!
-//! Builds a three-d perspective camera from the object's world transform
-//! (look along local −Z, up = local +Y) and draws solid scene meshes into
-//! a reusable texture — no grid, outlines, reference images, or gizmo markers.
+//! Builds a perspective camera from the object's world transform (look along
+//! local −Z, up = local +Y) and draws solid scene meshes into a reusable
+//! texture — no grid, outlines, reference images, or gizmo markers.
+//!
+//! # Why this owns a second renderer
+//!
+//! The viewport's renderer is sized to the window, and a camera render is not:
+//! the live preview is 960x540 and an agent asking through MCP picks whatever
+//! it likes. Resizing the viewport's targets to take a picture and back again
+//! would reallocate every full-screen buffer twice per frame, which is the most
+//! expensive thing the frame can do.
+//!
+//! So each target owns a renderer at its own size. They draw the *same*
+//! [`RenderScene`] — the meshes live on the GPU and are shared — with a
+//! different camera and the editor's gizmos hidden.
+//!
+//! Temporal jitter is off here. It exists to give TAA sub-pixel samples to
+//! accumulate over many frames, and a single still frame has no history to
+//! accumulate into: left on, it renders the picture through a half-pixel offset
+//! that nothing resolves.
+
+use aether_render::{Gpu, Renderer, RendererConfig};
 
 use crate::gfx::*;
-use crate::scene_render::{SceneLights, SceneRender};
+use crate::scene_render::SceneRender;
 use modeler_core::glam::Vec3;
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
 
@@ -37,8 +56,8 @@ pub fn resolve_camera(
         .map(|o| o.id)
 }
 
-/// Build a three-d camera from a scene camera object's world transform.
-pub fn three_d_camera(
+/// Build a camera from a scene camera object's world transform.
+pub fn camera_from_object(
     world: &Transform,
     fov_deg: f32,
     clip_start: f32,
@@ -66,106 +85,98 @@ pub fn three_d_camera(
     )
 }
 
-/// Reusable off-screen color + depth targets for camera rendering.
-/// Avoids allocating GPU textures every frame during live preview.
+/// A renderer sized for one camera image, and the pixels it read back.
 pub struct CameraRenderTarget {
+    renderer: Renderer,
     width: u32,
     height: u32,
-    color: Texture2D,
-    depth: DepthTexture2D,
-    /// Flipped top-left RGBA scratch (owned; returned as a slice).
+    /// Top-left RGBA, owned so it can be handed out as a slice.
     rgba: Vec<u8>,
 }
 
 impl CameraRenderTarget {
-    pub fn new(context: &Context, width: u32, height: u32) -> Self {
-        let width = width.max(1);
-        let height = height.max(1);
+    pub fn new(gpu: &Gpu, width: u32, height: u32) -> Self {
+        let (width, height) = (width.max(1), height.max(1));
         Self {
-            color: Texture2D::new_empty::<[u8; 4]>(
-                context,
-                width,
-                height,
-                Interpolation::Nearest,
-                Interpolation::Nearest,
-                None,
-                Wrapping::ClampToEdge,
-                Wrapping::ClampToEdge,
-            ),
-            depth: DepthTexture2D::new::<f32>(
-                context,
-                width,
-                height,
-                Wrapping::ClampToEdge,
-                Wrapping::ClampToEdge,
-            ),
-            rgba: vec![0u8; (width * height * 4) as usize],
+            renderer: {
+                let mut renderer = Renderer::new(
+                    gpu.clone(),
+                    RendererConfig { width, height, temporal_jitter: false },
+                );
+                // The same exposure calibration as the viewport, so what F12
+                // renders is what the viewport was showing.
+                crate::gfx::viewport::calibrate_exposure(&mut renderer);
+                renderer
+            },
             width,
             height,
+            rgba: Vec::new(),
         }
     }
 
-    pub fn ensure_size(&mut self, context: &Context, width: u32, height: u32) {
-        let width = width.max(1);
-        let height = height.max(1);
+    /// Matches this renderer's exposure to the viewport's lighting mode, so
+    /// what a camera renders is what the viewport was showing.
+    pub fn sync_exposure(&mut self, scene_lighting: bool) {
+        crate::gfx::viewport::sync_exposure(&mut self.renderer, scene_lighting);
+    }
+
+    /// Matches the target to a requested size, reallocating only on a change.
+    pub fn ensure_size(&mut self, width: u32, height: u32) {
+        let (width, height) = (width.max(1), height.max(1));
         if self.width == width && self.height == height {
             return;
         }
-        *self = Self::new(context, width, height);
+        self.renderer.resize(width, height);
+        self.width = width;
+        self.height = height;
     }
 
-    /// Render from `camera_id`. Returns `(width, height, rgba top-left)`.
+    /// Renders `camera_id`'s view of `render`. Returns `(width, height, rgba)`.
+    ///
+    /// `render` is taken mutably because the gizmos are hidden for the duration
+    /// and put back afterwards — the caller's viewport is drawing the same
+    /// scene and still wants them.
     pub fn render(
         &mut self,
         scene: &Scene,
         camera_id: ObjectId,
-        scene_render: &SceneRender,
-        lights: &SceneLights,
-        bg: [f32; 3],
+        render: &mut SceneRender,
     ) -> Result<(u32, u32, &[u8]), String> {
         let object = scene
             .object(camera_id)
             .ok_or_else(|| "camera object not found".to_string())?;
         let (fov_deg, clip_start, clip_end) = match object.primitive {
-            Primitive::Camera {
-                fov_deg,
-                clip_start,
-                clip_end,
-            } => (fov_deg, clip_start, clip_end),
+            Primitive::Camera { fov_deg, clip_start, clip_end } => {
+                (fov_deg, clip_start, clip_end)
+            }
             _ => return Err("object is not a camera".into()),
         };
         let world = scene.world_transform(camera_id);
-        let cam = three_d_camera(
-            &world,
-            fov_deg,
-            clip_start,
-            clip_end,
-            self.width,
-            self.height,
-        );
+        let camera =
+            camera_from_object(&world, fov_deg, clip_start, clip_end, self.width, self.height);
 
-        let models = scene_render.camera_render_models();
-        let target =
-            RenderTarget::new(self.color.as_color_target(None), self.depth.as_depth_target());
-        target
-            .clear(ClearState::color_and_depth(bg[0], bg[1], bg[2], 1.0, 1.0))
-            .render(&cam, &models, &lights.active());
+        let viewport_camera = render.scene.camera;
+        render.scene.camera = crate::gfx::viewport::aether_camera(&camera);
+        render.set_gizmos_visible(false);
 
-        // three-d's read() already flips Y (OpenGL bottom-left → top-left).
-        // Do not flip again or the live view appears upside-down.
-        let pixels: Vec<[u8; 4]> = self.color.as_color_target(None).read();
-        let needed = pixels.len() * 4;
-        if self.rgba.len() != needed {
-            self.rgba.resize(needed, 0);
+        // A fixed step rather than the frame's: this is one still image, and
+        // the only thing the renderer does with elapsed time is animate.
+        self.renderer.render(&render.scene, 1.0 / 60.0);
+
+        render.set_gizmos_visible(true);
+        render.scene.camera = viewport_camera;
+
+        self.rgba = self.renderer.read_output();
+        let expected = (self.width as usize) * (self.height as usize) * 4;
+        if self.rgba.len() < expected {
+            return Err(format!(
+                "the camera render read back {} bytes for a {}x{} image",
+                self.rgba.len(),
+                self.width,
+                self.height
+            ));
         }
-        for (i, p) in pixels.iter().enumerate() {
-            let o = i * 4;
-            self.rgba[o] = p[0];
-            self.rgba[o + 1] = p[1];
-            self.rgba[o + 2] = p[2];
-            self.rgba[o + 3] = 255;
-        }
-        Ok((self.width, self.height, &self.rgba))
+        Ok((self.width, self.height, &self.rgba[..expected]))
     }
 }
 

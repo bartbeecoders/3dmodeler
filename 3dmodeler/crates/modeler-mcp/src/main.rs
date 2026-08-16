@@ -83,18 +83,17 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "set_view",
-            "description": "Switch the viewport shading and lighting before a screenshot. Shading: wireframe (edges only), solid (neutral gray studio), shaded (full materials — the default). Lighting applies to shaded: studio (built-in rig) or scene (the scene's light objects, with shadows).",
+            "description": "Switch the viewport shading mode before a screenshot. wireframe: edges only. solid: neutral gray studio, materials ignored. material: full materials under studio lighting (the default). rendered: the scene's own light objects with shadows — the final image.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "shading": {"type": "string", "enum": ["wireframe", "solid", "shaded"]},
-                    "lighting": {"type": "string", "enum": ["studio", "scene"]}
+                    "shading": {"type": "string", "enum": ["wireframe", "solid", "material", "rendered"]}
                 }
             }
         },
         {
             "name": "add_object",
-            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (viewport Shaded mode with Scene lighting): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled. 'camera' adds a render camera (looks along local -Z; F12 in the app renders from it); fov_deg/clip_start/clip_end configure the lens.",
+            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (visible in the Rendered viewport mode): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled. 'camera' adds a render camera (looks along local -Z; F12 in the app renders from it); fov_deg/clip_start/clip_end configure the lens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -12,22 +12,44 @@
 //! | [`math`] | vectors, angles, colours, viewport — on glam |
 //! | [`camera`] | the view and projection matrices a draw call needs |
 //! | [`event`] | input events, shaped as the tools already match on them |
+//! | [`frame`] | what one frame is handed, and the winit translation behind it |
+//! | [`window`] | the OS window's wgpu surface (native only) |
+//! | [`egui_paint`] | egui's triangles, on wgpu |
+//! | [`gui`] | the egui frame: app events in, painted interface out |
 //!
 //! Re-exported flat, because the call sites say `use crate::gfx::*` where they
 //! used to say `use three_d::*` and the point is that the rest of the file did
 //! not have to change.
 
+// This layer is written to replace `three_d` whole, but its consumers arrive
+// one commit at a time: the renderer has not been ported yet, so the camera's
+// projection variants, half the maths vocabulary and the painter's diagnostics
+// are all reachable only from the tests. Warning about each of them says
+// nothing except "the port is not finished", which is already written down at
+// the top of this file. Comes off with the renderer.
+#![allow(dead_code, unused_imports)]
+
 pub mod camera;
 pub mod egui_paint;
 pub mod event;
 pub mod frame;
+pub mod gui;
 pub mod math;
+pub mod texture;
+pub mod viewport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod window;
 
 pub use egui_paint::EguiPainter;
+pub use gui::Gui;
+pub use texture::{CpuTexture, TextureData};
+pub use viewport::Viewport3d;
+#[cfg(not(target_arch = "wasm32"))]
+pub use window::GfxWindow;
 
 pub use camera::{Camera, Projection};
 pub use event::{Event, Key, Modifiers, MouseButton};
-pub use frame::{FrameInput, FrameOutput};
+pub use frame::{FrameInput, FrameOutput, FramePaint};
 #[cfg(not(target_arch = "wasm32"))]
 pub use frame::FrameInputGenerator;
 pub use math::{

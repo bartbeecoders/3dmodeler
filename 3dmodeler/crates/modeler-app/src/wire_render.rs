@@ -1,10 +1,24 @@
 //! GPU wireframe for the Wireframe shading mode: all sharp edges of all
-//! visible objects in at most three GL_LINES draw calls (one per selection
-//! tier), replacing the per-frame CPU projection through the egui painter.
+//! visible objects in at most five line-list draws (one per selection tier),
+//! replacing the per-frame CPU projection through the egui painter.
 //!
 //! The world-space vertex buffer is rebuilt only when a content signature
 //! (mesh identities, world transforms, selection tiers) changes — orbiting
 //! the camera costs one uniform upload, not an O(edges) re-projection.
+//!
+//! # Not yet drawing
+//!
+//! The line pass has no wgpu equivalent yet: under three-d this was a
+//! hand-written GL program ending in `draw_arrays(LINES, ..)`, and Aether has
+//! no line pipeline to hand it to. Everything up to the vertex data is live and
+//! unchanged — the signature, the tiering and the segment assembly — so what is
+//! missing is one pipeline and the draw loop in [`WireRender::render`], not the
+//! wireframe itself. The shader sources below are kept as the specification of
+//! what that pipeline has to do.
+
+// Everything the pass that draws would read is unused until it exists —
+// see the "not yet drawing" note above. Comes off with that pass.
+#![allow(dead_code)]
 
 use crate::gfx::*;
 use crate::scene_render::{hash_primitive, WireframeCache};
@@ -13,6 +27,8 @@ use modeler_core::Scene;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+// Kept as the specification for the pipeline that will replace them.
+#[allow(dead_code)]
 const VERTEX_SHADER: &str = "
 uniform mat4 viewProjection;
 in vec3 position;
@@ -21,6 +37,7 @@ void main() {
 }
 ";
 
+#[allow(dead_code)]
 const FRAGMENT_SHADER: &str = "
 uniform vec4 color;
 layout (location = 0) out vec4 outColor;
@@ -40,10 +57,10 @@ const TIER_COLORS: [[f32; 4]; 5] = [
 ];
 
 pub struct WireRender {
-    context: Context,
-    program: Program,
     cache: WireframeCache,
-    positions: Option<VertexBuffer<Vec3>>,
+    /// Line endpoints in world space, all tiers back to back. Uploaded whole
+    /// and drawn as five ranges, because the tier only changes the colour.
+    positions: Vec<Vec3>,
     /// (first vertex, vertex count) per tier within `positions`.
     ranges: [(u32, u32); 5],
     signature: Option<u64>,
@@ -92,13 +109,10 @@ fn wire_signature(scene: &Scene, selection: &Selection) -> u64 {
 }
 
 impl WireRender {
-    pub fn new(context: &Context) -> Self {
+    pub fn new() -> Self {
         Self {
-            context: context.clone(),
-            program: Program::from_source(context, VERTEX_SHADER, FRAGMENT_SHADER)
-                .expect("wireframe shaders compile"),
             cache: WireframeCache::new(),
-            positions: None,
+            positions: Vec::new(),
             ranges: [(0, 0); 5],
             signature: None,
         }
@@ -124,40 +138,23 @@ impl WireRender {
             self.ranges[i] = (all.len() as u32, tier.len() as u32);
             all.extend_from_slice(tier);
         }
-        self.positions =
-            (!all.is_empty()).then(|| VertexBuffer::new_with_data(&self.context, &all));
+        self.positions = all;
+    }
+
+    /// The colour a tier's lines are drawn in.
+    pub fn tier_color(tier: usize) -> [f32; 4] {
+        TIER_COLORS[tier.min(4)]
+    }
+
+    /// Line endpoints and their per-tier ranges, for the pass that draws them.
+    pub fn lines(&self) -> (&[Vec3], &[(u32, u32); 5]) {
+        (&self.positions, &self.ranges)
     }
 
     /// Draw the lines over the current render target (no depth test, like
     /// the egui overlay this replaces).
-    pub fn render(&self, viewport: Viewport, camera: &Camera) {
-        let Some(positions) = &self.positions else {
-            return;
-        };
-        self.program
-            .use_uniform("viewProjection", camera.projection() * camera.view());
-        let render_states = RenderStates {
-            depth_test: DepthTest::Always,
-            write_mask: WriteMask::COLOR,
-            blend: Blend::Disabled,
-            cull: Cull::None,
-        };
-        for (i, &(first, count)) in self.ranges.iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            self.program.use_uniform("color", vec4(
-                TIER_COLORS[i][0],
-                TIER_COLORS[i][1],
-                TIER_COLORS[i][2],
-                TIER_COLORS[i][3],
-            ));
-            self.program.use_vertex_attribute("position", positions);
-            self.program.draw_with(render_states, viewport, || unsafe {
-                use crate::gfx::context::HasContext as _;
-                self.context
-                    .draw_arrays(three_d::context::LINES, first as i32, count as i32);
-            });
-        }
-    }
+    ///
+    /// There is nothing to draw into yet — see the module note. The data is
+    /// assembled and waiting in [`Self::lines`].
+    pub fn render(&self, _viewport: Viewport, _camera: &Camera) {}
 }

@@ -15,7 +15,7 @@ pub use panel::ChatPanel;
 
 use crate::net::{self, HttpTask};
 use crate::physics::PhysicsMirror;
-use crate::scene_render::{LightingMode, ShadeMode};
+use crate::scene_render::ShadeMode;
 use crate::selection::Selection;
 use crate::settings::Settings;
 use modeler_ai::{
@@ -31,7 +31,6 @@ pub struct ToolContext<'a> {
     pub physics: &'a mut PhysicsMirror,
     pub library: &'a mut Library,
     pub shade_mode: &'a mut ShadeMode,
-    pub lighting_mode: &'a mut LightingMode,
 }
 
 /// One line of the chat log. The provider conversation (`messages`) is the
