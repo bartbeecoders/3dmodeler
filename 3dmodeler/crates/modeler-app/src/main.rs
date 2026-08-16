@@ -18,6 +18,7 @@ mod control;
 mod camera;
 mod camera_render;
 mod context_menu;
+mod dock;
 #[cfg(not(target_arch = "wasm32"))]
 mod render_preview;
 mod cutout_handles;
@@ -50,6 +51,8 @@ mod settings;
 mod theme;
 mod ui;
 mod undo;
+mod terrain_sculpt;
+mod texture_bridge;
 mod wall_tool;
 mod wire_render;
 
@@ -145,6 +148,8 @@ pub fn main() {
     let mut measure = overlay::MeasureTool::new();
     let mut wall_tool = wall_tool::WallTool::new();
     let mut roof_tool = roof_tool::RoofTool::new();
+    let mut sculpt_tool = terrain_sculpt::SculptTool::new();
+    let mut texture_bridge = texture_bridge::TextureBridge::new();
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
@@ -183,6 +188,8 @@ pub fn main() {
     let mut lights = scene_render::SceneLights::new();
 
     let mut egui_kb_last_frame = false;
+    // last OS window title we asked for (avoid a set_title call per frame)
+    let mut last_title = "3D Modeler";
 
     // The interface and the drawing surface are passed in rather than captured:
     // both are created after the window exists, which on winit 0.30 is inside
@@ -200,7 +207,8 @@ pub fn main() {
         // Dialogs keep Tab too — there it walks the dialog's fields.
         let dialog_open = ui_state.any_dialog_open()
             || calibrate.measured().is_some()
-            || marker_tool.active();
+            || marker_tool.active()
+            || sculpt_tool.active();
         let mut tab_pressed = false;
         if !egui_kb_last_frame && !dialog_open {
             for event in frame_input.events.iter_mut() {
@@ -217,7 +225,8 @@ pub fn main() {
             .or_else(|| modal.status_line())
             .or_else(|| image_move.status_line())
             .or_else(|| wall_tool.status_line(settings.unit))
-            .or_else(|| roof_tool.status_line(settings.unit));
+            .or_else(|| roof_tool.status_line(settings.unit))
+            .or_else(|| sculpt_tool.status_line(settings.unit));
         let modal_guides = modal.guides();
         let edit_overlay = edit_mode.overlay(&scene);
         // edit-mode element selection, for "set pivot/anchor to selection"
@@ -260,6 +269,7 @@ pub fn main() {
                     edit_mode.active().then_some(&mut edit_mode),
                     &mut wall_tool,
                     &mut roof_tool,
+                    &mut sculpt_tool,
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
@@ -363,6 +373,7 @@ pub fn main() {
                     ui_state.status_message = Some(message);
                 }
                 delete_tool.ui(gui_context, &mut scene, &mut sel);
+                sculpt_tool.panel(gui_context, &mut scene, layout.top_offset);
                 axis_widget::axis_widget(
                     gui_context,
                     &mut camera,
@@ -708,6 +719,28 @@ pub fn main() {
             );
         }
 
+        // terrain sculpt brush: owns LMB while active (dabs must never
+        // fall through to click-selection)
+        if !physics.is_stopped() && sculpt_tool.active() {
+            sculpt_tool.abort(&mut scene); // simulation took over mid-stroke
+        }
+        if sculpt_tool.active()
+            && !edit_mode.active()
+            && !modal.active()
+            && !wall_tool.active()
+            && !roof_tool.active()
+        {
+            sculpt_tool.handle_events(
+                &mut frame_input.events,
+                &camera,
+                frame_input.viewport,
+                &mut scene,
+                egui_owns_keyboard,
+                pointer_over_ui,
+                frame_input.elapsed_time as f32 / 1000.0,
+            );
+        }
+
         // right-click: context menu on the object (object mode) or the
         // vertex/edge/face (edit mode) under the cursor — set pivot/anchor
         // and common actions. On empty canvas (object mode) it opens the
@@ -717,6 +750,7 @@ pub fn main() {
             && !edit_mode.grabbing()
             && !wall_tool.active()
             && !roof_tool.active()
+            && !sculpt_tool.active()
         {
             for event in frame_input.events.iter_mut() {
                 if let Event::MousePress {
@@ -830,6 +864,7 @@ pub fn main() {
             && !modal.active()
             && !wall_tool.active()
             && !roof_tool.active()
+            && !sculpt_tool.active()
         {
             image_move.handle_events(
                 &mut frame_input.events,
@@ -849,6 +884,7 @@ pub fn main() {
             && !image_move.active()
             && !wall_tool.active()
             && !roof_tool.active()
+            && !sculpt_tool.active()
         {
             // modal transform operators get first claim on input after the UI
             modal.handle_events(
@@ -872,6 +908,7 @@ pub fn main() {
             && !edit_mode.active()
             && !wall_tool.active()
             && !roof_tool.active()
+            && !sculpt_tool.active()
         {
             delete_tool.handle_events(
                 &mut frame_input.events,
@@ -910,6 +947,7 @@ pub fn main() {
             && !edit_mode.active()
             && !wall_tool.active()
             && !roof_tool.active()
+            && !sculpt_tool.active()
         {
             cutout_handles.handle_events(
                 &mut frame_input.events,
@@ -1013,6 +1051,7 @@ pub fn main() {
                 || edit_mode.grabbing()
                 || wall_tool.drawing()
                 || roof_tool.drawing()
+                || sculpt_tool.stroking()
                 || cutout_handles.dragging()
                 || force_handles.dragging()
                 || rope_handles.dragging()
@@ -1193,7 +1232,16 @@ pub fn main() {
         }
 
         let gpu = viewport.renderer().gpu.clone();
-        scene_render.sync(&gpu, &scene, &sel, &overlaps, shade_mode, xray);
+        scene_render.sync(
+            &gpu,
+            viewport.renderer_mut(),
+            &mut texture_bridge,
+            &scene,
+            &sel,
+            &overlaps,
+            shade_mode,
+            xray,
+        );
         lights.sync(&mut scene_render.scene, &scene, shade_mode);
         gfx::viewport::sync_exposure(viewport.renderer_mut(), lights.scene_active());
 
@@ -1311,6 +1359,9 @@ pub fn main() {
                 }
             }
 
+            // sculpt brush ring, conforming to the terrain under the cursor
+            sculpt_tool.overlay(&scene, &mut overlay.draws);
+
             // Reference images last: they blend over the grid and the meshes.
             for quad in ref_render.quads() {
                 overlay.draws.image(
@@ -1427,7 +1478,20 @@ pub fn main() {
             }
         }
 
-        FrameOutput::default()
+        // Simulation mode belongs in the OS window title too — the taskbar
+        // and window list should say the scene is live, not just the status
+        // bar. State goes first so it survives title truncation.
+        let wanted_title = match physics.sim_state() {
+            physics::SimState::Playing => "▶ Simulating — 3D Modeler",
+            physics::SimState::Paused => "⏸ Simulation paused — 3D Modeler",
+            physics::SimState::Stopped => "3D Modeler",
+        };
+        let title = (wanted_title != last_title).then(|| {
+            last_title = wanted_title;
+            wanted_title.to_string()
+        });
+
+        FrameOutput { title, ..Default::default() }
     };
 
     #[cfg(target_arch = "wasm32")]
@@ -1505,6 +1569,9 @@ where
         };
         running.gfx.queue().submit([encoder.finish()]);
 
+        if let Some(title) = &frame_output.title {
+            running.window.set_title(title);
+        }
         if frame_output.exit {
             event_loop.exit();
             return;

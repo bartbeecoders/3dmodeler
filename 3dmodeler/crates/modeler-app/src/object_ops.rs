@@ -903,6 +903,112 @@ const FLOOR_DEFAULT_SIZE: f32 = 4.0;
 /// (centerline polygon); otherwise it is their bounding rectangle; with no
 /// walls at all it falls back to a `FLOOR_DEFAULT_SIZE` square at the
 /// origin. Selects the new floor and returns a status-bar message.
+
+// --- terrain prop scattering --------------------------------------------
+
+/// What a scatter run places: a built-in nature prop, or copies of a
+/// library asset.
+pub enum ScatterSource<'a> {
+    Kind(modeler_core::PropKind),
+    Asset(&'a modeler_core::LibraryAsset),
+}
+
+/// Base prop size in meters (scaled per placement via the TRANSFORM, so
+/// every instance of a variant shares one GPU mesh upload).
+fn prop_base_size(kind: modeler_core::PropKind) -> f32 {
+    use modeler_core::PropKind as K;
+    match kind {
+        K::Rock => 1.4,
+        K::Conifer => 5.0,
+        K::Broadleaf => 5.5,
+        K::Bush => 1.2,
+    }
+}
+
+/// Scatter props over a terrain: places under one grouped Empty root
+/// (child of the terrain, so the set follows terrain moves), each placement
+/// standing on the evaluated surface. Deterministic per scatter seed.
+/// Returns the group root and the placement count.
+pub fn scatter_props(
+    scene: &mut Scene,
+    terrain_id: ObjectId,
+    source: ScatterSource,
+    params: &modeler_core::terrain::ScatterParams,
+    max: usize,
+) -> Result<(ObjectId, usize), String> {
+    use modeler_core::glam::Quat;
+
+    let object = scene.object(terrain_id).ok_or("object vanished")?;
+    let Primitive::Terrain { size, resolution, height, seed } = object.primitive else {
+        return Err("scatter needs a terrain object".into());
+    };
+    let data = object.terrain.clone().unwrap_or_default();
+    // library assets can be whole assemblies: cap them harder
+    let cap = match source {
+        ScatterSource::Kind(_) => max.clamp(1, 2000),
+        ScatterSource::Asset(_) => max.clamp(1, 300),
+    };
+    let placements = data.scatter(seed, resolution, size, height, params, cap);
+    if placements.is_empty() {
+        return Err(
+            "no valid spots — loosen density, slope or height rules".into(),
+        );
+    }
+
+    let terrain_world = scene.world_transform(terrain_id);
+    let root = scene.add_object(Primitive::Empty { size: 0.4 }, terrain_world);
+    let label = match &source {
+        ScatterSource::Kind(kind) => match kind {
+            modeler_core::PropKind::Rock => "Rocks".to_string(),
+            modeler_core::PropKind::Conifer => "Conifers".to_string(),
+            modeler_core::PropKind::Broadleaf => "Broadleaves".to_string(),
+            modeler_core::PropKind::Bush => "Bushes".to_string(),
+        },
+        ScatterSource::Asset(asset) => format!("{} patch", asset.name),
+    };
+    if let Some(o) = scene.object_mut(root) {
+        o.name = label;
+        o.group = true; // one click selects the whole scatter
+    }
+    scene.set_parent(root, Some(terrain_id));
+
+    for (i, placement) in placements.iter().enumerate() {
+        let local = Transform {
+            location: placement.position,
+            rotation: Quat::from_rotation_z(placement.yaw),
+            scale: Vec3::splat(placement.scale),
+        };
+        let world = Transform::compose(&terrain_world, &local);
+        match &source {
+            ScatterSource::Kind(kind) => {
+                // a handful of shape variants: enough visual variety while
+                // thousands of props still collapse to ~7 mesh uploads
+                let variant = (i as u32).wrapping_mul(2_654_435_761) % 7;
+                let id = scene.add_object(
+                    Primitive::Prop { kind: *kind, seed: variant, size: prop_base_size(*kind) },
+                    world,
+                );
+                scene.set_parent(id, Some(root));
+            }
+            ScatterSource::Asset(asset) => {
+                let ids = modeler_core::library::instantiate(scene, asset, Vec3::ZERO);
+                // instantiate leaves exactly one root (it groups extras)
+                let inst_root = ids
+                    .iter()
+                    .copied()
+                    .find(|&id| scene.object(id).is_some_and(|o| o.parent.is_none()));
+                if let Some(inst_root) = inst_root {
+                    if let Some(o) = scene.object_mut(inst_root) {
+                        o.transform = world;
+                    }
+                    scene.set_parent(inst_root, Some(root));
+                }
+            }
+        }
+    }
+    Ok((root, placements.len()))
+}
+
 pub fn add_floor(scene: &mut Scene, selection: &mut Selection) -> String {
     let selected: std::collections::HashSet<ObjectId> =
         selection.selected().iter().copied().collect();

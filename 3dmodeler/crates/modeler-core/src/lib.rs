@@ -5,9 +5,11 @@
 //! rendering or physics — those live in `modeler-app`.
 
 pub mod boolean;
+pub mod erosion;
 pub mod library;
 pub mod material;
 pub mod mesh;
+pub mod terrain;
 
 use glam::{Quat, Vec2, Vec3};
 pub use boolean::{mesh_boolean, mesh_to_frame, BooleanOp};
@@ -19,6 +21,7 @@ pub use material::{
     WorldPositionEffect,
 };
 pub use mesh::{MeshData, WallCutout};
+pub use terrain::TerrainData;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -287,11 +290,86 @@ pub enum Primitive {
         #[serde(default = "default_cloth_stiffness")]
         stiffness: f32,
     },
+    /// A single-mesh nature prop (rock, conifer, broadleaf, bush) standing
+    /// on z = 0, `size` meters tall (rocks: across). `seed` varies the
+    /// shape: props sharing (kind, seed, size) share one GPU upload, which
+    /// is what makes terrain scattering cheap to draw. Trunk/rock surfaces
+    /// use the object's own material; foliage is `face_materials[0]`.
+    Prop {
+        kind: PropKind,
+        seed: u32,
+        size: f32,
+    },
+    /// Procedural terrain: a `size` × `size` height grid standing on z = 0,
+    /// centered on the origin in XY, rising to at most `height` meters
+    /// (rivers may dig slightly below the base plane). The heights come
+    /// from the noise-layer stack on the OBJECT (`Object::terrain`), seeded
+    /// by `seed` — nothing is baked; the mesh regenerates from parameters.
+    Terrain {
+        /// Side length in meters.
+        size: f32,
+        /// Grid quads per side (vertices = resolution + 1 per side).
+        /// Clamped 8..=512.
+        resolution: u32,
+        /// Height amplitude in meters.
+        height: f32,
+        /// World seed: same seed + same stack = same terrain.
+        seed: u32,
+    },
 }
 
 /// Default cloth stiffness (soft enough to drape; 1.0 would be nearly rigid).
 fn default_cloth_stiffness() -> f32 {
     0.25
+}
+
+/// The built-in nature props (`Primitive::Prop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropKind {
+    Rock,
+    Conifer,
+    Broadleaf,
+    Bush,
+}
+
+impl PropKind {
+    pub const ALL: [PropKind; 4] =
+        [PropKind::Rock, PropKind::Conifer, PropKind::Broadleaf, PropKind::Bush];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropKind::Rock => "Rock",
+            PropKind::Conifer => "Conifer",
+            PropKind::Broadleaf => "Broadleaf",
+            PropKind::Bush => "Bush",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PropKind> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.label().eq_ignore_ascii_case(name))
+    }
+
+    /// Foliage color for `face_materials[0]` (None: single-material prop).
+    pub fn foliage_color(self) -> Option<[f32; 3]> {
+        match self {
+            PropKind::Rock => None,
+            PropKind::Conifer => Some([0.13, 0.25, 0.12]),
+            PropKind::Broadleaf => Some([0.20, 0.34, 0.13]),
+            PropKind::Bush => Some([0.22, 0.36, 0.16]),
+        }
+    }
+
+    /// Base (trunk / rock) color for the object's own material.
+    pub fn base_color(self) -> [f32; 3] {
+        match self {
+            PropKind::Rock => [0.45, 0.42, 0.38],
+            PropKind::Bush => [0.25, 0.20, 0.12],
+            _ => [0.30, 0.21, 0.12], // bark
+        }
+    }
 }
 
 /// One end of a `Primitive::Rope`: free, or pinned to a point on another object.
@@ -434,6 +512,18 @@ impl Primitive {
             Primitive::Camera { .. } => "Camera",
             Primitive::Rope { .. } => "Rope",
             Primitive::Cloth { .. } => "Cloth",
+            Primitive::Terrain { .. } => "Terrain",
+            Primitive::Prop { kind, .. } => kind.label(),
+        }
+    }
+
+    /// A terrain with sensible defaults (Add ▸ Terrain, `add_object`).
+    pub fn default_terrain() -> Primitive {
+        Primitive::Terrain {
+            size: 100.0,
+            resolution: 128,
+            height: 12.0,
+            seed: 1,
         }
     }
 
@@ -483,6 +573,12 @@ impl Primitive {
             Primitive::Cloth { width, height, .. } => {
                 0.5 * (width * width + height * height).sqrt()
             }
+            // base plane centered on the origin; a top corner is farthest
+            // (heights can dip to -0.5 × height, still within this bound)
+            Primitive::Terrain { size, height, .. } => {
+                (0.5 * size * size + height * height).sqrt()
+            }
+            Primitive::Prop { size, .. } => size * 1.2,
         }
     }
 
@@ -534,6 +630,12 @@ impl Primitive {
                 Vec3::new(length, 2.0 * radius, 2.0 * radius)
             }
             Primitive::Cloth { width, height, .. } => Vec3::new(width, height, 0.0),
+            Primitive::Terrain { size, height, .. } => Vec3::new(size, size, height),
+            Primitive::Prop { kind, size, .. } => match kind {
+                PropKind::Rock => Vec3::new(size, size, 0.6 * size),
+                PropKind::Bush => Vec3::new(size, size, 0.5 * size),
+                _ => Vec3::new(0.7 * size, 0.7 * size, size),
+            },
         }
     }
 
@@ -557,6 +659,8 @@ impl Primitive {
             Primitive::Camera { .. } => mesh::CAMERA_GIZMO_HALF_H,
             Primitive::Rope { radius, .. } => radius,
             Primitive::Cloth { .. } => 0.0,
+            Primitive::Terrain { .. } => 0.0, // stands on its base plane
+            Primitive::Prop { .. } => 0.0,    // stands on its roots
         }
     }
 
@@ -601,6 +705,16 @@ impl Primitive {
                 segments_v,
                 stiffness: _,
             } => mesh::cloth(width, height, segments_u, segments_v),
+            // default stack; the object's own stack goes through render_mesh
+            Primitive::Terrain { size, resolution, height, seed } => {
+                terrain::generate_mesh(&TerrainData::default(), size, resolution, height, seed)
+            }
+            Primitive::Prop { kind, seed, size } => match kind {
+                PropKind::Rock => mesh::prop_rock(seed, size),
+                PropKind::Conifer => mesh::prop_conifer(seed, size),
+                PropKind::Broadleaf => mesh::prop_broadleaf(seed, size),
+                PropKind::Bush => mesh::prop_bush(seed, size),
+            },
         };
         if smooth {
             m
@@ -769,6 +883,19 @@ pub struct Object {
     /// Not saved; the renderer uses these to draw the draped cord.
     #[serde(skip)]
     pub rope_nodes: Option<Vec<Vec3>>,
+    /// Noise-layer stack, for `Primitive::Terrain` objects only (ignored
+    /// elsewhere): the generator the heights come from. `None` falls back
+    /// to `TerrainData::default()`. Editors must bump `mesh_revision` when
+    /// they change it so the render/physics caches resync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<TerrainData>,
+    /// Bumped on every sculpt-brush dab. The RENDERER keys on it (so the
+    /// stroke shows live) but the physics mirror does not — rebuilding a
+    /// terrain collider per dab would stall the stroke. The sculpt tool
+    /// bumps `mesh_revision` once at stroke end to resync collision.
+    /// Not saved: like `mesh_revision`, caches start fresh per session.
+    #[serde(skip)]
+    pub sculpt_revision: u64,
     /// Cloth pin points (grid vertices). Only meaningful for `Primitive::Cloth`.
     #[serde(default)]
     pub cloth_anchors: Vec<ClothAnchor>,
@@ -793,6 +920,10 @@ impl Object {
                 if !self.floor_outline.is_empty() =>
             {
                 mesh::floor_polygon(&self.floor_outline, thickness)
+            }
+            (None, Primitive::Terrain { size, resolution, height, seed }) => {
+                let mesh = self.terrain_mesh(size, resolution, height, seed, true);
+                if self.smooth { mesh } else { mesh.into_flat() }
             }
             // live draped rope: nodes are world-space; return a LOCAL mesh
             // centered on the first node by expressing points relative to it
@@ -841,8 +972,35 @@ impl Object {
             {
                 mesh::floor_polygon(&self.floor_outline, thickness)
             }
+            (None, Primitive::Terrain { size, resolution, height, seed }) => {
+                // no water sheet in the collider: rays, physics and the
+                // sculpt brush all reach the ground through the water
+                self.terrain_mesh(size, resolution, height, seed, false)
+            }
             (None, primitive) => primitive.generate(true),
         }
+    }
+
+    /// The terrain mesh from this object's own stack (default stack when
+    /// unset), shared-vertex topology. `with_water` adds the translucent
+    /// water sheet (render meshes only).
+    fn terrain_mesh(
+        &self,
+        size: f32,
+        resolution: u32,
+        height: f32,
+        seed: u32,
+        with_water: bool,
+    ) -> MeshData {
+        let default_stack;
+        let data = match &self.terrain {
+            Some(data) => data,
+            None => {
+                default_stack = TerrainData::default();
+                &default_stack
+            }
+        };
+        terrain::generate_mesh_ex(data, size, resolution, height, seed, with_water)
     }
 
     /// Radius of the bounding sphere around the local origin.
@@ -1225,9 +1383,33 @@ impl Scene {
             rope_start: RopeEnd::default(),
             rope_end: RopeEnd::default(),
             rope_nodes: None,
+            terrain: None,
+            sculpt_revision: 0,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
         });
+        // Terrain: smooth-shaded with its default stack, in a grassy green.
+        if matches!(primitive, Primitive::Terrain { .. }) {
+            if let Some(object) = self.objects.last_mut() {
+                object.smooth = true;
+                object.terrain = Some(TerrainData::default());
+                object.material.base_color = [0.35, 0.48, 0.28];
+                object.material.roughness = 0.95;
+            }
+        }
+        // Nature props: bark/rock base material + a foliage face material.
+        if let Primitive::Prop { kind, .. } = primitive {
+            if let Some(object) = self.objects.last_mut() {
+                object.material.base_color = kind.base_color();
+                object.material.roughness = 0.9;
+                if let Some(c) = kind.foliage_color() {
+                    let mut foliage = Material::default();
+                    foliage.base_color = c;
+                    foliage.roughness = 0.95;
+                    object.face_materials.push(foliage);
+                }
+            }
+        }
         // Ropes / cloth are physical by default — they only do something useful under gravity.
         if primitive.is_rope() {
             if let Some(object) = self.objects.last_mut() {
@@ -2227,6 +2409,28 @@ mod tests {
         assert_eq!(restored.masters()[0].id, mid);
         assert!((restored.mpc().wetness - 0.4).abs() < 1e-5);
         assert_eq!(restored.object(id).unwrap().material_master, Some(mid));
+    }
+
+    #[test]
+    fn scene_json_roundtrip_keeps_terrain_stack() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::default_terrain(), Transform::default());
+        // add_object seeds the default stack; swap in a preset to prove the
+        // exact layers survive, not just "some stack"
+        let canyon = TerrainData::preset("Canyon").unwrap();
+        scene.object_mut(id).unwrap().terrain = Some(canyon.clone());
+        let json = scene.to_json();
+        let data = Scene::from_json(&json).unwrap();
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        let object = restored.object(id).unwrap();
+        assert_eq!(object.terrain.as_ref(), Some(&canyon));
+        assert!(matches!(object.primitive, Primitive::Terrain { .. }));
+        // the mesh regenerates identically from the restored parameters
+        assert_eq!(
+            object.render_mesh().positions,
+            scene.object(id).unwrap().render_mesh().positions
+        );
     }
 
     #[test]

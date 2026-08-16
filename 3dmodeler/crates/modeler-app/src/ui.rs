@@ -1,11 +1,13 @@
-//! Blender-style editor UI: top menu bar, outliner, properties sidebar
-//! (N panel), bottom status bar and the keymap overlay.
+//! Blender-style editor UI: top menu bar, dockable panels (outliner,
+//! library, properties, PBR library, AI chat — see dock.rs), bottom status
+//! bar and the keymap overlay. N hides/shows all panels.
 //!
 //! Menus are hand-rolled egui Areas rather than `menu_button` — the built-in
 //! popups misbehave inside the deprecated panel API (see plan.md, Phase 3).
 
 use crate::camera::BlenderCamera;
 use crate::context_menu::ContextMenu;
+use crate::dock::{DockLayout, PanelId};
 use crate::edit_mode::{EditMode, SelectMode};
 use crate::library::LibraryPanel;
 use crate::pbr_library::PbrLibraryPanel;
@@ -104,8 +106,13 @@ pub struct UiState {
     /// Set by the Object menu, the properties panel and the context wheel;
     /// the window itself lives in `break_dialog_window`.
     break_dialog: Option<(object_ops::BreakKind, i32)>,
+    /// Persistent settings of the terrain Scatter section (Data tab).
+    scatter_kind: modeler_core::PropKind,
+    scatter_params: modeler_core::terrain::ScatterParams,
     /// Active Properties panel tab (Blender-style icon tabs).
     properties_tab: PropertiesTab,
+    /// Active section of the terrain Data panel (vertical tab strip).
+    terrain_data_tab: TerrainDataTab,
     /// Eyedropper armed on a boolean modifier: (object owning the stack,
     /// modifier index). The next viewport click picks that modifier's tool
     /// object instead of changing the selection; Esc cancels.
@@ -124,6 +131,8 @@ pub struct UiState {
     pub pbr_library_panel: PbrLibraryPanel,
     pub context_menu: ContextMenu,
     pub chat_panel: crate::ai::ChatPanel,
+    /// Dockable panel arrangement (tab groups, splits, floating windows).
+    pub dock: DockLayout,
     applied_theme: Option<Theme>,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
@@ -181,7 +190,10 @@ impl UiState {
             import_buffer: String::new(),
             pick_boolean_tool: None,
             break_dialog: None,
+            scatter_kind: modeler_core::PropKind::Conifer,
+            scatter_params: modeler_core::terrain::ScatterParams::default(),
             properties_tab: PropertiesTab::Transform,
+            terrain_data_tab: TerrainDataTab::Shape,
             status_message: None,
             current_file: None,
             saved_version: None,
@@ -192,6 +204,7 @@ impl UiState {
             pbr_library_panel: PbrLibraryPanel::new(),
             context_menu: ContextMenu::new(),
             chat_panel: crate::ai::ChatPanel::new(),
+            dock: DockLayout::load(),
             applied_theme: None,
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
@@ -200,8 +213,8 @@ impl UiState {
         }
     }
 
-    /// Non-egui inputs: N toggles the sidebar, clicks into the viewport close
-    /// any open menu.
+    /// Non-egui inputs: N toggles all dock panels, clicks into the viewport
+    /// close any open menu.
     pub fn handle_events(
         &mut self,
         events: &mut [Event],
@@ -238,6 +251,7 @@ impl UiState {
         edit: Option<&mut EditMode>,
         wall_tool: &mut crate::wall_tool::WallTool,
         roof_tool: &mut crate::roof_tool::RoofTool,
+        sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -337,18 +351,40 @@ impl UiState {
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
                 snap_to_vertex, shade_mode, xray, edit,
             );
-        let bottom_offset = self.status_bar(
+        let chrome_bottom = self.status_bar(
             ctx, scene, physics, measure, calibrate, marker_tool, snap_to_grid, settings,
             modal_status, fps, mcp,
         );
-        let right_offset = if self.show_sidebar {
-            self.sidebar(
+        // menu/toolbar toggles flip `chat_panel.open`; mirror that into the
+        // dock (open/close the AI tab) before drawing, and mirror tab closes
+        // back into the flag afterwards
+        if self.chat_panel.open != self.dock.is_open(PanelId::AiChat) {
+            self.dock.set_open(PanelId::AiChat, self.chat_panel.open);
+        }
+        let viewport_rect = if self.show_sidebar {
+            self.dock_panels(
                 ctx, scene, selection, settings, calibrate, marker_tool, library, edit_point,
+                sculpt_tool, chat,
             )
         } else {
-            0.0
+            None
         };
-        let left_offset = self.chat_panel.ui(ctx, chat, settings);
+        self.chat_panel.open = self.dock.is_open(PanelId::AiChat);
+        self.dock.save_if_changed(ctx);
+        // the viewport is the dock's (transparent) viewport tab; overlays and
+        // pointer tests use its distance from each window edge. With panels
+        // hidden (N) — or the viewport tab buried behind another tab — only
+        // the fixed chrome bounds the viewport.
+        let screen = ctx.content_rect();
+        let (top_offset, right_offset, bottom_offset, left_offset) = match viewport_rect {
+            Some(rect) => (
+                (rect.top() - screen.top()).max(0.0),
+                (screen.right() - rect.right()).max(0.0),
+                (screen.bottom() - rect.bottom()).max(0.0),
+                (rect.left() - screen.left()).max(0.0),
+            ),
+            None => (top_offset, 0.0, chrome_bottom, 0.0),
+        };
         self.keymap_window(ctx);
         self.about_window(ctx);
         #[cfg(target_arch = "wasm32")]
@@ -475,6 +511,7 @@ impl UiState {
                                     ui, camera, scene, selection, settings, snap_to_grid,
                                     shade_mode, xray,
                                     &mut self.chat_panel.open,
+                                    &mut self.dock,
                                 ),
                                 Menu::Help => {
                                     let mut close = false;
@@ -1187,7 +1224,7 @@ impl UiState {
                     SimState::Stopped => match modal_status {
                         // every modal status carries its own confirm/cancel hint
                         Some(status) => status.clone(),
-                        None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Sidebar"
+                        None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Panels"
                             .to_string(),
                     },
                 }
@@ -1275,125 +1312,49 @@ impl UiState {
 
     // --- sidebar: outliner + properties -----------------------------------
 
-    fn sidebar(
+    /// The dockable panel area between the fixed chrome (menu/toolbar above,
+    /// status bar below). Returns the viewport tab's body rect in screen
+    /// coordinates — `None` while the viewport tab is hidden behind another
+    /// tab stacked over it.
+    #[allow(clippy::too_many_arguments)]
+    fn dock_panels(
         &mut self,
         ctx: &egui::Context,
         scene: &mut Scene,
         selection: &mut Selection,
-        settings: &Settings,
+        settings: &mut Settings,
         calibrate: &mut CalibrateTool,
         marker_tool: &mut MarkerTool,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
-    ) -> f32 {
-        #[allow(deprecated)]
-        let response = egui::Panel::right("sidebar")
-            .default_size(280.0)
-            .min_width(240.0)
-            // Hard cap: PBR grids and long labels must not expand the panel
-            // across the whole window (egui grows panels to fit min content).
-            .max_width(340.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                // Clamp content width so children can't push preferred size past max.
-                let panel_w = ui.available_width().min(340.0);
-                ui.set_max_width(panel_w);
-                ui.horizontal(|ui| {
-                    theme::section_header(ui, "Outliner");
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui
-                                .small_button("+ 📂")
-                                .on_hover_text(
-                                    "New folder — drag outliner objects onto it",
-                                )
-                                .clicked()
-                            {
-                                let id = scene.add_folder("Folder");
-                                let name = scene
-                                    .folder(id)
-                                    .map(|f| f.name.clone())
-                                    .unwrap_or_default();
-                                self.rename_folder = Some((id, name));
-                                self.rename_needs_focus = true;
-                            }
-                        },
-                    );
-                });
-                egui::ScrollArea::vertical()
-                    .id_salt("outliner-scroll")
-                    .max_height(320.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        self.outliner(ui, scene, selection);
-                    });
-                ui.separator();
-                if let Some(message) = self.library_panel.section(ui, library) {
-                    self.status_message = Some(message);
-                }
-                ui.separator();
-                if !scene.reference_images().is_empty() {
-                    ui.horizontal(|ui| {
-                        // bulk eye: show/hide every reference image at once
-                        // (same ●/○ language as the per-image and folder rows)
-                        let all_visible =
-                            scene.reference_images().iter().all(|r| r.visible);
-                        let eye = if all_visible { "●" } else { "○" };
-                        if ui
-                            .small_button(eye)
-                            .on_hover_text(if all_visible {
-                                "Hide all reference images"
-                            } else {
-                                "Show all reference images"
-                            })
-                            .clicked()
-                        {
-                            let show = !all_visible;
-                            let ids: Vec<u64> =
-                                scene.reference_images().iter().map(|r| r.id).collect();
-                            for id in ids {
-                                if let Some(image) = scene.reference_image_mut(id) {
-                                    image.visible = show;
-                                }
-                            }
-                        }
-                        theme::section_header(ui, "Reference Images");
-                    });
-                    reference_image_rows(ui, scene, selection, settings, calibrate, marker_tool);
-                    ui.separator();
-                }
-                if !scene.measurements().is_empty() {
-                    theme::section_header(ui, "Measurements");
-                    let mut remove: Option<usize> = None;
-                    for (i, m) in scene.measurements().iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✖").on_hover_text("Delete measurement").clicked() {
-                                remove = Some(i);
-                            }
-                            ui.label(settings.unit.format(m.length()));
-                        });
-                    }
-                    if let Some(i) = remove {
-                        scene.remove_measurement(i);
-                    }
-                    ui.separator();
-                }
-                if let Some(message) = properties(
-                    ui,
-                    scene,
-                    selection,
-                    settings,
-                    edit_point,
-                    &mut self.break_dialog,
-                    &mut self.properties_tab,
-                    &mut self.pbr_library_panel,
-                    &mut self.pick_boolean_tool,
-                ) {
-                    self.status_message = Some(message);
-                }
-            });
-        response.response.rect.width()
+        sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
+        chat: &mut crate::ai::ChatSession,
+    ) -> Option<egui::Rect> {
+        // move the dock tree out so the viewer can borrow the rest of self
+        let mut dock_state = self.dock.state.take()?;
+        let mut viewer = PanelViewer {
+            state: self,
+            scene,
+            selection,
+            settings,
+            calibrate,
+            marker_tool,
+            library,
+            edit_point,
+            sculpt_tool,
+            chat,
+            viewport_rect: None,
+        };
+        #[allow(deprecated)] // DockArea::show — there is no root Ui to show_inside
+        egui_dock::DockArea::new(&mut dock_state)
+            .id(egui::Id::new("panel-dock"))
+            .show_add_buttons(false)
+            .show_leaf_close_all_buttons(false)
+            .show_leaf_collapse_buttons(false)
+            .show(ctx, &mut viewer);
+        let viewport_rect = viewer.viewport_rect;
+        self.dock.state = Some(dock_state);
+        viewport_rect
     }
 
     fn outliner(&mut self, ui: &mut egui::Ui, scene: &mut Scene, selection: &mut Selection) {
@@ -2622,6 +2583,190 @@ fn set_selected_smooth(scene: &mut Scene, selection: &Selection, smooth: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
+// --- dockable panels ---------------------------------------------------------
+
+/// Borrows everything the panel bodies need for one frame of the dock area.
+struct PanelViewer<'a> {
+    state: &'a mut UiState,
+    scene: &'a mut Scene,
+    selection: &'a mut Selection,
+    settings: &'a mut Settings,
+    calibrate: &'a mut CalibrateTool,
+    marker_tool: &'a mut MarkerTool,
+    library: &'a mut Library,
+    edit_point: Option<(ObjectId, Vec3)>,
+    sculpt_tool: &'a mut crate::terrain_sculpt::SculptTool,
+    chat: &'a mut crate::ai::ChatSession,
+    /// Screen rect of the viewport tab's body, recorded when it draws.
+    viewport_rect: Option<egui::Rect>,
+}
+
+impl PanelViewer<'_> {
+    /// Scene contents: the outliner tree plus the reference-image and
+    /// measurement lists (shown only when non-empty, as before).
+    fn outliner_panel(&mut self, ui: &mut egui::Ui) {
+        let scene = &mut *self.scene;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("+ 📂")
+                    .on_hover_text("New folder — drag outliner objects onto it")
+                    .clicked()
+                {
+                    let id = scene.add_folder("Folder");
+                    let name = scene.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+                    self.state.rename_folder = Some((id, name));
+                    self.state.rename_needs_focus = true;
+                }
+            });
+        });
+        self.state.outliner(ui, scene, self.selection);
+        if !scene.reference_images().is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                // bulk eye: show/hide every reference image at once
+                // (same ●/○ language as the per-image and folder rows)
+                let all_visible = scene.reference_images().iter().all(|r| r.visible);
+                let eye = if all_visible { "●" } else { "○" };
+                if ui
+                    .small_button(eye)
+                    .on_hover_text(if all_visible {
+                        "Hide all reference images"
+                    } else {
+                        "Show all reference images"
+                    })
+                    .clicked()
+                {
+                    let show = !all_visible;
+                    let ids: Vec<u64> = scene.reference_images().iter().map(|r| r.id).collect();
+                    for id in ids {
+                        if let Some(image) = scene.reference_image_mut(id) {
+                            image.visible = show;
+                        }
+                    }
+                }
+                theme::section_header(ui, "Reference Images");
+            });
+            reference_image_rows(
+                ui,
+                scene,
+                self.selection,
+                self.settings,
+                self.calibrate,
+                self.marker_tool,
+            );
+        }
+        if !scene.measurements().is_empty() {
+            ui.separator();
+            theme::section_header(ui, "Measurements");
+            let mut remove: Option<usize> = None;
+            for (i, m) in scene.measurements().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Delete measurement")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    ui.label(self.settings.unit.format(m.length()));
+                });
+            }
+            if let Some(i) = remove {
+                scene.remove_measurement(i);
+            }
+        }
+    }
+}
+
+impl egui_dock::TabViewer for PanelViewer<'_> {
+    type Tab = PanelId;
+
+    fn title(&mut self, tab: &mut PanelId) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut PanelId) {
+        match tab {
+            PanelId::Viewport => {
+                // the 3D scene renders under egui — this tab is just the
+                // transparent hole it shows through; record where it is
+                self.viewport_rect = Some(ui.max_rect());
+            }
+            PanelId::Outliner => self.outliner_panel(ui),
+            PanelId::Library => {
+                if let Some(message) = self.state.library_panel.section(ui, self.library) {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::Properties => {
+                if let Some(message) = properties(
+                    ui,
+                    self.scene,
+                    self.selection,
+                    self.settings,
+                    self.edit_point,
+                    &mut self.state.break_dialog,
+                    &mut self.state.properties_tab,
+                    &mut self.state.terrain_data_tab,
+                    &mut self.state.pick_boolean_tool,
+                    self.sculpt_tool,
+                    &mut self.state.scatter_kind,
+                    &mut self.state.scatter_params,
+                ) {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::PbrLibrary => {
+                self.state
+                    .pbr_library_panel
+                    .section(ui, self.scene, self.selection);
+                if let Some(message) = self.state.pbr_library_panel.take_status() {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::AiChat => self.state.chat_panel.section(ui, self.chat, self.settings),
+        }
+    }
+
+    fn is_closeable(&self, tab: &PanelId) -> bool {
+        *tab != PanelId::Viewport
+    }
+
+    fn allowed_in_windows(&self, tab: &mut PanelId) -> bool {
+        // the viewport stays on the main surface: a floating viewport would
+        // leave no docked hole to see the scene through
+        *tab != PanelId::Viewport
+    }
+
+    fn clear_background(&self, tab: &PanelId) -> bool {
+        *tab != PanelId::Viewport
+    }
+
+    fn scroll_bars(&self, tab: &PanelId) -> [bool; 2] {
+        match tab {
+            // chat lays out bottom-up and the PBR grids size themselves to
+            // the panel — both need the real (finite) body height
+            PanelId::Viewport | PanelId::AiChat | PanelId::PbrLibrary => [false, false],
+            _ => [false, true],
+        }
+    }
+
+    fn tab_style_override(
+        &self,
+        tab: &PanelId,
+        global_style: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        (*tab == PanelId::Viewport).then(|| {
+            let mut style = global_style.clone();
+            // viewport body flush with the node edges: overlays and pointer
+            // math treat the body rect as the exact viewport bounds
+            style.tab_body.inner_margin = egui::Margin::ZERO;
+            style
+        })
+    }
+}
+
 fn view_menu(
     ui: &mut egui::Ui,
     camera: &mut BlenderCamera,
@@ -2632,6 +2777,7 @@ fn view_menu(
     shade_mode: &mut ShadeMode,
     xray: &mut bool,
     chat_open: &mut bool,
+    dock: &mut DockLayout,
 ) -> bool {
     let mut close = false;
     if ui
@@ -2640,6 +2786,25 @@ fn view_menu(
         .clicked()
     {
         *chat_open = !*chat_open;
+        close = true;
+    }
+    ui.separator();
+    ui.label(egui::RichText::new("Panels").weak().size(11.0));
+    for panel in PanelId::CLOSABLE {
+        if panel == PanelId::AiChat {
+            continue; // toggled above as "AI Assistant"
+        }
+        let mut open = dock.is_open(panel);
+        if ui.checkbox(&mut open, panel.title()).clicked() {
+            dock.set_open(panel, open);
+        }
+    }
+    if ui
+        .button("Reset panel layout")
+        .on_hover_text("Restore the default panel arrangement")
+        .clicked()
+    {
+        dock.reset();
         close = true;
     }
     ui.separator();
@@ -3179,7 +3344,6 @@ enum PropertiesTab {
     Data,
     Modifiers,
     Material,
-    PbrLibrary,
     Physics,
 }
 
@@ -3190,7 +3354,6 @@ impl PropertiesTab {
             Self::Data => "Object Data",
             Self::Modifiers => "Modifiers",
             Self::Material => "Material",
-            Self::PbrLibrary => "PBR Library",
             Self::Physics => "Physics",
         }
     }
@@ -3202,7 +3365,6 @@ impl PropertiesTab {
             Self::Data => PieIcon::Data,
             Self::Modifiers => PieIcon::Modifier,
             Self::Material => PieIcon::MaterialColor,
-            Self::PbrLibrary => PieIcon::PbrLibrary,
             Self::Physics => PieIcon::Physics,
         }
     }
@@ -3213,8 +3375,52 @@ impl PropertiesTab {
             Self::Data => "Primitive / mesh / light parameters",
             Self::Modifiers => "Modifier stack (subdivision, boolean)",
             Self::Material => "PBR material, masters, world effects & MPC",
-            Self::PbrLibrary => "Browse free PBR collections (ambientCG, Poly Haven)",
             Self::Physics => "Dynamic body, density, bounciness, initial force",
+        }
+    }
+}
+
+/// Sections of the terrain Data panel, shown as a vertical tab strip —
+/// the flat stack of six feature blocks outgrew one scrolling column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerrainDataTab {
+    Shape,
+    Layers,
+    Erosion,
+    Color,
+    Water,
+    Scatter,
+}
+
+impl TerrainDataTab {
+    const ALL: [Self; 6] = [
+        Self::Shape,
+        Self::Layers,
+        Self::Erosion,
+        Self::Color,
+        Self::Water,
+        Self::Scatter,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shape => "Shape",
+            Self::Layers => "Layers",
+            Self::Erosion => "Erosion",
+            Self::Color => "Color",
+            Self::Water => "Water",
+            Self::Scatter => "Scatter",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Shape => "Size, resolution, seed, shading & sculpt brush",
+            Self::Layers => "The procedural noise-layer stack",
+            Self::Erosion => "Baked hydraulic + thermal erosion",
+            Self::Color => "Biome coloring by height and slope",
+            Self::Water => "Water level, tint, foam & ripple",
+            Self::Scatter => "Scatter rocks and vegetation over the surface",
         }
     }
 }
@@ -3481,16 +3687,17 @@ fn properties(
     edit_point: Option<(ObjectId, Vec3)>,
     break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
     tab: &mut PropertiesTab,
-    pbr_library: &mut PbrLibraryPanel,
+    terrain_tab: &mut TerrainDataTab,
     pick_boolean_tool: &mut Option<(ObjectId, usize)>,
+    sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
+    scatter_kind: &mut modeler_core::PropKind,
+    scatter_params: &mut modeler_core::terrain::ScatterParams,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
-        // PBR library can be browsed without a selection (Apply still needs one).
         theme::section_header(ui, "Properties");
-        let available = [PropertiesTab::PbrLibrary];
-        properties_tab_bar(ui, tab, &available);
-        pbr_library.section(ui, scene, selection);
-        return pbr_library.take_status();
+        ui.add_space(4.0);
+        ui.weak("Select an object to edit its properties.");
+        return None;
     };
     let Some(object) = scene.object(active_id) else {
         return None;
@@ -3538,11 +3745,7 @@ fn properties(
     if solid {
         available.push(PropertiesTab::Modifiers);
         available.push(PropertiesTab::Material);
-        available.push(PropertiesTab::PbrLibrary);
         available.push(PropertiesTab::Physics);
-    } else {
-        // Still allow browsing the free PBR collections on gizmos.
-        available.push(PropertiesTab::PbrLibrary);
     }
     properties_tab_bar(ui, tab, &available);
 
@@ -3560,6 +3763,9 @@ fn properties(
     let mut anchor = object.anchor;
     let mut dirty = PropDirty::default();
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
+    // (new stack, remesh?) — remesh=false persists setting edits only
+    let mut edited_terrain: Option<(modeler_core::TerrainData, bool)> = None;
+    let mut scatter_request = false;
     let mut break_kind: Option<object_ops::BreakKind> = None;
     let mut master_action: Option<MasterAction> = None;
     let mut apply_function: Option<MaterialFunction> = None;
@@ -3701,22 +3907,157 @@ fn properties(
                     .on_hover_text("Discard all mesh edits and restore the parametric shape")
                     .clicked();
             } else {
-                dirty.primitive |= primitive_params(
-                    ui,
-                    &mut primitive,
-                    !object.floor_outline.is_empty(),
-                    Some((scene, active_id)),
-                );
-                if !primitive.is_gizmo() {
-                    dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
-                }
+                if matches!(primitive, Primitive::Terrain { .. }) {
+                    // Terrain grew six feature blocks — a vertical tab strip
+                    // replaces the endless scroll. Shape keeps the shared
+                    // primitive params and the shading toggle.
+                    let mut stack = object.terrain.clone().unwrap_or_default();
+                    // (dirty, remesh) union over whichever section is open
+                    let mut terrain_edit = (false, false);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(56.0);
+                            for t in TerrainDataTab::ALL {
+                                if ui
+                                    .selectable_label(*terrain_tab == t, t.label())
+                                    .on_hover_text(t.tooltip())
+                                    .clicked()
+                                {
+                                    *terrain_tab = t;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| match *terrain_tab {
+                            TerrainDataTab::Shape => {
+                                dirty.primitive |= primitive_params(
+                                    ui,
+                                    &mut primitive,
+                                    !object.floor_outline.is_empty(),
+                                    Some((scene, active_id)),
+                                );
+                                dirty.smooth |=
+                                    ui.checkbox(&mut smooth, "Shade smooth").changed();
+                                ui.add_space(6.0);
+                                let sculpting = sculpt_tool.target() == Some(active_id);
+                                let label =
+                                    if sculpting { "Sculpting…" } else { "Sculpt terrain" };
+                                if ui
+                                    .add_enabled(!sculpting, egui::Button::new(label))
+                                    .on_hover_text(
+                                        "Paint height with a brush in the viewport: raise, \
+                                         lower, smooth, flatten. Esc exits.",
+                                    )
+                                    .clicked()
+                                {
+                                    sculpt_tool.start(active_id);
+                                }
+                            }
+                            TerrainDataTab::Layers => {
+                                let changed = terrain_stack_ui(ui, &mut stack);
+                                terrain_edit.0 |= changed;
+                                terrain_edit.1 |= changed;
+                            }
+                            TerrainDataTab::Erosion => {
+                                let (d, r) = terrain_erosion_ui(ui, &mut stack, &primitive);
+                                terrain_edit.0 |= d;
+                                terrain_edit.1 |= r;
+                            }
+                            TerrainDataTab::Color => {
+                                terrain_edit.0 |= terrain_color_ui(ui, &mut stack);
+                            }
+                            TerrainDataTab::Water => {
+                                let (d, r) = terrain_water_ui(ui, &mut stack, &primitive);
+                                terrain_edit.0 |= d;
+                                terrain_edit.1 |= r;
+                            }
+                            TerrainDataTab::Scatter => {
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("scatter-kind")
+                                        .selected_text(scatter_kind.label())
+                                        .width(96.0)
+                                        .show_ui(ui, |ui| {
+                                            for k in modeler_core::PropKind::ALL {
+                                                if ui
+                                                    .selectable_label(
+                                                        *scatter_kind == k,
+                                                        k.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    *scatter_kind = k;
+                                                }
+                                            }
+                                        });
+                                    if ui
+                                        .button("Scatter")
+                                        .on_hover_text(
+                                            "Place props over the terrain (grouped under \
+                                             one root; click any prop to select the whole \
+                                             set, X deletes it, Ctrl+Z undoes)",
+                                        )
+                                        .clicked()
+                                    {
+                                        scatter_request = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Density");
+                                    ui.add(egui::Slider::new(
+                                        &mut scatter_params.density,
+                                        0.05..=1.0,
+                                    ));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Seed");
+                                    ui.add(egui::DragValue::new(&mut scatter_params.seed).speed(1));
+                                    ui.label("Spacing");
+                                    ui.add(
+                                        egui::DragValue::new(&mut scatter_params.cell_size)
+                                            .speed(0.1)
+                                            .range(0.5..=100.0)
+                                            .suffix(" m"),
+                                    );
+                                });
+                                egui::CollapsingHeader::new("Rules")
+                                    .id_salt("scatter-rules")
+                                    .show(ui, |ui| {
+                                        slider_row(ui, "Max slope", &mut scatter_params.max_slope, 0.05..=3.0);
+                                        float_row_ex(ui, "Min height", &mut scatter_params.height_min, 0.1, -1000.0..=1000.0, Some(" m"));
+                                        float_row_ex(ui, "Max height", &mut scatter_params.height_max, 0.1, -1000.0..=1000.0, Some(" m"));
+                                        slider_row(ui, "Scale min", &mut scatter_params.scale_min, 0.1..=3.0);
+                                        slider_row(ui, "Scale max", &mut scatter_params.scale_max, 0.1..=4.0);
+                                        slider_row(ui, "Patchiness", &mut scatter_params.patchiness, 0.0..=1.0);
+                                        ui.checkbox(&mut scatter_params.spacing, "Keep props apart");
+                                        ui.checkbox(
+                                            &mut scatter_params.avoid_paint,
+                                            "Avoid painted rock/snow/sand",
+                                        );
+                                    });
+                            }
+                        });
+                    });
+                    if terrain_edit.0 {
+                        edited_terrain = Some((stack, terrain_edit.1));
+                    }
+                } else {
+                    dirty.primitive |= primitive_params(
+                        ui,
+                        &mut primitive,
+                        !object.floor_outline.is_empty(),
+                        Some((scene, active_id)),
+                    );
+                    if !primitive.is_gizmo() {
+                        dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+                    }
 
-                if let Primitive::Wall { length, height, .. } = primitive {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Openings (doors & windows)").strong());
-                    let mut cutouts = object.cutouts.clone();
-                    if wall_cutout_rows(ui, &mut cutouts, length, height) {
-                        edited_cutouts = Some(cutouts);
+                    if let Primitive::Wall { length, height, .. } = primitive {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Openings (doors & windows)").strong());
+                        let mut cutouts = object.cutouts.clone();
+                        if wall_cutout_rows(ui, &mut cutouts, length, height) {
+                            edited_cutouts = Some(cutouts);
+                        }
                     }
                 }
 
@@ -4344,13 +4685,6 @@ fn properties(
             }
         }
 
-        PropertiesTab::PbrLibrary => {
-            pbr_library.section(ui, scene, selection);
-            if let Some(message) = pbr_library.take_status() {
-                return Some(message);
-            }
-        }
-
         PropertiesTab::Physics => {
             let mut dynamic = object.dynamic;
             let mut density = object.density;
@@ -4538,6 +4872,32 @@ fn properties(
             object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
+    if let Some((stack, remesh)) = edited_terrain {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.terrain = Some(stack);
+            if remesh {
+                object.mesh_revision += 1; // caches key on it (primitive unchanged)
+            }
+        }
+    }
+    let mut status_override = None;
+    if scatter_request {
+        scatter_params.scale_max = scatter_params.scale_max.max(scatter_params.scale_min);
+        status_override = Some(
+            match object_ops::scatter_props(
+                scene,
+                active_id,
+                object_ops::ScatterSource::Kind(*scatter_kind),
+                scatter_params,
+                800,
+            ) {
+                Ok((_, count)) => {
+                    format!("scattered {count} {}", scatter_kind.label().to_lowercase())
+                }
+                Err(e) => e,
+            },
+        );
+    }
     let mut status = None;
     if !modifier_edits.is_empty() || modifier_add.is_some() {
         if let Some(object) = scene.object_mut(active_id) {
@@ -4570,7 +4930,7 @@ fn properties(
     if let Some(kind) = break_kind {
         *break_dialog = Some((kind, object_ops::DEFAULT_PARTICLES as i32));
     }
-    status
+    status_override.or(status)
 }
 
 /// Toolbar toggle for the edit-mode element select, with a painted
@@ -4789,6 +5149,521 @@ fn rope_end_row(
                 }
             }
         });
+    }
+    changed
+}
+
+/// Erosion section of the Data tab: bake / re-bake the hydraulic + thermal
+/// simulation into the terrain's non-destructive erosion layer, tune its
+/// blend, and warn when the bake went stale. Mutates `stack` in place; the
+/// caller writes it back and bumps `mesh_revision`.
+fn terrain_erosion_ui(
+    ui: &mut egui::Ui,
+    stack: &mut modeler_core::TerrainData,
+    primitive: &Primitive,
+) -> (bool, bool) {
+    use modeler_core::erosion::ErosionSettings;
+
+    let Primitive::Terrain { size, resolution, height, seed } = *primitive else {
+        return (false, false);
+    };
+    // `changed` = geometry moved (remesh + physics resync);
+    // `dirty` alone = only stored settings edited (persist, no rebuild)
+    let mut changed = false;
+    let mut dirty = false;
+    ui.label(egui::RichText::new("Erosion").strong());
+
+    let mut bake_with: Option<ErosionSettings> = None;
+    if stack.erosion.is_none() {
+        ui.horizontal(|ui| {
+            ui.menu_button("Bake erosion", |ui| {
+                for (name, settings) in ErosionSettings::presets() {
+                    if ui.button(name).clicked() {
+                        bake_with = Some(settings);
+                        ui.close();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("rain-carves channels & scree slopes")
+                    .weak()
+                    .size(10.0),
+            );
+        });
+    } else {
+        // stale check reads &stack, so it runs before the &mut borrows
+        let stale = stack.erosion_stale(seed, resolution, size, height);
+        {
+            let erosion = stack.erosion.as_mut().expect("checked above");
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut erosion.enabled, "Enabled").changed();
+                ui.label("Strength");
+                changed |= ui
+                    .add(egui::Slider::new(&mut erosion.strength, 0.0..=1.5))
+                    .changed();
+            });
+            if stale {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠ Terrain changed since the bake — re-bake to match",
+                    )
+                    .color(egui::Color32::from_rgb(220, 170, 60))
+                    .size(11.0),
+                );
+            }
+            egui::CollapsingHeader::new("Settings")
+                .id_salt("terrain-erosion-settings")
+                .show(ui, |ui| {
+                    let s = &mut erosion.settings;
+                    let mut droplets_k = s.droplets as f32 / 1000.0;
+                    if slider_row(ui, "Droplets (k)", &mut droplets_k, 1.0..=400.0) {
+                        s.droplets = (droplets_k * 1000.0) as u32;
+                        dirty = true;
+                    }
+                    dirty |= slider_row(ui, "Erosion rate", &mut s.erosion_rate, 0.0..=1.0);
+                    dirty |= slider_row(ui, "Deposition", &mut s.deposition, 0.0..=1.0);
+                    dirty |= slider_row(ui, "Capacity", &mut s.capacity, 0.5..=16.0);
+                    dirty |= int_row(ui, "Brush radius", &mut s.brush_radius, 1..=8);
+                    dirty |= int_row(ui, "Thermal sweeps", &mut s.thermal_iterations, 0..=200);
+                    dirty |= slider_row(ui, "Talus angle °", &mut s.talus_angle_deg, 5.0..=75.0);
+                    dirty |= slider_row(ui, "Smoothing", &mut s.smoothing, 0.0..=1.0);
+                    ui.label(
+                        egui::RichText::new("Settings apply on the next re-bake.")
+                            .weak()
+                            .size(10.0),
+                    );
+                });
+        }
+        let rebake_settings = stack.erosion.as_ref().expect("checked above").settings;
+        ui.horizontal(|ui| {
+            if ui
+                .button("Re-bake")
+                .on_hover_text("Run the simulation again with the settings above")
+                .clicked()
+            {
+                bake_with = Some(rebake_settings);
+            }
+            ui.menu_button("Re-bake as…", |ui| {
+                for (name, settings) in ErosionSettings::presets() {
+                    if ui.button(name).clicked() {
+                        bake_with = Some(settings);
+                        ui.close();
+                    }
+                }
+            });
+            if ui
+                .button("Remove")
+                .on_hover_text("Drop the baked erosion (undoable)")
+                .clicked()
+            {
+                stack.erosion = None;
+                changed = true;
+            }
+        });
+    }
+    if let Some(settings) = bake_with {
+        stack.bake_erosion(seed, resolution, size, height, settings);
+        changed = true;
+    }
+    (changed || dirty, changed)
+}
+
+/// Biome-coloring section of the Data tab. Color edits never remesh — the
+/// renderer re-bakes the albedo texture on its own (debounced) schedule.
+fn terrain_color_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) -> bool {
+    use modeler_core::terrain::TerrainColor;
+
+    let mut changed = false;
+    ui.label(egui::RichText::new("Biome color").strong());
+    let mut on = stack.color.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut on, "Enabled")
+            .on_hover_text(
+                "Paint the terrain by height and slope: grass, rock on steep \
+                 faces, snow above the line, sand near the base",
+            )
+            .changed()
+        {
+            stack.color = on.then(TerrainColor::default);
+            changed = true;
+        }
+        if stack.color.is_some() {
+            egui::ComboBox::from_id_salt("terrain-color-preset")
+                .selected_text("Preset…")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (name, preset) in TerrainColor::presets() {
+                        if ui.button(name).clicked() {
+                            stack.color = Some(preset);
+                            changed = true;
+                        }
+                    }
+                });
+        }
+    });
+    if let Some(color) = &mut stack.color {
+        egui::CollapsingHeader::new("Colors & rules")
+            .id_salt("terrain-color-settings")
+            .show(ui, |ui| {
+                let mut swatch = |ui: &mut egui::Ui, label: &str, c: &mut [f32; 3]| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.color_edit_button_rgb(c).changed();
+                        ui.label(label);
+                    });
+                };
+                swatch(ui, "Grass", &mut color.grass);
+                swatch(ui, "Dry grass", &mut color.dry_grass);
+                swatch(ui, "Rock", &mut color.rock);
+                swatch(ui, "Cliff", &mut color.cliff);
+                swatch(ui, "Snow", &mut color.snow);
+                swatch(ui, "Sand", &mut color.sand);
+                changed |= float_row_ex(ui, "Sand up to", &mut color.sand_height, 0.05, 0.0..=50.0, Some(" m"));
+                changed |= slider_row(ui, "Rock slope", &mut color.rock_slope, 0.1..=2.0);
+                changed |= slider_row(ui, "Snow line", &mut color.snow_line, 0.0..=2.0);
+                changed |= slider_row(ui, "Snow max slope", &mut color.snow_slope_max, 0.1..=2.0);
+                changed |= slider_row(ui, "Variation", &mut color.variation, 0.0..=1.0);
+            });
+    }
+    changed
+}
+
+/// Water section of the Data tab. Returns `(dirty, remesh)`: level and
+/// ripple edits move the sheet's geometry (remesh); tint, foam, opacity and
+/// roughness only restamp the bake / material.
+fn terrain_water_ui(
+    ui: &mut egui::Ui,
+    stack: &mut modeler_core::TerrainData,
+    primitive: &Primitive,
+) -> (bool, bool) {
+    use modeler_core::terrain::WaterLayer;
+
+    let mut dirty = false;
+    let mut remesh = false;
+    ui.label(egui::RichText::new("Water").strong());
+    let mut on = stack.water.is_some_and(|w| w.enabled);
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut on, "Enabled")
+            .on_hover_text(
+                "A still water surface at a fixed height — fills lakes, \
+                 basins and carved river beds below the level",
+            )
+            .changed()
+        {
+            match &mut stack.water {
+                // keep the tuned settings across off/on toggles
+                Some(water) => water.enabled = on,
+                None => stack.water = on.then(WaterLayer::default),
+            }
+            dirty = true;
+            remesh = true;
+        }
+    });
+    if let Some(water) = stack.water.as_mut().filter(|w| w.enabled) {
+        let height = match primitive {
+            Primitive::Terrain { height, .. } => height.max(1.0) as f64,
+            _ => 50.0,
+        };
+        remesh |= float_row_ex(
+            ui,
+            "Level",
+            &mut water.level,
+            0.05,
+            (-0.5 * height)..=height,
+            Some(" m"),
+        );
+        ui.horizontal(|ui| {
+            dirty |= ui.color_edit_button_rgb(&mut water.shallow).changed();
+            ui.label("Shallow");
+            dirty |= ui.color_edit_button_rgb(&mut water.deep).changed();
+            ui.label("Deep");
+        });
+        egui::CollapsingHeader::new("Surface")
+            .id_salt("terrain-water-settings")
+            .show(ui, |ui| {
+                dirty |= float_row_ex(
+                    ui,
+                    "Deep below",
+                    &mut water.depth_falloff,
+                    0.1,
+                    0.1..=50.0,
+                    Some(" m"),
+                );
+                dirty |= float_row_ex(
+                    ui,
+                    "Foam width",
+                    &mut water.foam_width,
+                    0.05,
+                    0.0..=10.0,
+                    Some(" m"),
+                );
+                dirty |= slider_row(ui, "Opacity", &mut water.opacity, 0.05..=1.0);
+                dirty |= slider_row(ui, "Roughness", &mut water.roughness, 0.02..=1.0);
+                remesh |= float_row_ex(
+                    ui,
+                    "Ripple",
+                    &mut water.ripple,
+                    0.01,
+                    0.0..=2.0,
+                    Some(" m"),
+                );
+            });
+    }
+    dirty |= remesh;
+    (dirty, remesh)
+}
+
+/// Editor for a terrain's noise-layer stack (Data tab). Mutates `stack` in
+/// place; the caller writes it back to the object and bumps `mesh_revision`.
+fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) -> bool {
+    use modeler_core::terrain::{Band, BlendMode, LayerKind, NoiseMask, TerrainData, TerrainLayer, VoronoiOutput};
+
+    let mut changed = false;
+
+    // whole-stack presets
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("terrain-preset")
+            .selected_text("Load preset…")
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for (name, data) in TerrainData::presets() {
+                    if ui.button(name).clicked() {
+                        // replace only the generator — hand sculpting, baked
+                        // erosion and coloring survive a preset switch
+                        stack.layers = data.layers;
+                        changed = true;
+                    }
+                }
+            });
+        ui.menu_button("＋ Add layer", |ui| {
+            for kind in LayerKind::catalog() {
+                if ui.button(kind.label()).clicked() {
+                    stack.layers.push(TerrainLayer::new(kind));
+                    changed = true;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Stamps").weak().size(10.0));
+            for shape in modeler_core::terrain::ShapeKind::ALL {
+                if ui.button(shape.label()).clicked() {
+                    stack.layers.push(TerrainLayer::new(LayerKind::shape(shape)));
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+    });
+
+    let mut remove: Option<usize> = None;
+    let mut swap: Option<(usize, usize)> = None;
+    let count = stack.layers.len();
+    for (i, layer) in stack.layers.iter_mut().enumerate() {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut layer.enabled, "").changed();
+                    ui.label(egui::RichText::new(layer.kind.label()).strong());
+                    if layer.kind.is_modifier() {
+                        ui.label(egui::RichText::new("modifier").weak().size(10.0));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
+                            remove = Some(i);
+                        }
+                        if i + 1 < count && ui.small_button("⬇").clicked() {
+                            swap = Some((i, i + 1));
+                        }
+                        if i > 0 && ui.small_button("⬆").clicked() {
+                            swap = Some((i - 1, i));
+                        }
+                    });
+                });
+
+                match &mut layer.kind {
+                    LayerKind::Fbm { scale, octaves, gain, lacunarity, erosion, warp } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                        changed |= slider_row(ui, "Erosion", erosion, 0.0..=1.0);
+                        changed |= slider_row(ui, "Self-warp", warp, 0.0..=1.5);
+                    }
+                    LayerKind::Ridged { scale, octaves, gain, lacunarity, sharpness } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                        changed |= slider_row(ui, "Sharpness", sharpness, 0.2..=4.0);
+                    }
+                    LayerKind::Billow { scale, octaves, gain, lacunarity } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                    }
+                    LayerKind::Value { scale } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                    }
+                    LayerKind::Voronoi { scale, jitter, output } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Jitter", jitter, 0.0..=1.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Output");
+                            egui::ComboBox::from_id_salt(("terrain-voronoi", i))
+                                .selected_text(output.label())
+                                .show_ui(ui, |ui| {
+                                    for o in VoronoiOutput::ALL {
+                                        if ui.selectable_label(*output == o, o.label()).clicked()
+                                            && *output != o
+                                        {
+                                            *output = o;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                    LayerKind::Crater { scale, density, depth, rim } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Density", density, 0.0..=1.0);
+                        changed |= slider_row(ui, "Depth", depth, 0.0..=2.0);
+                        changed |= slider_row(ui, "Rim", rim, 0.0..=1.0);
+                    }
+                    LayerKind::Dune { scale, direction_deg, sharpness } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Direction °", direction_deg, 0.0..=360.0);
+                        changed |= slider_row(ui, "Sharpness", sharpness, 0.2..=4.0);
+                    }
+                    LayerKind::Flow { scale, direction_deg, width, meander } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Direction °", direction_deg, 0.0..=360.0);
+                        changed |= float_row_ex(ui, "Width", width, 0.1, 0.1..=200.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Meander", meander, 0.1, 0.0..=200.0, Some(" m"));
+                    }
+                    LayerKind::Constant { value } => {
+                        changed |= slider_row(ui, "Value", value, -1.0..=1.0);
+                    }
+                    LayerKind::Shape { shape, x, y, radius, rotation_deg, aspect, falloff, detail } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Shape");
+                            egui::ComboBox::from_id_salt(("terrain-shape", i))
+                                .selected_text(shape.label())
+                                .show_ui(ui, |ui| {
+                                    for s in modeler_core::terrain::ShapeKind::ALL {
+                                        if ui.selectable_label(*shape == s, s.label()).clicked()
+                                            && *shape != s
+                                        {
+                                            *shape = s;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        changed |= float_row_ex(ui, "X", x, 0.25, -2000.0..=2000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Y", y, 0.25, -2000.0..=2000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Radius", radius, 0.25, 0.5..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Rotation °", rotation_deg, 0.0..=360.0);
+                        changed |= slider_row(ui, "Stretch", aspect, 0.2..=8.0);
+                        changed |= slider_row(ui, "Falloff", falloff, 0.05..=1.0);
+                        changed |= slider_row(ui, "Detail", detail, 0.0..=1.0);
+                    }
+                    LayerKind::DomainWarp { scale, strength, octaves } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Strength", strength, 0.2, 0.0..=200.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=6);
+                    }
+                    LayerKind::Terrace { steps, smoothness } => {
+                        changed |= int_row(ui, "Steps", steps, 2..=64);
+                        changed |= slider_row(ui, "Smoothness", smoothness, 0.0..=1.0);
+                    }
+                }
+
+                if !layer.kind.is_modifier() {
+                    ui.horizontal(|ui| {
+                        ui.label("Blend");
+                        egui::ComboBox::from_id_salt(("terrain-blend", i))
+                            .selected_text(layer.blend.label())
+                            .show_ui(ui, |ui| {
+                                for b in BlendMode::ALL {
+                                    if ui.selectable_label(layer.blend == b, b.label()).clicked()
+                                        && layer.blend != b
+                                    {
+                                        layer.blend = b;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    });
+                }
+                changed |= slider_row(ui, "Amount", &mut layer.amount, 0.0..=1.5);
+
+                egui::CollapsingHeader::new("Mask")
+                    .id_salt(("terrain-mask", i))
+                    .show(ui, |ui| {
+                        // height band
+                        let mut on = layer.mask.height.is_some();
+                        if ui.checkbox(&mut on, "By height").changed() {
+                            layer.mask.height = on.then_some(Band {
+                                min: 0.3,
+                                max: 1.5,
+                                falloff: 0.15,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(band) = &mut layer.mask.height {
+                            changed |= slider_row(ui, "Min", &mut band.min, -0.5..=1.5);
+                            changed |= slider_row(ui, "Max", &mut band.max, -0.5..=1.5);
+                            changed |= slider_row(ui, "Falloff", &mut band.falloff, 0.01..=0.5);
+                            changed |= ui.checkbox(&mut band.invert, "Invert").changed();
+                        }
+                        // slope band (rise/run: 1 = 45°)
+                        let mut on = layer.mask.slope.is_some();
+                        if ui.checkbox(&mut on, "By slope").changed() {
+                            layer.mask.slope = on.then_some(Band {
+                                min: 0.4,
+                                max: 10.0,
+                                falloff: 0.2,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(band) = &mut layer.mask.slope {
+                            changed |= slider_row(ui, "Min", &mut band.min, 0.0..=3.0);
+                            changed |= slider_row(ui, "Max", &mut band.max, 0.0..=10.0);
+                            changed |= slider_row(ui, "Falloff", &mut band.falloff, 0.01..=1.0);
+                            changed |= ui.checkbox(&mut band.invert, "Invert").changed();
+                        }
+                        // noise coverage
+                        let mut on = layer.mask.noise.is_some();
+                        if ui.checkbox(&mut on, "By noise").changed() {
+                            layer.mask.noise = on.then_some(NoiseMask {
+                                scale: 60.0,
+                                threshold: 0.5,
+                                softness: 0.15,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(nm) = &mut layer.mask.noise {
+                            changed |= float_row_ex(ui, "Scale", &mut nm.scale, 0.5, 1.0..=1000.0, Some(" m"));
+                            changed |= slider_row(ui, "Threshold", &mut nm.threshold, 0.0..=1.0);
+                            changed |= slider_row(ui, "Softness", &mut nm.softness, 0.01..=0.5);
+                            changed |= ui.checkbox(&mut nm.invert, "Invert").changed();
+                        }
+                    });
+            });
+    }
+    if let Some((a, b)) = swap {
+        stack.layers.swap(a, b);
+        changed = true;
+    }
+    if let Some(i) = remove {
+        stack.layers.remove(i);
+        changed = true;
     }
     changed
 }
@@ -5031,6 +5906,62 @@ fn primitive_params(
                 egui::RichText::new(
                     "Sheet in local XY (default hangs vertically). Pin vertices \
                      with handles / Alt+click, then Play.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Terrain { size, resolution, height, seed } => {
+            changed |= float_row_ex(ui, "Size", size, 0.5, 1.0..=2000.0, Some(" m"));
+            changed |= int_row(ui, "Resolution", resolution, 8..=512);
+            changed |= float_row_ex(ui, "Height", height, 0.1, 0.1..=500.0, Some(" m"));
+            ui.horizontal(|ui| {
+                ui.label("Seed");
+                changed |= ui.add(egui::DragValue::new(seed).speed(1)).changed();
+                if ui
+                    .button("Shuffle")
+                    .on_hover_text("Jump to a different random seed")
+                    .clicked()
+                {
+                    // any avalanche step works; determinism doesn't matter here
+                    *seed = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Heights come from the layer stack below — same seed and \
+                     stack always rebuild the same terrain.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Prop { kind, seed, size } => {
+            ui.horizontal(|ui| {
+                ui.label("Kind");
+                egui::ComboBox::from_id_salt("prop-kind")
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in modeler_core::PropKind::ALL {
+                            if ui.selectable_label(*kind == k, k.label()).clicked()
+                                && *kind != k
+                            {
+                                *kind = k;
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            changed |= float_row_ex(ui, "Size", size, 0.05, 0.1..=100.0, Some(" m"));
+            ui.horizontal(|ui| {
+                ui.label("Variant");
+                changed |= ui.add(egui::DragValue::new(seed).speed(1)).changed();
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Foliage color lives in the face material; trunk/rock is \
+                     the object material.",
                 )
                 .weak()
                 .size(11.0),

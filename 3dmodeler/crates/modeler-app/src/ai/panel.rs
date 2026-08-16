@@ -84,16 +84,14 @@ impl ChatPanel {
         }
     }
 
-    /// Draw the panel; returns its width (the viewport's left offset).
-    pub fn ui(
+    /// Panel body, drawn inside a dock tab (the tab's rect bounds it, so the
+    /// bottom-up layout can pin the input row to the panel bottom).
+    pub fn section(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         session: &mut ChatSession,
         settings: &mut Settings,
-    ) -> f32 {
-        if !self.open {
-            return 0.0;
-        }
+    ) {
         // until a model is picked the config IS the panel content
         let configured = !settings
             .ai
@@ -102,60 +100,53 @@ impl ChatPanel {
             .unwrap_or(true);
         let show_config = self.show_config || !configured;
 
-        #[allow(deprecated)]
-        let response = egui::Panel::left("ai_chat")
-            .default_size(340.0)
-            .size_range(240.0..=520.0) // never squeeze the viewport out
-            .show(ctx, |ui| {
-                bigger_text(ui);
-                ui.horizontal(|ui| {
-                    theme::section_header(ui, "AI Assistant");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .selectable_label(show_config, "⚙")
-                            .on_hover_text("Provider & model settings")
-                            .clicked()
-                        {
-                            self.show_config = !show_config;
-                        }
-                        // the active model, as a compact reminder
-                        if let Some(state) = settings.ai.state(settings.ai.active) {
-                            if !state.model.is_empty() {
-                                ui.weak(egui::RichText::new(&state.model).small());
-                            }
-                        }
-                    });
-                });
-                ui.separator();
-                if show_config {
-                    self.config_ui(ui, session, settings);
-                    ui.separator();
+        bigger_text(ui);
+        ui.horizontal(|ui| {
+            theme::section_header(ui, "AI Assistant");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(show_config, "⚙")
+                    .on_hover_text("Provider & model settings")
+                    .clicked()
+                {
+                    self.show_config = !show_config;
                 }
-                // bottom-up: footer, input and status pin to the panel
-                // bottom; the log scrolls in whatever space remains
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    self.input_ui(ui, session, settings, configured);
-                    ui.add_space(2.0);
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                if session.entries.is_empty() {
-                                    ui.add_space(8.0);
-                                    ui.weak("Ask for anything: “recreate the Eiffel tower”,");
-                                    ui.weak("“make it taller”, “add some lights”,");
-                                    ui.weak("“make it night time”…");
-                                }
-                                for (index, entry) in session.entries.iter().enumerate() {
-                                    entry_ui(ui, index, entry);
-                                }
-                                ui.add_space(4.0);
-                            });
-                    });
-                });
+                // the active model, as a compact reminder
+                if let Some(state) = settings.ai.state(settings.ai.active) {
+                    if !state.model.is_empty() {
+                        ui.weak(egui::RichText::new(&state.model).small());
+                    }
+                }
             });
-        response.response.rect.width()
+        });
+        ui.separator();
+        if show_config {
+            self.config_ui(ui, session, settings);
+            ui.separator();
+        }
+        // bottom-up: footer, input and status pin to the panel
+        // bottom; the log scrolls in whatever space remains
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.input_ui(ui, session, settings, configured);
+            ui.add_space(2.0);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if session.entries.is_empty() {
+                            ui.add_space(8.0);
+                            ui.weak("Ask for anything: “recreate the Eiffel tower”,");
+                            ui.weak("“make it taller”, “add some lights”,");
+                            ui.weak("“make it night time”…");
+                        }
+                        for (index, entry) in session.entries.iter().enumerate() {
+                            entry_ui(ui, index, entry);
+                        }
+                        ui.add_space(4.0);
+                    });
+            });
+        });
     }
 
     /// Bottom block, drawn bottom-up: cost footer, then the input row, then

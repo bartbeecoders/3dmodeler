@@ -61,11 +61,13 @@ pub struct FrameOutput {
     pub swap_buffers: bool,
     /// Sleep until the next input event instead of drawing continuously.
     pub wait_next_event: bool,
+    /// Retitle the OS window (e.g. "Simulating — …"). None = leave as is.
+    pub title: Option<String>,
 }
 
 impl Default for FrameOutput {
     fn default() -> Self {
-        Self { exit: false, swap_buffers: true, wait_next_event: false }
+        Self { exit: false, swap_buffers: true, wait_next_event: false, title: None }
     }
 }
 

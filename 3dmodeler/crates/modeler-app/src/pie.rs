@@ -33,6 +33,8 @@ pub enum PieIcon {
     LightSun,
     LightSpot,
     Camera,
+    /// Mountain skyline (terrain).
+    Terrain,
     // actions (line-art)
     Duplicate,
     Anchor,
@@ -57,8 +59,6 @@ pub enum PieIcon {
     Modifier,
     /// Properties tab: physics (falling ball).
     Physics,
-    /// Properties tab: PBR material library (texture swatches).
-    PbrLibrary,
 }
 
 /// The icon matching a primitive (shared by the pie and the Add dropdown).
@@ -78,6 +78,13 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Empty { .. } => PieIcon::Empty,
         P::Rope { .. } => PieIcon::Rope,
         P::Cloth { .. } => PieIcon::Cloth,
+        P::Terrain { .. } => PieIcon::Terrain,
+        // props reuse close-enough line art (they are mostly scatter-made)
+        P::Prop { kind, .. } => match kind {
+            modeler_core::PropKind::Rock => PieIcon::IcoSphere,
+            modeler_core::PropKind::Bush => PieIcon::UvSphere,
+            _ => PieIcon::Cone,
+        },
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
             modeler_core::LightKind::Sun => PieIcon::LightSun,
@@ -420,16 +427,6 @@ pub fn draw_icon(
             painter.line_segment([p(0.15, -0.55), p(0.55, -0.15)], stroke);
             painter.line_segment([p(0.05, -0.2), p(0.65, 0.05)], stroke);
         }
-        // PBR library: 2×2 texture swatches
-        PieIcon::PbrLibrary => {
-            let half = 0.45 * s;
-            let gap = 0.12 * s;
-            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let center = p(dx * (half + gap) * 0.55, dy * (half + gap) * 0.55);
-                let r = egui::Rect::from_center_size(center, egui::vec2(half, half));
-                painter.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Middle);
-            }
-        }
         // Rope: hanging catenary with thickness ticks
         PieIcon::Rope => {
             let curve = [
@@ -462,6 +459,20 @@ pub fn draw_icon(
             painter.circle_filled(tr, 0.1 * s, stroke.color);
         }
         // Floor: flat slab — parallelogram top with a visible thickness
+        // Terrain: two overlapping mountain peaks over a base line
+        PieIcon::Terrain => {
+            painter.add(egui::Shape::line(
+                vec![
+                    p(-1.0, 0.75),
+                    p(-0.45, -0.25),
+                    p(-0.15, 0.2),
+                    p(0.3, -0.8),
+                    p(1.0, 0.75),
+                ],
+                stroke,
+            ));
+            painter.line_segment([p(-1.0, 0.75), p(1.0, 0.75)], stroke);
+        }
         PieIcon::Floor => {
             let top = [p(-1.0, -0.1), p(-0.35, -0.85), p(1.0, -0.85), p(0.35, -0.1)];
             painter.add(egui::Shape::closed_line(top.to_vec(), stroke));

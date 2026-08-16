@@ -259,6 +259,23 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             segments_v.hash(h);
             hash_f32(h, stiffness);
         }
+        Primitive::Terrain { size, resolution, height, seed } => {
+            15u8.hash(h);
+            hash_f32(h, size);
+            resolution.hash(h);
+            hash_f32(h, height);
+            seed.hash(h);
+        }
+        Primitive::Prop { kind, seed, size } => {
+            16u8.hash(h);
+            modeler_core::PropKind::ALL
+                .iter()
+                .position(|&k| k == kind)
+                .unwrap_or(0)
+                .hash(h);
+            seed.hash(h);
+            hash_f32(h, size);
+        }
     }
 }
 
@@ -355,6 +372,9 @@ fn mesh_key(scene: &Scene, object: &modeler_core::Object) -> u64 {
     if !shareable(object) {
         object.id.0.hash(&mut h);
         object.mesh_revision.hash(&mut h);
+        // live sculpt strokes: the renderer follows every dab, while the
+        // physics ShapeKey deliberately ignores this counter (see Object)
+        object.sculpt_revision.hash(&mut h);
     }
     h.finish()
 }
@@ -365,6 +385,9 @@ fn shareable(object: &modeler_core::Object) -> bool {
         && object.rope_nodes.is_none()
         && object.cutouts.is_empty()
         && object.floor_outline.is_empty()
+        // the noise stack lives on the object, so terrain geometry is not
+        // a function of the primitive alone (edits bump mesh_revision)
+        && object.terrain.is_none()
         && object.subdivision_only_levels().is_some()
 }
 
@@ -453,13 +476,19 @@ fn to_aether_mesh(
 }
 
 /// The engine material for one modeler material.
+///
+/// `tex` is the bridged texture set, when the material has maps: its
+/// template carries the array-texture layer indices and `HAS_*` flags, and
+/// each mapped channel neutralizes the matching scalar (the shader
+/// multiplies map × scalar).
 fn gpu_material(
     material: &Material,
     primitive: &Primitive,
     mode: ShadeMode,
     xray: bool,
+    tex: Option<&crate::texture_bridge::TextureSet>,
 ) -> GpuMaterial {
-    let mut m = GpuMaterial::default();
+    let mut m = tex.map(|t| t.template).unwrap_or_default();
     let alpha = if xray { 0.35 } else { material.alpha.clamp(0.0, 1.0) };
 
     let (base, roughness, metallic, emissive) = match primitive {
@@ -479,6 +508,14 @@ fn gpu_material(
         ),
     };
 
+    let (base, roughness, metallic) = match tex {
+        Some(t) => (
+            if t.has_albedo { [1.0, 1.0, 1.0] } else { base },
+            if t.has_roughness { 1.0 } else { roughness },
+            if t.has_metallic { 1.0 } else { metallic },
+        ),
+        None => (base, roughness, metallic),
+    };
     m.base_color = vec4(base[0], base[1], base[2], alpha).into();
     m.emissive = vec4(emissive[0], emissive[1], emissive[2], EMISSIVE_NITS).into();
     m.metallic_roughness_reflectance_ao = vec4(
@@ -488,6 +525,11 @@ fn gpu_material(
         material.occlusion.clamp(0.0, 1.0),
     )
     .into();
+    if tex.is_some() {
+        // UV tiling (repeats per unit of mesh UV); rotation is unsupported
+        let s = material.textures.uv_scale;
+        m.aniso_uv = vec4(m.aniso_uv.x, m.aniso_uv.y, s[0], s[1]).into();
+    }
     if material.coat > 1.0e-4 {
         m.clearcoat_sheen =
             vec4(material.coat, material.coat_roughness, material.sheen, 0.5).into();
@@ -501,10 +543,34 @@ fn gpu_material(
     m
 }
 
+/// The synthesized material for a terrain's water sheet (mesh slot 1). The
+/// baked tint texture carries the colors; this sets the surface response:
+/// glossy non-metal, dither-transparent through `alpha`.
+fn water_material(water: &modeler_core::terrain::WaterLayer) -> Material {
+    let mut m = Material::default();
+    m.base_color = water.deep; // fallback for looks that skip the bake
+    m.roughness = water.roughness.clamp(0.02, 1.0);
+    m.metallic = 0.0;
+    m.specular = 0.9;
+    m.alpha = water.opacity.clamp(0.05, 1.0);
+    m
+}
+
 /// Hash of everything [`gpu_material`] reads, so two objects that would produce
-/// the same engine material share one.
-fn material_key(material: &Material, primitive: &Primitive, mode: ShadeMode, xray: bool) -> u64 {
+/// the same engine material share one. `tex_hash` is the bridged texture
+/// identity (set key / bake stamp), 0 when untextured.
+fn material_key(
+    material: &Material,
+    primitive: &Primitive,
+    mode: ShadeMode,
+    xray: bool,
+    tex_hash: u64,
+) -> u64 {
     let mut h = DefaultHasher::new();
+    tex_hash.hash(&mut h);
+    for f in material.textures.uv_scale {
+        hash_f32(&mut h, f);
+    }
     for f in [
         material.base_color[0],
         material.base_color[1],
@@ -548,15 +614,19 @@ impl SceneRender {
     /// Wireframe mode draws no surfaces at all — the edges come from
     /// [`crate::wire_render`] through the overlay — so it syncs an empty scene
     /// while keeping the caches warm for the switch back.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         gpu: &Gpu,
+        renderer: &mut aether_render::Renderer,
+        bridge: &mut crate::texture_bridge::TextureBridge,
         scene: &Scene,
         selection: &Selection,
         overlaps: &HashSet<ObjectId>,
         mode: ShadeMode,
         xray: bool,
     ) {
+        bridge.begin_frame();
         // This frame's transforms are about to be written, so what is in the
         // scene now is the previous frame's. Taking the snapshot here is what
         // gives every object a `prev_transform` one frame behind its current
@@ -586,6 +656,16 @@ impl SceneRender {
                 scale: world.scale,
             };
 
+            // terrain water rides in the mesh as slot-1 triangles even though
+            // the object has no face_materials — its material is synthesized
+            // from the WaterLayer below
+            let water = object
+                .terrain
+                .as_ref()
+                .and_then(|data| data.water)
+                .filter(|w| w.enabled)
+                .filter(|_| matches!(object.primitive, Primitive::Terrain { .. }));
+
             let key = mesh_key(scene, object);
             live_meshes.insert(key);
             if !self.meshes.contains_key(&key) {
@@ -593,8 +673,11 @@ impl SceneRender {
                 if data.indices.is_empty() {
                     continue;
                 }
-                let (mesh, slots) =
-                    to_aether_mesh(&data, object.name.clone(), object.face_materials.len());
+                let slot_count = object
+                    .face_materials
+                    .len()
+                    .max(if water.is_some() { 1 } else { 0 });
+                let (mesh, slots) = to_aether_mesh(&data, object.name.clone(), slot_count);
                 let handle = self.scene.add_mesh(gpu, &mesh);
                 self.meshes.insert(key, CachedMesh { handle, slots });
             }
@@ -607,14 +690,108 @@ impl SceneRender {
             let is_gizmo = object.primitive.is_gizmo();
             let casts_shadow = !is_gizmo;
 
+            // Textures are skipped in the two looks that ignore materials.
+            let flat_look = mode == ShadeMode::Solid || xray;
+            // Terrain biome color: bake the rule chain to an albedo texture
+            // keyed per object; the stamp follows committed edits
+            // (mesh_revision — mid-stroke sculpt keeps the last bake).
+            let terrain_bake: Option<(crate::texture_bridge::TextureSet, u64)> = if flat_look {
+                None
+            } else if let (
+                Primitive::Terrain { size, resolution, height, seed },
+                Some(data),
+            ) = (object.primitive, object.terrain.as_ref())
+            {
+                data.color.map(|color| {
+                    let stamp = {
+                        let mut h = DefaultHasher::new();
+                        object.mesh_revision.hash(&mut h);
+                        hash_primitive(&mut h, &object.primitive);
+                        color.stamp().hash(&mut h);
+                        h.finish()
+                    };
+                    let set = bridge.resolve_baked_albedo(
+                        renderer,
+                        &format!("terrain-color:{}", object.id.0),
+                        stamp,
+                        || {
+                            data.bake_color(seed, resolution, size, height, 1024)
+                                .expect("color is Some")
+                        },
+                    );
+                    (set, stamp)
+                })
+            } else {
+                None
+            };
+            // Water tint bake, same debounced path as the biome color.
+            let water_bake: Option<(crate::texture_bridge::TextureSet, u64)> = if flat_look {
+                None
+            } else if let (
+                Primitive::Terrain { size, resolution, height, seed },
+                Some(data),
+                Some(layer),
+            ) = (object.primitive, object.terrain.as_ref(), water)
+            {
+                let stamp = {
+                    let mut h = DefaultHasher::new();
+                    object.mesh_revision.hash(&mut h);
+                    hash_primitive(&mut h, &object.primitive);
+                    layer.stamp().hash(&mut h);
+                    h.finish()
+                };
+                let set = bridge.resolve_baked_albedo(
+                    renderer,
+                    &format!("terrain-water:{}", object.id.0),
+                    stamp,
+                    || {
+                        data.bake_water_color(seed, resolution, size, height, 512)
+                            .expect("water is Some and enabled")
+                    },
+                );
+                Some((set, stamp))
+            } else {
+                None
+            };
+
             let mut upsert = |this: &mut Self,
                               slot: u32,
                               material: &Material,
                               submesh: Option<Submesh>| {
-                let mkey = material_key(material, &object.primitive, mode, xray);
+                // slot 0 of a colored terrain wears the baked biome albedo;
+                // everything else resolves its own texture maps (if any)
+                let (tex, tex_hash) = if flat_look {
+                    (None, 0)
+                } else if slot == 0 && terrain_bake.is_some() {
+                    let (set, stamp) = terrain_bake.as_ref().unwrap();
+                    (Some(*set), *stamp)
+                } else if slot == 1 && water_bake.is_some() {
+                    let (set, stamp) = water_bake.as_ref().unwrap();
+                    (Some(*set), *stamp)
+                } else {
+                    match crate::texture_bridge::TextureBridge::set_key(&material.textures)
+                    {
+                        Some(key) => {
+                            let set = bridge.resolve_files(renderer, &material.textures);
+                            let mut h = DefaultHasher::new();
+                            key.hash(&mut h);
+                            set.is_some().hash(&mut h);
+                            (set, h.finish())
+                        }
+                        None => (None, 0),
+                    }
+                };
+                let mkey = material_key(material, &object.primitive, mode, xray, tex_hash);
                 live_materials.insert(mkey);
                 let material = *this.materials.entry(mkey).or_insert_with(|| {
-                    this_add_material(&mut this.scene, material, &object.primitive, mode, xray)
+                    this_add_material(
+                        &mut this.scene,
+                        material,
+                        &object.primitive,
+                        mode,
+                        xray,
+                        tex.as_ref(),
+                    )
                 });
 
                 let slot_key = (object.id, slot);
@@ -657,6 +834,7 @@ impl SceneRender {
                 for (slot, range) in &slots {
                     let material = match slot {
                         0 => own.clone(),
+                        1 if water.is_some() => water_material(&water.unwrap()),
                         k => object
                             .face_materials
                             .get(*k as usize - 1)
@@ -676,6 +854,7 @@ impl SceneRender {
         }
 
         self.retire_objects(&live_objects);
+        bridge.end_frame(renderer);
 
         // Retire what this frame did not use. Meshes hold GPU buffers, so a
         // modeller that keeps re-meshing while the user drags a parameter would
@@ -767,8 +946,9 @@ fn this_add_material(
     primitive: &Primitive,
     mode: ShadeMode,
     xray: bool,
+    tex: Option<&crate::texture_bridge::TextureSet>,
 ) -> MaterialHandle {
-    scene.add_material(gpu_material(material, primitive, mode, xray))
+    scene.add_material(gpu_material(material, primitive, mode, xray, tex))
 }
 
 /// What lights the viewport, and how that maps onto a physically based engine.
@@ -1188,7 +1368,7 @@ mod tests {
         // Culling a transparent object's back faces leaves a hollow shell.
         let mut material = Material::default();
         material.alpha = 0.4;
-        let m = gpu_material(&material, &Primitive::Cube { size: 1.0 }, ShadeMode::MaterialPreview, false);
+        let m = gpu_material(&material, &Primitive::Cube { size: 1.0 }, ShadeMode::MaterialPreview, false, None);
         assert!(m.flags() & material_flags::ALPHA_BLEND != 0);
         assert!(m.flags() & material_flags::DOUBLE_SIDED != 0);
         assert!((m.base_color.w - 0.4).abs() < 1e-6);
@@ -1199,7 +1379,7 @@ mod tests {
         let mut material = Material::default();
         material.base_color = [0.9, 0.1, 0.1];
         let solid =
-            gpu_material(&material, &Primitive::Cube { size: 1.0 }, ShadeMode::Solid, false);
+            gpu_material(&material, &Primitive::Cube { size: 1.0 }, ShadeMode::Solid, false, None);
         assert!(
             (solid.base_color.x - solid.base_color.y).abs() < 1e-3,
             "Solid must be a neutral studio grey"
@@ -1214,7 +1394,7 @@ mod tests {
             spot_angle_deg: 45.0,
             shadows: false,
         };
-        let gizmo = gpu_material(&material, &light, ShadeMode::Solid, false);
+        let gizmo = gpu_material(&material, &light, ShadeMode::Solid, false, None);
         assert!(gizmo.emissive.x > gizmo.emissive.z);
     }
 
@@ -1225,6 +1405,7 @@ mod tests {
             &Primitive::Cube { size: 1.0 },
             ShadeMode::MaterialPreview,
             true,
+            None,
         );
         assert!(m.base_color.w < 0.5);
         assert!(m.flags() & material_flags::ALPHA_BLEND != 0);
@@ -1240,8 +1421,15 @@ mod tests {
             render: &mut SceneRender,
             scene: &Scene,
         ) {
+            let mut renderer = aether_render::Renderer::new(
+                gpu.clone(),
+                aether_render::RendererConfig::default(),
+            );
+            let mut bridge = crate::texture_bridge::TextureBridge::new();
             render.sync(
                 gpu,
+                &mut renderer,
+                &mut bridge,
                 scene,
                 &Selection::default(),
                 &HashSet::new(),

@@ -190,6 +190,59 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             "clip_end": clip_end,
         });
     }
+    if let modeler_core::Primitive::Terrain { size, resolution, height, seed } = object.primitive {
+        json["terrain"] = json!({
+            "size": size,
+            "resolution": resolution,
+            "height": height,
+            "seed": seed,
+            // hand-sculpted offsets present (clear with clear_sculpt=true)
+            "has_sculpt": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.sculpt.as_ref())
+                .is_some_and(|s| !s.is_empty()),
+            // biome coloring on/off (set with terrain_color)
+            "has_color": object
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.color.is_some()),
+            // hand-painted biome patches present (paintable in-app only)
+            "has_paint": object
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.paint.is_some()),
+            // baked erosion layer (bake with erode, clear with clear_erosion)
+            "erosion": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.erosion.as_ref())
+                .map(|e| json!({
+                    "enabled": e.enabled,
+                    "strength": e.strength,
+                    "droplets": e.settings.droplets,
+                    // true = terrain edited since the bake; re-run erode
+                    "stale": object.terrain.as_ref().is_some_and(|t| {
+                        t.erosion_stale(seed, resolution, size, height)
+                    }),
+                })),
+            // water table (set with water, remove with clear_water)
+            "water": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.water.as_ref())
+                .map(|w| json!({
+                    "enabled": w.enabled,
+                    "level": w.level,
+                    "opacity": w.opacity,
+                })),
+            // the full stack (round-trippable through update_object {terrain: ...})
+            "layers": object
+                .terrain
+                .as_ref()
+                .map(|t| serde_json::to_value(&t.layers).unwrap_or(Value::Null)),
+        });
+    }
     if matches!(object.primitive, modeler_core::Primitive::Wall { .. }) {
         json["cutouts"] = object
             .cutouts
@@ -266,6 +319,20 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
             segments_v: 8,
             stiffness: 0.25,
         }),
+        "terrain" => Some(Primitive::default_terrain()),
+        "rock" | "conifer" | "broadleaf" | "bush" => {
+            let kind = modeler_core::PropKind::from_name(name).expect("matched above");
+            Some(Primitive::Prop {
+                kind,
+                seed: 1,
+                size: match kind {
+                    modeler_core::PropKind::Rock => 1.4,
+                    modeler_core::PropKind::Conifer => 5.0,
+                    modeler_core::PropKind::Broadleaf => 5.5,
+                    modeler_core::PropKind::Bush => 1.2,
+                },
+            })
+        }
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
         "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
@@ -428,6 +495,257 @@ fn apply_object_params(
                     segments_u: new_su,
                     segments_v: new_sv,
                     stiffness: st.unwrap_or(stiffness).clamp(0.0, 1.0),
+                };
+            }
+        }
+        // terrain parameters (terrains only)
+        if let Primitive::Terrain { size, resolution, height, seed } = object.primitive {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let (sz, h) = (get("size"), get("height"));
+            let res = params
+                .get("resolution")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            let sd = params.get("seed").and_then(Value::as_u64).map(|v| v as u32);
+            if sz.is_some() || h.is_some() || res.is_some() || sd.is_some() {
+                object.primitive = Primitive::Terrain {
+                    size: sz.unwrap_or(size).clamp(1.0, 2000.0),
+                    resolution: res.unwrap_or(resolution).clamp(
+                        modeler_core::terrain::MIN_RESOLUTION,
+                        modeler_core::terrain::MAX_RESOLUTION,
+                    ),
+                    height: h.unwrap_or(height).clamp(0.1, 500.0),
+                    seed: sd.unwrap_or(seed),
+                };
+            }
+            // whole-stack replacement: named preset, or explicit layer list
+            if let Some(name) = params.get("terrain_preset").and_then(Value::as_str) {
+                let preset = modeler_core::TerrainData::preset(name).ok_or_else(|| {
+                    let names: Vec<&str> = modeler_core::TerrainData::presets()
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .collect();
+                    format!("unknown terrain_preset '{name}' ({})", names.join("|"))
+                })?;
+                // replace only the generator layers — sculpt/erosion/color
+                // survive a preset switch
+                match &mut object.terrain {
+                    Some(data) => data.layers = preset.layers,
+                    None => object.terrain = Some(preset),
+                }
+                object.mesh_revision += 1; // render/physics caches key on it
+            } else if let Some(v) = params.get("terrain").filter(|v| !v.is_null()) {
+                let data: modeler_core::TerrainData = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("bad 'terrain' stack: {e}"))?;
+                object.terrain = Some(data);
+                object.mesh_revision += 1;
+            }
+            // terrain_stamp: append ONE Shape landform layer without
+            // resending the whole stack. Valleys default to the Carve blend
+            // (TerrainLayer::new), like the UI's Add-layer menu.
+            if let Some(v) = params.get("terrain_stamp").filter(|v| !v.is_null()) {
+                use modeler_core::terrain::{LayerKind, ShapeKind, TerrainLayer};
+                let shape: ShapeKind = serde_json::from_value(
+                    v.get("shape").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|_| {
+                    "terrain_stamp requires 'shape' \
+                     (mountain|ridge|valley|plateau|crater)"
+                        .to_string()
+                })?;
+                let f = |key: &str, default: f32| {
+                    v.get(key).and_then(Value::as_f64).map(|n| n as f32).unwrap_or(default)
+                };
+                let kind = LayerKind::Shape {
+                    shape,
+                    x: f("x", 0.0),
+                    y: f("y", 0.0),
+                    radius: f("radius", 25.0).max(0.1),
+                    rotation_deg: f("rotation_deg", 0.0),
+                    aspect: f("aspect", if shape == ShapeKind::Ridge { 3.0 } else { 1.0 })
+                        .clamp(0.2, 10.0),
+                    falloff: f("falloff", 0.5).clamp(0.0, 1.0),
+                    detail: f("detail", 0.3).clamp(0.0, 1.0),
+                };
+                let mut layer = TerrainLayer::new(kind);
+                layer.amount = f("amount", 1.0).clamp(0.0, 2.0);
+                if let Some(b) = v.get("blend").filter(|b| !b.is_null()) {
+                    layer.blend = serde_json::from_value(b.clone()).map_err(|_| {
+                        "bad terrain_stamp 'blend' \
+                         (add|subtract|multiply|max|min|replace|carve|flatten)"
+                            .to_string()
+                    })?;
+                }
+                let data = object.terrain.get_or_insert_with(Default::default);
+                data.layers.push(layer);
+                object.mesh_revision += 1;
+            }
+            if params.get("clear_sculpt").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    if data.sculpt.take().is_some() {
+                        object.mesh_revision += 1;
+                    }
+                }
+            }
+            // erosion: bake / tune / clear
+            let mut erosion_touched = false;
+            if let Some(v) = params
+                .get("erode")
+                .filter(|v| !v.is_null() && v.as_bool() != Some(false))
+            {
+                // re-read: size/resolution/height/seed may have changed above
+                let Primitive::Terrain { size, resolution, height, seed } = object.primitive
+                else {
+                    unreachable!("inside the terrain arm");
+                };
+                let mut settings = match v.get("preset").and_then(Value::as_str) {
+                    Some(name) => modeler_core::erosion::ErosionSettings::preset(name)
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown erosion preset '{name}' \
+                                 (Lite|Natural|Mountain|Canyon|Heavy Rain|Dry Thermal)"
+                            )
+                        })?,
+                    // default: the last bake's settings, else Natural
+                    None => object
+                        .terrain
+                        .as_ref()
+                        .and_then(|t| t.erosion.as_ref())
+                        .map(|e| e.settings)
+                        .unwrap_or_default(),
+                };
+                let get_f = |k: &str| v.get(k).and_then(Value::as_f64).map(|x| x as f32);
+                let get_u = |k: &str| v.get(k).and_then(Value::as_u64).map(|x| x as u32);
+                if let Some(x) = get_u("droplets") {
+                    settings.droplets = x;
+                }
+                if let Some(x) = get_f("erosion_rate") {
+                    settings.erosion_rate = x;
+                }
+                if let Some(x) = get_f("deposition") {
+                    settings.deposition = x;
+                }
+                if let Some(x) = get_f("capacity") {
+                    settings.capacity = x;
+                }
+                if let Some(x) = get_u("brush_radius") {
+                    settings.brush_radius = x;
+                }
+                if let Some(x) = get_u("thermal_iterations") {
+                    settings.thermal_iterations = x;
+                }
+                if let Some(x) = get_f("talus_angle_deg") {
+                    settings.talus_angle_deg = x;
+                }
+                if let Some(x) = get_f("smoothing") {
+                    settings.smoothing = x;
+                }
+                let data = object.terrain.get_or_insert_with(Default::default);
+                data.bake_erosion(seed, resolution, size, height, settings.sanitized());
+                erosion_touched = true;
+            }
+            if let Some(s) = params.get("erosion_strength").and_then(Value::as_f64) {
+                if let Some(e) = object.terrain.as_mut().and_then(|t| t.erosion.as_mut()) {
+                    e.strength = (s as f32).clamp(0.0, 2.0);
+                    erosion_touched = true;
+                }
+            }
+            if let Some(b) = params.get("erosion_enabled").and_then(Value::as_bool) {
+                if let Some(e) = object.terrain.as_mut().and_then(|t| t.erosion.as_mut()) {
+                    e.enabled = b;
+                    erosion_touched = true;
+                }
+            }
+            if params.get("clear_erosion").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    erosion_touched |= data.erosion.take().is_some();
+                }
+            }
+            if erosion_touched {
+                object.mesh_revision += 1; // render/physics caches key on it
+            }
+            // biome coloring: preset name, full settings object, or on/off.
+            // Never bumps mesh_revision — geometry is untouched, the
+            // renderer re-bakes the albedo on its own.
+            if let Some(v) = params.get("terrain_color").filter(|v| !v.is_null()) {
+                let data = object.terrain.get_or_insert_with(Default::default);
+                if let Some(b) = v.as_bool() {
+                    data.color = b.then(modeler_core::terrain::TerrainColor::default);
+                } else if let Some(name) = v.as_str() {
+                    data.color =
+                        Some(modeler_core::terrain::TerrainColor::preset(name).ok_or_else(
+                            || {
+                                format!(
+                                    "unknown terrain_color preset '{name}' \
+                                     (Meadow|Autumn|Desert|Arctic|Volcanic|Alien)"
+                                )
+                            },
+                        )?);
+                } else {
+                    data.color = Some(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| format!("bad 'terrain_color': {e}"))?,
+                    );
+                }
+            }
+            // water table: true/false toggles it, an object sets fields
+            // ({level, shallow, deep, depth_falloff, foam_width, opacity,
+            // roughness, ripple, enabled}; unset fields keep defaults). The
+            // sheet is real geometry, so this remeshes.
+            let mut water_touched = false;
+            if let Some(v) = params.get("water").filter(|v| !v.is_null()) {
+                let data = object.terrain.get_or_insert_with(Default::default);
+                if let Some(b) = v.as_bool() {
+                    match &mut data.water {
+                        Some(water) => water.enabled = b,
+                        None if b => data.water = Some(Default::default()),
+                        None => {}
+                    }
+                } else {
+                    // start from the current settings so partial updates work
+                    let mut base =
+                        serde_json::to_value(data.water.unwrap_or_default())
+                            .unwrap_or_default();
+                    if let (Some(base), Some(patch)) = (base.as_object_mut(), v.as_object())
+                    {
+                        for (k, val) in patch {
+                            base.insert(k.clone(), val.clone());
+                        }
+                    }
+                    data.water = Some(
+                        serde_json::from_value(base)
+                            .map_err(|e| format!("bad 'water': {e}"))?,
+                    );
+                }
+                water_touched = true;
+            }
+            if params.get("clear_water").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    water_touched |= data.water.take().is_some();
+                }
+            }
+            if water_touched {
+                object.mesh_revision += 1;
+            }
+        }
+        // prop parameters (props only)
+        if let Primitive::Prop { kind, seed, size } = object.primitive {
+            let kind = match params.get("prop_kind").and_then(Value::as_str) {
+                Some(name) => modeler_core::PropKind::from_name(name).ok_or_else(|| {
+                    format!("unknown prop_kind '{name}' (rock|conifer|broadleaf|bush)")
+                })?,
+                None => kind,
+            };
+            let sz = params.get("size").and_then(Value::as_f64).map(|v| v as f32);
+            let sd = params.get("seed").and_then(Value::as_u64).map(|v| v as u32);
+            if kind != (if let Primitive::Prop { kind, .. } = object.primitive { kind } else { kind })
+                || sz.is_some()
+                || sd.is_some()
+            {
+                object.primitive = Primitive::Prop {
+                    kind,
+                    seed: sd.unwrap_or(seed),
+                    size: sz.unwrap_or(size).clamp(0.1, 100.0),
                 };
             }
         }
@@ -1194,7 +1512,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|light|sun|spot|camera)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|terrain|rope|cloth|light|sun|spot|camera)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());
@@ -1418,11 +1736,100 @@ fn execute_inner(
             apply_object_params(scene, id, command)?;
             Ok(json!({"object": object_json(scene, scene.object(id).unwrap())}))
         }
+        "scatter_props" => {
+            let id = resolve(scene, &command["object"])?;
+            let mut params = modeler_core::terrain::ScatterParams::default();
+            let get_f = |k: &str| command.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            if let Some(v) = get_f("density") {
+                params.density = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = command.get("seed").and_then(Value::as_u64) {
+                params.seed = v as u32;
+            }
+            if let Some(v) = get_f("cell_size") {
+                params.cell_size = v.max(0.5);
+            }
+            if let Some(v) = get_f("max_slope") {
+                params.max_slope = v;
+            }
+            if let Some(v) = get_f("height_min") {
+                params.height_min = v;
+            }
+            if let Some(v) = get_f("height_max") {
+                params.height_max = v;
+            }
+            if let Some(v) = get_f("scale_min") {
+                params.scale_min = v.max(0.05);
+            }
+            if let Some(v) = get_f("scale_max") {
+                params.scale_max = v.max(params.scale_min);
+            }
+            if let Some(v) = get_f("patchiness") {
+                params.patchiness = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = command.get("spacing").and_then(Value::as_bool) {
+                params.spacing = v;
+            }
+            if let Some(v) = command.get("avoid_paint").and_then(Value::as_bool) {
+                params.avoid_paint = v;
+            }
+            let max = command
+                .get("max")
+                .and_then(Value::as_u64)
+                .unwrap_or(800) as usize;
+            let (root, count) = if let Some(name) =
+                command.get("type").and_then(Value::as_str)
+            {
+                let kind = modeler_core::PropKind::from_name(name).ok_or_else(|| {
+                    format!("unknown prop type '{name}' (rock|conifer|broadleaf|bush)")
+                })?;
+                crate::object_ops::scatter_props(
+                    scene,
+                    id,
+                    crate::object_ops::ScatterSource::Kind(kind),
+                    &params,
+                    max,
+                )?
+            } else if let Some(name) = command.get("asset").and_then(Value::as_str) {
+                let asset = library_doc
+                    .assets()
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .ok_or_else(|| format!("no library asset named '{name}'"))?;
+                crate::object_ops::scatter_props(
+                    scene,
+                    id,
+                    crate::object_ops::ScatterSource::Asset(&asset),
+                    &params,
+                    max,
+                )?
+            } else {
+                return Err(
+                    "scatter_props needs 'type' (rock|conifer|broadleaf|bush) or a \
+                     library 'asset' name"
+                        .into(),
+                );
+            };
+            let name = scene.object(root).map(|o| o.name.clone()).unwrap_or_default();
+            Ok(json!({"count": count, "root": root.0, "root_name": name}))
+        }
         "delete_object" => {
             let id = resolve(scene, &command["object"])?;
-            scene.remove_object(id);
+            // with_children removes the whole subtree (scatter groups,
+            // assemblies); default keeps children, re-rooted
+            let mut removed = 1;
+            if command.get("with_children").and_then(Value::as_bool) == Some(true) {
+                let subtree = scene.subtree(id);
+                removed = subtree.len();
+                for child in subtree {
+                    scene.remove_object(child);
+                }
+            } else {
+                scene.remove_object(id);
+            }
             selection.retain_existing(|i| scene.object(i).is_some());
-            Ok(json!({}))
+            Ok(json!({"removed": removed}))
         }
         "set_parent" => {
             let child = resolve(scene, &command["child"])?;

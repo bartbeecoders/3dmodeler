@@ -26,7 +26,7 @@ enum PieItem {
 
 /// Slot order around the wheel, starting north and going clockwise.
 /// Cube sits on top — it is used the most.
-fn pie_items() -> [(PieItem, &'static str); 12] {
+fn pie_items() -> [(PieItem, &'static str); 13] {
     // catalog: [Plane, Cube, UvSphere, IcoSphere, Cylinder, Cone, Torus, Empty]
     let c = Primitive::catalog();
     [
@@ -37,6 +37,7 @@ fn pie_items() -> [(PieItem, &'static str); 12] {
         (PieItem::Primitive(c[4]), "Cylinder"),
         (PieItem::Primitive(c[6]), "Torus"),
         (PieItem::Primitive(c[0]), "Plane"),
+        (PieItem::Primitive(Primitive::default_terrain()), "Terrain"),
         (PieItem::Rope, "Rope"),
         (PieItem::Cloth, "Cloth"),
         (PieItem::Primitive(c[7]), "Empty"),
@@ -270,6 +271,16 @@ pub fn mesh_menu_buttons(ui: &mut egui::Ui) -> Option<Primitive> {
         .clicked()
     {
         clicked = Some(cloth);
+    }
+    let terrain = Primitive::default_terrain();
+    if pie::icon_menu_button(ui, &pie::primitive_icon(&terrain), "Terrain")
+        .on_hover_text(
+            "Procedural terrain from a noise-layer stack: edit layers, seed \
+             and size in the Data tab; presets included",
+        )
+        .clicked()
+    {
+        clicked = Some(terrain);
     }
     clicked
 }

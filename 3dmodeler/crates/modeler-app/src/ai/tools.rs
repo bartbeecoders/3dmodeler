@@ -43,6 +43,7 @@ WORKFLOW
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Ropes: primitive "rope" (length/radius/segments) is a flexible multi-segment cord. Pin ends with rope_start / rope_end (object name or null) and optional rope_start_point / rope_end_point local points. Ropes always simulate when play runs; hang a weight by anchoring start to a fixed body and end to a dynamic cube.
+- Terrain: primitive "terrain" (size/resolution/height/seed) is a procedural landscape generated from a noise-layer stack. Pick a look with terrain_preset (Hills, Alpine, Dunes, Archipelago, Canyon, Volcanic, Rolling, Craters), change seed for a different variation of the same look, size/height for extent. It stands on z=0 and other objects collide with the surface. Default 100x100 m — scale scene objects accordingly or make the terrain smaller. Place individual landforms with terrain_stamp (mountain/ridge/valley/plateau/crater at an x,y). For realism, bake erosion after shaping: update_object with erode=true (or a preset) carves rain channels and settles scree; erosion_strength blends it. Water: update_object with water=true (or {level: ...}) floods every basin and carved river below the level, with depth tint and shoreline foam. Vegetation: scatter_props places rocks/conifers/broadleaf/bushes (or library assets) standing on the surface, grouped under one root; delete_object with_children removes a set.
 - Cloth: primitive "cloth" (width/height/segments_u/segments_v/stiffness 0..1) is a soft sheet in local XY. Pin grid vertices with cloth_anchors: [{u, v, object, local_point?}]. Default four corners are free; attach top edge to a bar for a hanging curtain. Low stiffness (~0.2) drapes; 1.0 is stiff.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
 
@@ -75,8 +76,23 @@ fn object_properties() -> Value {
         "spot_angle_deg": {"type": "number", "description": "spot lights only, 1..160"},
         "shadows": {"type": "boolean", "description": "lights only"},
         "length": {"type": "number", "description": "walls or ropes, meters"},
-        "height": {"type": "number", "description": "walls or cloth, meters"},
+        "height": {"type": "number", "description": "walls, cloth or terrain (max height), meters"},
         "width": {"type": "number", "description": "cloth only, meters"},
+        "size": {"type": "number", "description": "terrain only: side length, meters"},
+        "resolution": {"type": "integer", "description": "terrain only: grid quads per side 8–512"},
+        "seed": {"type": "integer", "description": "terrain only: world seed (same seed = same terrain)"},
+        "terrain_preset": {"type": "string", "description": "terrain only: replace the layer stack with a named preset (Hills|Alpine|Dunes|Archipelago|Canyon|Volcanic|Rolling|Craters)"},
+        "terrain": {"type": "object", "description": "terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
+        "clear_sculpt": {"type": "boolean", "description": "terrain only: true removes all hand-sculpted brush offsets, restoring the pure procedural surface"},
+        "erode": {"description": "terrain only: bake rain erosion (carved channels + settled scree). true = Natural recipe, or {preset: Lite|Natural|Mountain|Canyon|Heavy Rain|Dry Thermal, droplets?, erosion_rate?, deposition?, capacity?, brush_radius?, thermal_iterations?, talus_angle_deg?, smoothing?}. Non-destructive; re-run after big terrain changes (get_scene reports erosion.stale)"},
+        "erosion_strength": {"type": "number", "description": "terrain only: blend of the baked erosion, 0..2 (1 = as simulated)"},
+        "erosion_enabled": {"type": "boolean", "description": "terrain only: toggle the baked erosion without discarding it"},
+        "clear_erosion": {"type": "boolean", "description": "terrain only: true discards the baked erosion layer"},
+        "terrain_color": {"description": "terrain only: biome coloring by height/slope (grass, rock on steep faces, snow, sand). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (Meadow), false (plain material color), or a full settings object as reported in the terrain stack"},
+        "water": {"description": "terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
+        "clear_water": {"type": "boolean", "description": "terrain only: true removes the water layer entirely"},
+        "terrain_stamp": {"type": "object", "description": "terrain only: append ONE landform layer without resending the stack: {shape: mountain|ridge|valley|plateau|crater, x, y (terrain-local meters, 0,0 = center), radius? (default 25), rotation_deg?, aspect?, falloff? 0..1, detail? 0..1, amount? 0..2, blend? add|subtract|multiply|max|min|replace|carve|flatten}. Valleys default to carve; repeat to stack landforms"},
+        "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "props only: retype a nature prop"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},
@@ -121,8 +137,9 @@ pub fn catalog() -> Vec<ToolSpec> {
     add_properties["primitive"] = json!({
         "type": "string",
         "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus",
-                 "wall", "floor", "empty", "rope", "cloth", "light", "sun", "spot"],
-        "description": "what to add ('light' = point light; 'rope'/'cloth' = soft physics)"
+                 "wall", "floor", "empty", "terrain", "rock", "conifer", "broadleaf", "bush",
+                 "rope", "cloth", "light", "sun", "spot"],
+        "description": "what to add ('light' = point light; 'rope'/'cloth' = soft physics; 'terrain' = procedural landscape; 'rock'/'conifer'/'broadleaf'/'bush' = nature props)"
     });
     let mut update_properties = object_properties();
     update_properties["object"] = object_ref("object name or id");
@@ -142,8 +159,33 @@ pub fn catalog() -> Vec<ToolSpec> {
         tool("update_object", "Change any properties of an object.", update_properties, &["object"]),
         tool(
             "delete_object",
-            "Remove an object (children survive, re-rooted).",
-            json!({"object": object_ref("object name or id")}),
+            "Remove an object. with_children=true removes the whole subtree (scatter groups, assemblies); default keeps children, re-rooted.",
+            json!({
+                "object": object_ref("object name or id"),
+                "with_children": {"type": "boolean", "description": "true = delete the object and every descendant"}
+            }),
+            &["object"],
+        ),
+        tool(
+            "scatter_props",
+            "Scatter nature props (or copies of a library asset) over a terrain: deterministic placements standing on the surface, grouped under one root parented to the terrain (delete_object with_children on the returned root removes the set). Rules: density 0..1, max_slope, height band, scale range, patchiness clusters, spacing keeps props apart, avoid_paint skips painted rock/snow/sand ground.",
+            json!({
+                "object": object_ref("the terrain, by name or id"),
+                "type": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "built-in prop to scatter (or use 'asset')"},
+                "asset": {"type": "string", "description": "library asset name to stamp copies of (capped at 300)"},
+                "density": {"type": "number", "description": "0..1 acceptance per candidate (default 0.5)"},
+                "seed": {"type": "integer", "description": "scatter seed — same seed re-places identically"},
+                "cell_size": {"type": "number", "description": "candidate spacing in meters (default 6)"},
+                "max_slope": {"type": "number", "description": "reject steeper ground (rise/run, default 0.7)"},
+                "height_min": {"type": "number", "description": "meters above the base plane"},
+                "height_max": {"type": "number"},
+                "scale_min": {"type": "number", "description": "per-prop scale range (default 0.8..1.4)"},
+                "scale_max": {"type": "number"},
+                "patchiness": {"type": "number", "description": "0 even .. 1 strongly clustered (default 0.5)"},
+                "spacing": {"type": "boolean", "description": "local-max anti-clumping (default true)"},
+                "avoid_paint": {"type": "boolean", "description": "skip hand-painted rock/cliff/snow/sand (default true)"},
+                "max": {"type": "integer", "description": "placement cap (default 800, max 2000)"}
+            }),
             &["object"],
         ),
         tool(
@@ -290,6 +332,24 @@ pub fn catalog() -> Vec<ToolSpec> {
             &[],
         ),
         tool("get_library", "List the reusable asset library.", json!({}), &[]),
+        tool(
+            "list_pbr",
+            "List the locally imported PBR materials (id, name, category, texture maps). Apply one with apply_pbr.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "apply_pbr",
+            "Apply a locally imported PBR material (see list_pbr) to objects — terrains included. Makes each target's material unique first.",
+            json!({
+                "material": {"type": "string", "description": "material id or name from list_pbr"},
+                "object": object_ref("target object"),
+                "objects": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "several targets (defaults to the selection when omitted)"},
+                "uv_scale": {"description": "texture repeats per UV unit: number (uniform) or [u, v]"},
+                "uv_rotation": {"type": "number", "description": "UV rotation in degrees"}
+            }),
+            &["material"],
+        ),
         tool(
             "create_library_object",
             "Capture objects (with children) as a reusable library asset.",
@@ -499,7 +559,8 @@ mod tests {
         let mcp_commands = [
             "get_scene", "new_scene", "add_object", "update_object", "delete_object",
             "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
-            "add_roof", "break_into_bricks", "break_into_balls", "boolean_objects", "add_modifier",
+            "add_roof", "scatter_props", "break_into_bricks", "break_into_balls",
+            "boolean_objects", "add_modifier",
             "update_modifier", "remove_modifier", "apply_modifiers", "add_measurement",
             "simulate", "set_view",
             "screenshot",
@@ -507,6 +568,7 @@ mod tests {
             "calibrate_reference_image", "add_image_marker", "update_image_marker",
             "delete_image_marker", "get_library", "create_library_object",
             "update_library_object", "delete_library_object", "place_library_object",
+            "list_pbr", "apply_pbr",
         ];
         let catalog = catalog();
         for command in mcp_commands {
