@@ -18,6 +18,7 @@ mod control;
 mod camera;
 mod camera_render;
 mod context_menu;
+mod dock;
 #[cfg(not(target_arch = "wasm32"))]
 mod render_preview;
 mod cutout_handles;

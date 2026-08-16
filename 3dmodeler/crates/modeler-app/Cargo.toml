@@ -31,6 +31,7 @@ serde_json = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 hayro = "0.7" # pure-Rust PDF rasterizer: reference setup imports plan-set PDFs
+egui_dock = { version = "0.19.1", features = ["serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # winit 0.30, not 0.28: wgpu 26 needs raw-window-handle 0.6 and winit 0.28

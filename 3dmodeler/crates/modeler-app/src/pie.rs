@@ -59,8 +59,6 @@ pub enum PieIcon {
     Modifier,
     /// Properties tab: physics (falling ball).
     Physics,
-    /// Properties tab: PBR material library (texture swatches).
-    PbrLibrary,
 }
 
 /// The icon matching a primitive (shared by the pie and the Add dropdown).
@@ -428,16 +426,6 @@ pub fn draw_icon(
             painter.circle_filled(p(-0.25, -0.3), 0.22 * s, stroke.color);
             painter.line_segment([p(0.15, -0.55), p(0.55, -0.15)], stroke);
             painter.line_segment([p(0.05, -0.2), p(0.65, 0.05)], stroke);
-        }
-        // PBR library: 2×2 texture swatches
-        PieIcon::PbrLibrary => {
-            let half = 0.45 * s;
-            let gap = 0.12 * s;
-            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let center = p(dx * (half + gap) * 0.55, dy * (half + gap) * 0.55);
-                let r = egui::Rect::from_center_size(center, egui::vec2(half, half));
-                painter.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Middle);
-            }
         }
         // Rope: hanging catenary with thickness ticks
         PieIcon::Rope => {

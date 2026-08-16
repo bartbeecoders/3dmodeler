@@ -265,15 +265,6 @@ impl Tab {
         }
     }
 
-    /// Short label for the narrow properties-panel tab strip.
-    fn short_label(self) -> &'static str {
-        match self {
-            Self::Sources => "Src",
-            Self::AmbientCg => "aCG",
-            Self::PolyHaven => "PH",
-            Self::Local => "Loc",
-        }
-    }
 }
 
 pub struct PbrLibraryPanel {
@@ -528,23 +519,19 @@ impl PbrLibraryPanel {
         }
     }
 
-    /// Collection picker UI (Properties → PBR Library tab).
+    /// Collection picker UI (the dockable "PBR Library" panel).
     pub fn section(
         &mut self,
         ui: &mut egui::Ui,
         scene: &Scene,
         selection: &Selection,
     ) {
-        // Compact tab strip — short labels so all four fit inside the capped
-        // sidebar width (long names used to overflow the clip rect and become
-        // unclickable while still painting).
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for tab in [Tab::Sources, Tab::AmbientCg, Tab::PolyHaven, Tab::Local] {
                 let selected = self.tab == tab;
                 if ui
-                    .selectable_label(selected, tab.short_label())
-                    .on_hover_text(tab.label())
+                    .selectable_label(selected, tab.label())
                     .clicked()
                 {
                     self.tab = tab;
@@ -624,10 +611,10 @@ impl PbrLibraryPanel {
             .size(11.0),
         );
         ui.add_space(4.0);
-        // Keep the list short and scrollable so Sources never blows the panel.
+        // Scrollable so Sources never blows the panel.
         egui::ScrollArea::vertical()
             .id_salt("pbr-sources-scroll")
-            .max_height(280.0)
+            .max_height(ui.available_height().max(280.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for src in PBR_SOURCES {
@@ -772,8 +759,8 @@ impl PbrLibraryPanel {
         );
 
         let has_sel = !selection.is_empty();
-        // Bound height to leftover space so the panel stays a normal sidebar.
-        let list_h = ui.available_height().clamp(140.0, 320.0);
+        // Fill the leftover panel height (the dock tab bounds it).
+        let list_h = ui.available_height().max(140.0);
         egui::ScrollArea::vertical()
             .id_salt(format!("pbr-scroll-{source}"))
             .max_height(list_h)

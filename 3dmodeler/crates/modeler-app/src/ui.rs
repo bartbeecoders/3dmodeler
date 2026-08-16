@@ -1,11 +1,13 @@
-//! Blender-style editor UI: top menu bar, outliner, properties sidebar
-//! (N panel), bottom status bar and the keymap overlay.
+//! Blender-style editor UI: top menu bar, dockable panels (outliner,
+//! library, properties, PBR library, AI chat — see dock.rs), bottom status
+//! bar and the keymap overlay. N hides/shows all panels.
 //!
 //! Menus are hand-rolled egui Areas rather than `menu_button` — the built-in
 //! popups misbehave inside the deprecated panel API (see plan.md, Phase 3).
 
 use crate::camera::BlenderCamera;
 use crate::context_menu::ContextMenu;
+use crate::dock::{DockLayout, PanelId};
 use crate::edit_mode::{EditMode, SelectMode};
 use crate::library::LibraryPanel;
 use crate::pbr_library::PbrLibraryPanel;
@@ -127,6 +129,8 @@ pub struct UiState {
     pub pbr_library_panel: PbrLibraryPanel,
     pub context_menu: ContextMenu,
     pub chat_panel: crate::ai::ChatPanel,
+    /// Dockable panel arrangement (tab groups, splits, floating windows).
+    pub dock: DockLayout,
     applied_theme: Option<Theme>,
     #[cfg(target_arch = "wasm32")]
     save_as_open: bool,
@@ -197,6 +201,7 @@ impl UiState {
             pbr_library_panel: PbrLibraryPanel::new(),
             context_menu: ContextMenu::new(),
             chat_panel: crate::ai::ChatPanel::new(),
+            dock: DockLayout::load(),
             applied_theme: None,
             #[cfg(target_arch = "wasm32")]
             save_as_open: false,
@@ -205,8 +210,8 @@ impl UiState {
         }
     }
 
-    /// Non-egui inputs: N toggles the sidebar, clicks into the viewport close
-    /// any open menu.
+    /// Non-egui inputs: N toggles all dock panels, clicks into the viewport
+    /// close any open menu.
     pub fn handle_events(
         &mut self,
         events: &mut [Event],
@@ -343,19 +348,40 @@ impl UiState {
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
                 snap_to_vertex, shade_mode, xray, edit,
             );
-        let bottom_offset = self.status_bar(
+        let chrome_bottom = self.status_bar(
             ctx, scene, physics, measure, calibrate, marker_tool, snap_to_grid, settings,
             modal_status, fps, mcp,
         );
-        let right_offset = if self.show_sidebar {
-            self.sidebar(
+        // menu/toolbar toggles flip `chat_panel.open`; mirror that into the
+        // dock (open/close the AI tab) before drawing, and mirror tab closes
+        // back into the flag afterwards
+        if self.chat_panel.open != self.dock.is_open(PanelId::AiChat) {
+            self.dock.set_open(PanelId::AiChat, self.chat_panel.open);
+        }
+        let viewport_rect = if self.show_sidebar {
+            self.dock_panels(
                 ctx, scene, selection, settings, calibrate, marker_tool, library, edit_point,
-                sculpt_tool,
+                sculpt_tool, chat,
             )
         } else {
-            0.0
+            None
         };
-        let left_offset = self.chat_panel.ui(ctx, chat, settings);
+        self.chat_panel.open = self.dock.is_open(PanelId::AiChat);
+        self.dock.save_if_changed(ctx);
+        // the viewport is the dock's (transparent) viewport tab; overlays and
+        // pointer tests use its distance from each window edge. With panels
+        // hidden (N) — or the viewport tab buried behind another tab — only
+        // the fixed chrome bounds the viewport.
+        let screen = ctx.content_rect();
+        let (top_offset, right_offset, bottom_offset, left_offset) = match viewport_rect {
+            Some(rect) => (
+                (rect.top() - screen.top()).max(0.0),
+                (screen.right() - rect.right()).max(0.0),
+                (screen.bottom() - rect.bottom()).max(0.0),
+                (rect.left() - screen.left()).max(0.0),
+            ),
+            None => (top_offset, 0.0, chrome_bottom, 0.0),
+        };
         self.keymap_window(ctx);
         self.about_window(ctx);
         #[cfg(target_arch = "wasm32")]
@@ -482,6 +508,7 @@ impl UiState {
                                     ui, camera, scene, selection, settings, snap_to_grid,
                                     shade_mode, xray,
                                     &mut self.chat_panel.open,
+                                    &mut self.dock,
                                 ),
                                 Menu::Help => {
                                     let mut close = false;
@@ -1194,7 +1221,7 @@ impl UiState {
                     SimState::Stopped => match modal_status {
                         // every modal status carries its own confirm/cancel hint
                         Some(status) => status.clone(),
-                        None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Sidebar"
+                        None => "LMB Select · MMB Orbit · Shift+A Add · G/R/S Transform · N Panels"
                             .to_string(),
                     },
                 }
@@ -1282,129 +1309,49 @@ impl UiState {
 
     // --- sidebar: outliner + properties -----------------------------------
 
-    fn sidebar(
+    /// The dockable panel area between the fixed chrome (menu/toolbar above,
+    /// status bar below). Returns the viewport tab's body rect in screen
+    /// coordinates — `None` while the viewport tab is hidden behind another
+    /// tab stacked over it.
+    #[allow(clippy::too_many_arguments)]
+    fn dock_panels(
         &mut self,
         ctx: &egui::Context,
         scene: &mut Scene,
         selection: &mut Selection,
-        settings: &Settings,
+        settings: &mut Settings,
         calibrate: &mut CalibrateTool,
         marker_tool: &mut MarkerTool,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
         sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
-    ) -> f32 {
-        #[allow(deprecated)]
-        let response = egui::Panel::right("sidebar")
-            .default_size(280.0)
-            .min_width(240.0)
-            // Hard cap: PBR grids and long labels must not expand the panel
-            // across the whole window (egui grows panels to fit min content).
-            .max_width(340.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                // Clamp content width so children can't push preferred size past max.
-                let panel_w = ui.available_width().min(340.0);
-                ui.set_max_width(panel_w);
-                ui.horizontal(|ui| {
-                    theme::section_header(ui, "Outliner");
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui
-                                .small_button("+ 📂")
-                                .on_hover_text(
-                                    "New folder — drag outliner objects onto it",
-                                )
-                                .clicked()
-                            {
-                                let id = scene.add_folder("Folder");
-                                let name = scene
-                                    .folder(id)
-                                    .map(|f| f.name.clone())
-                                    .unwrap_or_default();
-                                self.rename_folder = Some((id, name));
-                                self.rename_needs_focus = true;
-                            }
-                        },
-                    );
-                });
-                egui::ScrollArea::vertical()
-                    .id_salt("outliner-scroll")
-                    .max_height(320.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        self.outliner(ui, scene, selection);
-                    });
-                ui.separator();
-                if let Some(message) = self.library_panel.section(ui, library) {
-                    self.status_message = Some(message);
-                }
-                ui.separator();
-                if !scene.reference_images().is_empty() {
-                    ui.horizontal(|ui| {
-                        // bulk eye: show/hide every reference image at once
-                        // (same ●/○ language as the per-image and folder rows)
-                        let all_visible =
-                            scene.reference_images().iter().all(|r| r.visible);
-                        let eye = if all_visible { "●" } else { "○" };
-                        if ui
-                            .small_button(eye)
-                            .on_hover_text(if all_visible {
-                                "Hide all reference images"
-                            } else {
-                                "Show all reference images"
-                            })
-                            .clicked()
-                        {
-                            let show = !all_visible;
-                            let ids: Vec<u64> =
-                                scene.reference_images().iter().map(|r| r.id).collect();
-                            for id in ids {
-                                if let Some(image) = scene.reference_image_mut(id) {
-                                    image.visible = show;
-                                }
-                            }
-                        }
-                        theme::section_header(ui, "Reference Images");
-                    });
-                    reference_image_rows(ui, scene, selection, settings, calibrate, marker_tool);
-                    ui.separator();
-                }
-                if !scene.measurements().is_empty() {
-                    theme::section_header(ui, "Measurements");
-                    let mut remove: Option<usize> = None;
-                    for (i, m) in scene.measurements().iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✖").on_hover_text("Delete measurement").clicked() {
-                                remove = Some(i);
-                            }
-                            ui.label(settings.unit.format(m.length()));
-                        });
-                    }
-                    if let Some(i) = remove {
-                        scene.remove_measurement(i);
-                    }
-                    ui.separator();
-                }
-                if let Some(message) = properties(
-                    ui,
-                    scene,
-                    selection,
-                    settings,
-                    edit_point,
-                    &mut self.break_dialog,
-                    &mut self.properties_tab,
-                    &mut self.pbr_library_panel,
-                    &mut self.pick_boolean_tool,
-                    sculpt_tool,
-                    &mut self.scatter_kind,
-                    &mut self.scatter_params,
-                ) {
-                    self.status_message = Some(message);
-                }
-            });
-        response.response.rect.width()
+        chat: &mut crate::ai::ChatSession,
+    ) -> Option<egui::Rect> {
+        // move the dock tree out so the viewer can borrow the rest of self
+        let mut dock_state = self.dock.state.take()?;
+        let mut viewer = PanelViewer {
+            state: self,
+            scene,
+            selection,
+            settings,
+            calibrate,
+            marker_tool,
+            library,
+            edit_point,
+            sculpt_tool,
+            chat,
+            viewport_rect: None,
+        };
+        #[allow(deprecated)] // DockArea::show — there is no root Ui to show_inside
+        egui_dock::DockArea::new(&mut dock_state)
+            .id(egui::Id::new("panel-dock"))
+            .show_add_buttons(false)
+            .show_leaf_close_all_buttons(false)
+            .show_leaf_collapse_buttons(false)
+            .show(ctx, &mut viewer);
+        let viewport_rect = viewer.viewport_rect;
+        self.dock.state = Some(dock_state);
+        viewport_rect
     }
 
     fn outliner(&mut self, ui: &mut egui::Ui, scene: &mut Scene, selection: &mut Selection) {
@@ -2633,6 +2580,189 @@ fn set_selected_smooth(scene: &mut Scene, selection: &Selection, smooth: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
+// --- dockable panels ---------------------------------------------------------
+
+/// Borrows everything the panel bodies need for one frame of the dock area.
+struct PanelViewer<'a> {
+    state: &'a mut UiState,
+    scene: &'a mut Scene,
+    selection: &'a mut Selection,
+    settings: &'a mut Settings,
+    calibrate: &'a mut CalibrateTool,
+    marker_tool: &'a mut MarkerTool,
+    library: &'a mut Library,
+    edit_point: Option<(ObjectId, Vec3)>,
+    sculpt_tool: &'a mut crate::terrain_sculpt::SculptTool,
+    chat: &'a mut crate::ai::ChatSession,
+    /// Screen rect of the viewport tab's body, recorded when it draws.
+    viewport_rect: Option<egui::Rect>,
+}
+
+impl PanelViewer<'_> {
+    /// Scene contents: the outliner tree plus the reference-image and
+    /// measurement lists (shown only when non-empty, as before).
+    fn outliner_panel(&mut self, ui: &mut egui::Ui) {
+        let scene = &mut *self.scene;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("+ 📂")
+                    .on_hover_text("New folder — drag outliner objects onto it")
+                    .clicked()
+                {
+                    let id = scene.add_folder("Folder");
+                    let name = scene.folder(id).map(|f| f.name.clone()).unwrap_or_default();
+                    self.state.rename_folder = Some((id, name));
+                    self.state.rename_needs_focus = true;
+                }
+            });
+        });
+        self.state.outliner(ui, scene, self.selection);
+        if !scene.reference_images().is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                // bulk eye: show/hide every reference image at once
+                // (same ●/○ language as the per-image and folder rows)
+                let all_visible = scene.reference_images().iter().all(|r| r.visible);
+                let eye = if all_visible { "●" } else { "○" };
+                if ui
+                    .small_button(eye)
+                    .on_hover_text(if all_visible {
+                        "Hide all reference images"
+                    } else {
+                        "Show all reference images"
+                    })
+                    .clicked()
+                {
+                    let show = !all_visible;
+                    let ids: Vec<u64> = scene.reference_images().iter().map(|r| r.id).collect();
+                    for id in ids {
+                        if let Some(image) = scene.reference_image_mut(id) {
+                            image.visible = show;
+                        }
+                    }
+                }
+                theme::section_header(ui, "Reference Images");
+            });
+            reference_image_rows(
+                ui,
+                scene,
+                self.selection,
+                self.settings,
+                self.calibrate,
+                self.marker_tool,
+            );
+        }
+        if !scene.measurements().is_empty() {
+            ui.separator();
+            theme::section_header(ui, "Measurements");
+            let mut remove: Option<usize> = None;
+            for (i, m) in scene.measurements().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Delete measurement")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    ui.label(self.settings.unit.format(m.length()));
+                });
+            }
+            if let Some(i) = remove {
+                scene.remove_measurement(i);
+            }
+        }
+    }
+}
+
+impl egui_dock::TabViewer for PanelViewer<'_> {
+    type Tab = PanelId;
+
+    fn title(&mut self, tab: &mut PanelId) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut PanelId) {
+        match tab {
+            PanelId::Viewport => {
+                // the 3D scene renders under egui — this tab is just the
+                // transparent hole it shows through; record where it is
+                self.viewport_rect = Some(ui.max_rect());
+            }
+            PanelId::Outliner => self.outliner_panel(ui),
+            PanelId::Library => {
+                if let Some(message) = self.state.library_panel.section(ui, self.library) {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::Properties => {
+                if let Some(message) = properties(
+                    ui,
+                    self.scene,
+                    self.selection,
+                    self.settings,
+                    self.edit_point,
+                    &mut self.state.break_dialog,
+                    &mut self.state.properties_tab,
+                    &mut self.state.pick_boolean_tool,
+                    self.sculpt_tool,
+                    &mut self.state.scatter_kind,
+                    &mut self.state.scatter_params,
+                ) {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::PbrLibrary => {
+                self.state
+                    .pbr_library_panel
+                    .section(ui, self.scene, self.selection);
+                if let Some(message) = self.state.pbr_library_panel.take_status() {
+                    self.state.status_message = Some(message);
+                }
+            }
+            PanelId::AiChat => self.state.chat_panel.section(ui, self.chat, self.settings),
+        }
+    }
+
+    fn is_closeable(&self, tab: &PanelId) -> bool {
+        *tab != PanelId::Viewport
+    }
+
+    fn allowed_in_windows(&self, tab: &mut PanelId) -> bool {
+        // the viewport stays on the main surface: a floating viewport would
+        // leave no docked hole to see the scene through
+        *tab != PanelId::Viewport
+    }
+
+    fn clear_background(&self, tab: &PanelId) -> bool {
+        *tab != PanelId::Viewport
+    }
+
+    fn scroll_bars(&self, tab: &PanelId) -> [bool; 2] {
+        match tab {
+            // chat lays out bottom-up and the PBR grids size themselves to
+            // the panel — both need the real (finite) body height
+            PanelId::Viewport | PanelId::AiChat | PanelId::PbrLibrary => [false, false],
+            _ => [false, true],
+        }
+    }
+
+    fn tab_style_override(
+        &self,
+        tab: &PanelId,
+        global_style: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        (*tab == PanelId::Viewport).then(|| {
+            let mut style = global_style.clone();
+            // viewport body flush with the node edges: overlays and pointer
+            // math treat the body rect as the exact viewport bounds
+            style.tab_body.inner_margin = egui::Margin::ZERO;
+            style
+        })
+    }
+}
+
 fn view_menu(
     ui: &mut egui::Ui,
     camera: &mut BlenderCamera,
@@ -2643,6 +2773,7 @@ fn view_menu(
     shade_mode: &mut ShadeMode,
     xray: &mut bool,
     chat_open: &mut bool,
+    dock: &mut DockLayout,
 ) -> bool {
     let mut close = false;
     if ui
@@ -2651,6 +2782,25 @@ fn view_menu(
         .clicked()
     {
         *chat_open = !*chat_open;
+        close = true;
+    }
+    ui.separator();
+    ui.label(egui::RichText::new("Panels").weak().size(11.0));
+    for panel in PanelId::CLOSABLE {
+        if panel == PanelId::AiChat {
+            continue; // toggled above as "AI Assistant"
+        }
+        let mut open = dock.is_open(panel);
+        if ui.checkbox(&mut open, panel.title()).clicked() {
+            dock.set_open(panel, open);
+        }
+    }
+    if ui
+        .button("Reset panel layout")
+        .on_hover_text("Restore the default panel arrangement")
+        .clicked()
+    {
+        dock.reset();
         close = true;
     }
     ui.separator();
@@ -3190,7 +3340,6 @@ enum PropertiesTab {
     Data,
     Modifiers,
     Material,
-    PbrLibrary,
     Physics,
 }
 
@@ -3201,7 +3350,6 @@ impl PropertiesTab {
             Self::Data => "Object Data",
             Self::Modifiers => "Modifiers",
             Self::Material => "Material",
-            Self::PbrLibrary => "PBR Library",
             Self::Physics => "Physics",
         }
     }
@@ -3213,7 +3361,6 @@ impl PropertiesTab {
             Self::Data => PieIcon::Data,
             Self::Modifiers => PieIcon::Modifier,
             Self::Material => PieIcon::MaterialColor,
-            Self::PbrLibrary => PieIcon::PbrLibrary,
             Self::Physics => PieIcon::Physics,
         }
     }
@@ -3224,7 +3371,6 @@ impl PropertiesTab {
             Self::Data => "Primitive / mesh / light parameters",
             Self::Modifiers => "Modifier stack (subdivision, boolean)",
             Self::Material => "PBR material, masters, world effects & MPC",
-            Self::PbrLibrary => "Browse free PBR collections (ambientCG, Poly Haven)",
             Self::Physics => "Dynamic body, density, bounciness, initial force",
         }
     }
@@ -3492,19 +3638,16 @@ fn properties(
     edit_point: Option<(ObjectId, Vec3)>,
     break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
     tab: &mut PropertiesTab,
-    pbr_library: &mut PbrLibraryPanel,
     pick_boolean_tool: &mut Option<(ObjectId, usize)>,
     sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
     scatter_kind: &mut modeler_core::PropKind,
     scatter_params: &mut modeler_core::terrain::ScatterParams,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
-        // PBR library can be browsed without a selection (Apply still needs one).
         theme::section_header(ui, "Properties");
-        let available = [PropertiesTab::PbrLibrary];
-        properties_tab_bar(ui, tab, &available);
-        pbr_library.section(ui, scene, selection);
-        return pbr_library.take_status();
+        ui.add_space(4.0);
+        ui.weak("Select an object to edit its properties.");
+        return None;
     };
     let Some(object) = scene.object(active_id) else {
         return None;
@@ -3552,11 +3695,7 @@ fn properties(
     if solid {
         available.push(PropertiesTab::Modifiers);
         available.push(PropertiesTab::Material);
-        available.push(PropertiesTab::PbrLibrary);
         available.push(PropertiesTab::Physics);
-    } else {
-        // Still allow browsing the free PBR collections on gizmos.
-        available.push(PropertiesTab::PbrLibrary);
     }
     properties_tab_bar(ui, tab, &available);
 
@@ -4442,13 +4581,6 @@ fn properties(
             });
             if mpc_dirty {
                 scene.set_mpc(mpc);
-            }
-        }
-
-        PropertiesTab::PbrLibrary => {
-            pbr_library.section(ui, scene, selection);
-            if let Some(message) = pbr_library.take_status() {
-                return Some(message);
             }
         }
 
