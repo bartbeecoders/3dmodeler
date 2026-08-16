@@ -226,7 +226,10 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                         t.erosion_stale(seed, resolution, size, height)
                     }),
                 })),
-            // water table (set with water, remove with clear_water)
+            // water table (set with water, remove with clear_water).
+            // simulate mirrors the object's physics flag: on a terrain it
+            // arms wave animation + buoyancy during playback instead of
+            // making the ground dynamic (set via dynamic=true).
             "water": object
                 .terrain
                 .as_ref()
@@ -235,6 +238,8 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                     "enabled": w.enabled,
                     "level": w.level,
                     "opacity": w.opacity,
+                    "simulate": object.dynamic,
+                    "waves": serde_json::to_value(w.waves).unwrap_or(Value::Null),
                 })),
             // the full stack (round-trippable through update_object {terrain: ...})
             "layers": object

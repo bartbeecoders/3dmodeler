@@ -558,6 +558,7 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             sculpt_revision: 0,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
+            water_time: None,
         });
         name_to_id.insert(&imported.name, id);
         new_ids.push(id);

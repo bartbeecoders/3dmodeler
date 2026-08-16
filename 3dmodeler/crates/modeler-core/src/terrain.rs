@@ -1264,8 +1264,12 @@ pub struct WaterLayer {
     pub opacity: f32,
     /// Micro-roughness: low values give mirror-like reflections.
     pub roughness: f32,
-    /// Static ripple amplitude in meters (0 = glass flat).
+    /// Static ripple amplitude in meters (0 = glass flat). Used while the
+    /// simulation is stopped; playback animates the wave field instead.
     pub ripple: f32,
+    /// Gerstner wave parameters for the physics-play water simulation
+    /// (a terrain with its physics flag set animates these while ▶).
+    pub waves: crate::water::WaveParams,
 }
 
 impl Default for WaterLayer {
@@ -1280,6 +1284,7 @@ impl Default for WaterLayer {
             opacity: 0.55,
             roughness: 0.08,
             ripple: 0.06,
+            waves: crate::water::WaveParams::default(),
         }
     }
 }
@@ -2174,6 +2179,21 @@ pub fn generate_mesh_ex(
     seed: u32,
     include_water: bool,
 ) -> MeshData {
+    generate_mesh_at(data, size, resolution, height, seed, include_water, None)
+}
+
+/// [`generate_mesh_ex`] at a simulation time: `Some(t)` animates the water
+/// sheet with the layer's Gerstner wave field (physics playback); `None`
+/// keeps the static rippled surface.
+pub fn generate_mesh_at(
+    data: &TerrainData,
+    size: f32,
+    resolution: u32,
+    height: f32,
+    seed: u32,
+    include_water: bool,
+    water_time: Option<f32>,
+) -> MeshData {
     let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize;
     let n = res + 1;
     let step = size / res as f32;
@@ -2220,7 +2240,7 @@ pub fn generate_mesh_ex(
     }
     if include_water {
         if let Some(water) = data.water.filter(|w| w.enabled) {
-            append_water_surface(&mut mesh, &heights, &water, size, res, seed);
+            append_water_surface(&mut mesh, &heights, &water, size, res, seed, water_time);
         }
     }
     mesh
@@ -2237,6 +2257,7 @@ fn append_water_surface(
     size: f32,
     res: usize,
     seed: u32,
+    water_time: Option<f32>,
 ) {
     let n = res + 1;
     let wet = |ix: usize, iy: usize| heights[iy * n + ix] < water.level;
@@ -2261,6 +2282,9 @@ fn append_water_surface(
         let b = vnoise_d(p / 1.1, seed.wrapping_add(0x0aa2)).0;
         water.level + (a + 0.5 * b) * (water.ripple / 1.5)
     };
+    // simulation playback: the static ripple gives way to the travelling
+    // Gerstner field (see water.rs)
+    let wave_set = water_time.map(|_| crate::water::WaveSet::new(&water.waves, seed));
 
     // emit only the vertices wet cells actually reference
     let mut remap: Vec<u32> = vec![u32::MAX; n * n];
@@ -2271,15 +2295,27 @@ fn append_water_surface(
         }
         let x = (ix as f32 / res as f32 - 0.5) * size;
         let y = (iy as f32 / res as f32 - 0.5) * size;
-        let z = ripple_z(ix, iy);
-        // ripple slope for the normal (finite differences on the noise)
-        let step = size / res as f32;
-        let dzdx = (ripple_z((ix + 1).min(res), iy) - ripple_z(ix.saturating_sub(1), iy))
-            / (2.0 * step);
-        let dzdy = (ripple_z(ix, (iy + 1).min(res)) - ripple_z(ix, iy.saturating_sub(1)))
-            / (2.0 * step);
-        mesh.positions.push(Vec3::new(x, y, z));
-        mesh.normals.push(Vec3::new(-dzdx, -dzdy, 1.0).normalize());
+        let (position, normal) = match (&wave_set, water_time) {
+            (Some(set), Some(t)) => {
+                // trochoid: crests pull vertices horizontally too
+                let (offset, normal) = set.displace(Vec2::new(x, y), t);
+                (Vec3::new(x, y, water.level) + offset, normal)
+            }
+            _ => {
+                let z = ripple_z(ix, iy);
+                // ripple slope for the normal (finite differences)
+                let step = size / res as f32;
+                let dzdx = (ripple_z((ix + 1).min(res), iy)
+                    - ripple_z(ix.saturating_sub(1), iy))
+                    / (2.0 * step);
+                let dzdy = (ripple_z(ix, (iy + 1).min(res))
+                    - ripple_z(ix, iy.saturating_sub(1)))
+                    / (2.0 * step);
+                (Vec3::new(x, y, z), Vec3::new(-dzdx, -dzdy, 1.0).normalize())
+            }
+        };
+        mesh.positions.push(position);
+        mesh.normals.push(normal);
         mesh.uvs.push(Vec2::new(ix as f32 / res as f32, iy as f32 / res as f32));
         let index = mesh.positions.len() as u32 - 1;
         remap[slot] = index;

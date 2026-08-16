@@ -172,6 +172,37 @@ struct BodyEntry {
     bounciness: f32,
 }
 
+/// One water-sim terrain's wave field while playing: the physics flag on a
+/// terrain means "simulate the water", so the terrain stays a static
+/// collider and this drives the surface animation plus buoyancy. The
+/// terrain's translation is honored; rotation/scale are not (waves are
+/// evaluated in the terrain's unscaled local frame).
+struct WaterVolume {
+    object_id: ObjectId,
+    /// Terrain world translation at play.
+    origin: Vec3,
+    /// Half of the terrain's side length (footprint bound).
+    half: f32,
+    /// Water level above the terrain's base plane, local meters.
+    level: f32,
+    waves: modeler_core::water::WaveSet,
+}
+
+/// Buoyancy inputs for one dynamic body, frozen at play.
+struct BuoyBody {
+    id: ObjectId,
+    /// Bounding-sphere radius (world units) — the submersion probe.
+    radius: f32,
+    /// Body density relative to water (= 1.0). Lighter floats, denser sinks.
+    density: f32,
+}
+
+/// Water density in the app's (box3d-relative) density units: the default
+/// object density is 1.0, so 1.0 = neutral buoyancy when fully submerged.
+const WATER_DENSITY: f32 = 1.0;
+/// Linear drag factor for submerged bodies (per unit submerged fraction).
+const WATER_DRAG: f32 = 1.4;
+
 /// Simulated rope: a chain of segment bodies + distance joints, not a
 /// single mirrored body. Segment positions drive `Object::rope_nodes`.
 struct RopeSim {
@@ -277,6 +308,14 @@ pub struct PhysicsMirror {
     /// Rope design lengths at play; restored on stop so sim never shortens
     /// a sagging cord to its current span.
     rope_length_snapshot: Vec<(ObjectId, f32)>,
+    /// Water-sim terrains this run (physics flag + water enabled): wave
+    /// fields for the buoyancy pass and the per-frame surface animation.
+    water_volumes: Vec<WaterVolume>,
+    /// Per-body buoyancy inputs, frozen at play like `sim_order`.
+    buoy_bodies: Vec<BuoyBody>,
+    /// Simulated seconds since play — the wave clock (FIXED_DT per step,
+    /// so a paused sim resumes with the surface exactly where it was).
+    sim_time: f32,
     accumulator: f32,
     /// Solver substeps for this world; lowered on heavy scenes at play.
     substeps: i32,
@@ -304,6 +343,9 @@ impl PhysicsMirror {
                 ground_plane: true,
                 snapshot: Vec::new(),
                 rope_length_snapshot: Vec::new(),
+                water_volumes: Vec::new(),
+                buoy_bodies: Vec::new(),
+                sim_time: 0.0,
                 accumulator: 0.0,
                 substeps: SUBSTEPS,
                 slow_motion: 1.0,
@@ -407,6 +449,9 @@ impl PhysicsMirror {
             }
         }
         self.sim_order.clear();
+        self.water_volumes.clear();
+        self.buoy_bodies.clear();
+        self.sim_time = 0.0;
     }
 
     /// Tear down and recreate the box3d world itself (used to switch the
@@ -437,7 +482,11 @@ impl PhysicsMirror {
         let mut body_def = ffi::b3DefaultBodyDef();
         body_def.position = bvec(world.location);
         body_def.rotation = bquat(world.rotation);
-        if simulate && object.dynamic {
+        // Terrain never becomes a rigid body: its physics flag means
+        // "simulate the water" (waves + buoyancy), the ground itself is
+        // land and stays a static collider.
+        let terrain = matches!(object.primitive, Primitive::Terrain { .. });
+        if simulate && object.dynamic && !terrain {
             body_def.type_ = ffi::b3BodyType_b3_dynamicBody;
             body_def.sleepThreshold = SLEEP_THRESHOLD;
         }
@@ -570,17 +619,12 @@ impl PhysicsMirror {
             }
             // terrain is concave by nature: exact triangle mesh of the
             // generated height grid so picking, drop-to-floor and rolling
-            // bodies follow the actual surface. Height fields are static-only
-            // in box3d (and Y-up, unlike this Z-up world), so a terrain made
-            // dynamic falls back to the convex hull below while playing.
-            Primitive::Terrain { .. } if !object.dynamic || sim == SimState::Stopped => {
+            // bodies follow the actual surface. Always static — the physics
+            // flag on a terrain drives the WATER simulation, not the ground
+            // (see `create_entry` and the buoyancy pass in `update`).
+            Primitive::Terrain { .. } => {
                 let mesh = object.collision_mesh();
                 Self::create_mesh_shape(body, shape_def, &mesh, scale, meshes);
-            }
-            // dynamic terrain while playing: hull of the object's own stack
-            // mesh (the catch-all below would use the default stack)
-            Primitive::Terrain { .. } => {
-                Self::create_hull_shape(body, shape_def, &object.collision_mesh(), scale);
             }
             // floors shaped to walls may be concave (L/U rooms): exact
             // triangle mesh so the notches stay open
@@ -743,6 +787,33 @@ impl PhysicsMirror {
                         );
                     }
                     self.sim_order.push(object.id);
+                    // buoyancy probe for this body (sphere approximation)
+                    let max_scale = world.scale.abs().max_element().max(1e-6);
+                    self.buoy_bodies.push(BuoyBody {
+                        id: object.id,
+                        radius: (object.bounding_radius() * max_scale).max(1e-3),
+                        density: object.density.max(0.01),
+                    });
+                }
+                // a water-sim terrain contributes a wave volume: the flag
+                // that makes anything else dynamic makes terrain water live
+                if object.dynamic {
+                    if let (Primitive::Terrain { size, seed, .. }, Some(data)) =
+                        (object.primitive, object.terrain.as_ref())
+                    {
+                        if let Some(water) = data.water.filter(|w| w.enabled) {
+                            self.water_volumes.push(WaterVolume {
+                                object_id: object.id,
+                                origin: world.location,
+                                half: size * 0.5,
+                                level: water.level,
+                                waves: modeler_core::water::WaveSet::new(
+                                    &water.waves,
+                                    seed,
+                                ),
+                            });
+                        }
+                    }
                 }
                 self.entries.insert(object.id, entry);
             }
@@ -1295,6 +1366,19 @@ impl PhysicsMirror {
                 }
             }
         }
+        // water-sim terrains: freeze the surface back to the static sheet
+        let water_ids: Vec<ObjectId> = scene
+            .objects()
+            .iter()
+            .filter(|o| o.water_time.is_some())
+            .map(|o| o.id)
+            .collect();
+        for id in water_ids {
+            if let Some(object) = scene.object_mut(id) {
+                object.water_time = None;
+                object.mesh_revision = object.mesh_revision.wrapping_add(1);
+            }
+        }
         // Re-seat attached ropes on their design-mode pins WITHOUT changing
         // length (a long rope between two close pins should stay long).
         crate::rope_handles::sync_attached_ropes(scene);
@@ -1323,9 +1407,13 @@ impl PhysicsMirror {
                 for cloth in self.cloths.values() {
                     update_cloth_edge_capsules(&cloth.bodies, &cloth.edge_colliders);
                 }
+                if !self.water_volumes.is_empty() {
+                    self.apply_buoyancy();
+                }
             }
             unsafe { ffi::b3World_Step(self.world, FIXED_DT, self.substeps) };
             self.accumulator -= FIXED_DT;
+            self.sim_time += FIXED_DT;
         }
         // Drop the surplus instead of banking it: a scene too slow to keep up
         // stays in slow motion rather than spiralling into 14 steps per frame.
@@ -1423,6 +1511,55 @@ impl PhysicsMirror {
             if let Some(object) = scene.object_mut(id) {
                 object.cloth_nodes = Some(nodes);
                 object.mesh_revision = object.mesh_revision.wrapping_add(1);
+            }
+        }
+
+        // water-sim terrains: advance the surface clock — the renderer
+        // rebuilds the (Gerstner-displaced) sheet exactly like a draped
+        // rope or cloth, keyed on the mesh_revision bump
+        for i in 0..self.water_volumes.len() {
+            let id = self.water_volumes[i].object_id;
+            if let Some(object) = scene.object_mut(id) {
+                object.water_time = Some(self.sim_time);
+                object.mesh_revision = object.mesh_revision.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Buoyancy + drag on dynamic bodies inside a water volume, applied per
+    /// fixed step (the box3d docs prefer steady forces over impulses with
+    /// the sub-stepping solver). Sphere approximation: the submerged
+    /// fraction of the body's bounding sphere scales an Archimedes lift
+    /// (`ρ_water · V · g` with `V ≈ mass / density`) plus linear drag.
+    unsafe fn apply_buoyancy(&self) {
+        use modeler_core::glam::Vec2;
+        for buoy in &self.buoy_bodies {
+            let Some(entry) = self.entries.get(&buoy.id) else { continue };
+            let p = ffi::b3Body_GetPosition(entry.body);
+            for volume in &self.water_volumes {
+                let local = Vec2::new(p.x - volume.origin.x, p.y - volume.origin.y);
+                if local.x.abs() > volume.half || local.y.abs() > volume.half {
+                    continue;
+                }
+                let surface =
+                    volume.origin.z + volume.level + volume.waves.height(local, self.sim_time);
+                let r = buoy.radius;
+                let submerged = ((surface - (p.z - r)) / (2.0 * r)).clamp(0.0, 1.0);
+                if submerged <= 0.0 {
+                    continue;
+                }
+                let mass = ffi::b3Body_GetMass(entry.body).max(1e-6);
+                let lift = WATER_DENSITY / buoy.density * mass * 9.81 * submerged;
+                let v = ffi::b3Body_GetLinearVelocity(entry.body);
+                let drag = WATER_DRAG * mass * submerged;
+                let force = bvec(Vec3::new(
+                    -v.x * drag,
+                    -v.y * drag,
+                    lift - v.z * drag,
+                ));
+                // wake = true: a floating body must not fall asleep mid-bob
+                ffi::b3Body_ApplyForceToCenter(entry.body, force, true);
+                break; // the first covering volume wins
             }
         }
     }
@@ -1850,6 +1987,64 @@ mod tests {
         // cube (half size 1) should rest on the ground plane at z = 0
         let z = scene.object(id).unwrap().transform.location.z;
         assert!((z - 1.0).abs() < 0.05, "cube should rest at z=1, got {z}");
+    }
+
+    /// A terrain's physics flag means "simulate the water", never "the ground
+    /// is a rigid body": the terrain must not move, its water clock must run
+    /// while playing, and a light body must float near the water surface
+    /// instead of sinking to the ground.
+    #[test]
+    fn terrain_physics_flag_drives_water_not_the_ground() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        let tid = scene.add_object(
+            Primitive::Terrain { size: 60.0, resolution: 32, height: 8.0, seed: 1 },
+            Transform::default(),
+        );
+        {
+            let terrain = scene.object_mut(tid).unwrap();
+            terrain.dynamic = true; // = simulate water
+            let mut data = modeler_core::TerrainData::default();
+            // flat ground at z = 0 so the float height is predictable
+            data.layers.clear();
+            data.water = Some(modeler_core::terrain::WaterLayer {
+                level: 5.0,
+                ..Default::default()
+            });
+            terrain.terrain = Some(data);
+        }
+        let mut cork = Transform::default();
+        cork.location.z = 9.0;
+        let cid = scene.add_object(Primitive::Cube { size: 1.0 }, cork);
+        {
+            let cube = scene.object_mut(cid).unwrap();
+            cube.dynamic = true;
+            cube.density = 0.2; // well below water density: must float
+        }
+
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        for _ in 0..600 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+
+        let terrain_loc = scene.object(tid).unwrap().transform.location;
+        assert!(terrain_loc.length() < 1e-3, "terrain moved: {terrain_loc}");
+        assert!(
+            scene.object(tid).unwrap().water_time.is_some(),
+            "water clock must run while playing"
+        );
+        let z = scene.object(cid).unwrap().transform.location.z;
+        assert!(
+            (3.5..7.0).contains(&z),
+            "a density-0.2 cube should bob near the z=5 surface, got {z}"
+        );
+
+        physics.stop(&mut scene);
+        assert!(
+            scene.object(tid).unwrap().water_time.is_none(),
+            "stop must freeze the surface back to the static sheet"
+        );
     }
 
     /// Drop a cube and report the highest point it reaches after its first
