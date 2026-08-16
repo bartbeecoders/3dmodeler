@@ -190,6 +190,19 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             "clip_end": clip_end,
         });
     }
+    if let modeler_core::Primitive::Terrain { size, resolution, height, seed } = object.primitive {
+        json["terrain"] = json!({
+            "size": size,
+            "resolution": resolution,
+            "height": height,
+            "seed": seed,
+            // the full stack (round-trippable through update_object {terrain: ...})
+            "layers": object
+                .terrain
+                .as_ref()
+                .map(|t| serde_json::to_value(&t.layers).unwrap_or(Value::Null)),
+        });
+    }
     if matches!(object.primitive, modeler_core::Primitive::Wall { .. }) {
         json["cutouts"] = object
             .cutouts
@@ -266,6 +279,7 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
             segments_v: 8,
             stiffness: 0.25,
         }),
+        "terrain" => Some(Primitive::default_terrain()),
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
         "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
@@ -429,6 +443,44 @@ fn apply_object_params(
                     segments_v: new_sv,
                     stiffness: st.unwrap_or(stiffness).clamp(0.0, 1.0),
                 };
+            }
+        }
+        // terrain parameters (terrains only)
+        if let Primitive::Terrain { size, resolution, height, seed } = object.primitive {
+            let get = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            let (sz, h) = (get("size"), get("height"));
+            let res = params
+                .get("resolution")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            let sd = params.get("seed").and_then(Value::as_u64).map(|v| v as u32);
+            if sz.is_some() || h.is_some() || res.is_some() || sd.is_some() {
+                object.primitive = Primitive::Terrain {
+                    size: sz.unwrap_or(size).clamp(1.0, 2000.0),
+                    resolution: res.unwrap_or(resolution).clamp(
+                        modeler_core::terrain::MIN_RESOLUTION,
+                        modeler_core::terrain::MAX_RESOLUTION,
+                    ),
+                    height: h.unwrap_or(height).clamp(0.1, 500.0),
+                    seed: sd.unwrap_or(seed),
+                };
+            }
+            // whole-stack replacement: named preset, or explicit layer list
+            if let Some(name) = params.get("terrain_preset").and_then(Value::as_str) {
+                let preset = modeler_core::TerrainData::preset(name).ok_or_else(|| {
+                    let names: Vec<&str> = modeler_core::TerrainData::presets()
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .collect();
+                    format!("unknown terrain_preset '{name}' ({})", names.join("|"))
+                })?;
+                object.terrain = Some(preset);
+                object.mesh_revision += 1; // render/physics caches key on it
+            } else if let Some(v) = params.get("terrain").filter(|v| !v.is_null()) {
+                let data: modeler_core::TerrainData = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("bad 'terrain' stack: {e}"))?;
+                object.terrain = Some(data);
+                object.mesh_revision += 1;
             }
         }
         if let Some(cutouts) = cutouts {
@@ -1194,7 +1246,7 @@ fn execute_inner(
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()
-                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|light|sun|spot|camera)")?;
+                .ok_or("missing 'primitive' (plane|cube|sphere|icosphere|cylinder|cone|torus|wall|floor|roof|empty|terrain|rope|cloth|light|sun|spot|camera)")?;
             let primitive = primitive_from_name(primitive_name)
                 .ok_or_else(|| format!("unknown primitive '{primitive_name}'"))?;
             let id = scene.add_object(primitive, Transform::default());

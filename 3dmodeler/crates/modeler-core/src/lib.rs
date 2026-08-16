@@ -8,6 +8,7 @@ pub mod boolean;
 pub mod library;
 pub mod material;
 pub mod mesh;
+pub mod terrain;
 
 use glam::{Quat, Vec2, Vec3};
 pub use boolean::{mesh_boolean, mesh_to_frame, BooleanOp};
@@ -19,6 +20,7 @@ pub use material::{
     WorldPositionEffect,
 };
 pub use mesh::{MeshData, WallCutout};
+pub use terrain::TerrainData;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -287,6 +289,22 @@ pub enum Primitive {
         #[serde(default = "default_cloth_stiffness")]
         stiffness: f32,
     },
+    /// Procedural terrain: a `size` × `size` height grid standing on z = 0,
+    /// centered on the origin in XY, rising to at most `height` meters
+    /// (rivers may dig slightly below the base plane). The heights come
+    /// from the noise-layer stack on the OBJECT (`Object::terrain`), seeded
+    /// by `seed` — nothing is baked; the mesh regenerates from parameters.
+    Terrain {
+        /// Side length in meters.
+        size: f32,
+        /// Grid quads per side (vertices = resolution + 1 per side).
+        /// Clamped 8..=512.
+        resolution: u32,
+        /// Height amplitude in meters.
+        height: f32,
+        /// World seed: same seed + same stack = same terrain.
+        seed: u32,
+    },
 }
 
 /// Default cloth stiffness (soft enough to drape; 1.0 would be nearly rigid).
@@ -434,6 +452,17 @@ impl Primitive {
             Primitive::Camera { .. } => "Camera",
             Primitive::Rope { .. } => "Rope",
             Primitive::Cloth { .. } => "Cloth",
+            Primitive::Terrain { .. } => "Terrain",
+        }
+    }
+
+    /// A terrain with sensible defaults (Add ▸ Terrain, `add_object`).
+    pub fn default_terrain() -> Primitive {
+        Primitive::Terrain {
+            size: 100.0,
+            resolution: 128,
+            height: 12.0,
+            seed: 1,
         }
     }
 
@@ -482,6 +511,11 @@ impl Primitive {
             // origin at sheet center
             Primitive::Cloth { width, height, .. } => {
                 0.5 * (width * width + height * height).sqrt()
+            }
+            // base plane centered on the origin; a top corner is farthest
+            // (heights can dip to -0.5 × height, still within this bound)
+            Primitive::Terrain { size, height, .. } => {
+                (0.5 * size * size + height * height).sqrt()
             }
         }
     }
@@ -534,6 +568,7 @@ impl Primitive {
                 Vec3::new(length, 2.0 * radius, 2.0 * radius)
             }
             Primitive::Cloth { width, height, .. } => Vec3::new(width, height, 0.0),
+            Primitive::Terrain { size, height, .. } => Vec3::new(size, size, height),
         }
     }
 
@@ -557,6 +592,7 @@ impl Primitive {
             Primitive::Camera { .. } => mesh::CAMERA_GIZMO_HALF_H,
             Primitive::Rope { radius, .. } => radius,
             Primitive::Cloth { .. } => 0.0,
+            Primitive::Terrain { .. } => 0.0, // stands on its base plane
         }
     }
 
@@ -601,6 +637,10 @@ impl Primitive {
                 segments_v,
                 stiffness: _,
             } => mesh::cloth(width, height, segments_u, segments_v),
+            // default stack; the object's own stack goes through render_mesh
+            Primitive::Terrain { size, resolution, height, seed } => {
+                terrain::generate_mesh(&TerrainData::default(), size, resolution, height, seed)
+            }
         };
         if smooth {
             m
@@ -769,6 +809,12 @@ pub struct Object {
     /// Not saved; the renderer uses these to draw the draped cord.
     #[serde(skip)]
     pub rope_nodes: Option<Vec<Vec3>>,
+    /// Noise-layer stack, for `Primitive::Terrain` objects only (ignored
+    /// elsewhere): the generator the heights come from. `None` falls back
+    /// to `TerrainData::default()`. Editors must bump `mesh_revision` when
+    /// they change it so the render/physics caches resync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<TerrainData>,
     /// Cloth pin points (grid vertices). Only meaningful for `Primitive::Cloth`.
     #[serde(default)]
     pub cloth_anchors: Vec<ClothAnchor>,
@@ -793,6 +839,10 @@ impl Object {
                 if !self.floor_outline.is_empty() =>
             {
                 mesh::floor_polygon(&self.floor_outline, thickness)
+            }
+            (None, Primitive::Terrain { size, resolution, height, seed }) => {
+                let mesh = self.terrain_mesh(size, resolution, height, seed);
+                if self.smooth { mesh } else { mesh.into_flat() }
             }
             // live draped rope: nodes are world-space; return a LOCAL mesh
             // centered on the first node by expressing points relative to it
@@ -841,7 +891,21 @@ impl Object {
             {
                 mesh::floor_polygon(&self.floor_outline, thickness)
             }
+            (None, Primitive::Terrain { size, resolution, height, seed }) => {
+                self.terrain_mesh(size, resolution, height, seed)
+            }
             (None, primitive) => primitive.generate(true),
+        }
+    }
+
+    /// The terrain mesh from this object's own stack (default stack when
+    /// unset), shared-vertex topology.
+    fn terrain_mesh(&self, size: f32, resolution: u32, height: f32, seed: u32) -> MeshData {
+        match &self.terrain {
+            Some(data) => terrain::generate_mesh(data, size, resolution, height, seed),
+            None => {
+                terrain::generate_mesh(&TerrainData::default(), size, resolution, height, seed)
+            }
         }
     }
 
@@ -1225,9 +1289,19 @@ impl Scene {
             rope_start: RopeEnd::default(),
             rope_end: RopeEnd::default(),
             rope_nodes: None,
+            terrain: None,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
         });
+        // Terrain: smooth-shaded with its default stack, in a grassy green.
+        if matches!(primitive, Primitive::Terrain { .. }) {
+            if let Some(object) = self.objects.last_mut() {
+                object.smooth = true;
+                object.terrain = Some(TerrainData::default());
+                object.material.base_color = [0.35, 0.48, 0.28];
+                object.material.roughness = 0.95;
+            }
+        }
         // Ropes / cloth are physical by default — they only do something useful under gravity.
         if primitive.is_rope() {
             if let Some(object) = self.objects.last_mut() {
@@ -2227,6 +2301,28 @@ mod tests {
         assert_eq!(restored.masters()[0].id, mid);
         assert!((restored.mpc().wetness - 0.4).abs() < 1e-5);
         assert_eq!(restored.object(id).unwrap().material_master, Some(mid));
+    }
+
+    #[test]
+    fn scene_json_roundtrip_keeps_terrain_stack() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::default_terrain(), Transform::default());
+        // add_object seeds the default stack; swap in a preset to prove the
+        // exact layers survive, not just "some stack"
+        let canyon = TerrainData::preset("Canyon").unwrap();
+        scene.object_mut(id).unwrap().terrain = Some(canyon.clone());
+        let json = scene.to_json();
+        let data = Scene::from_json(&json).unwrap();
+        let mut restored = Scene::new();
+        restored.restore(&data);
+        let object = restored.object(id).unwrap();
+        assert_eq!(object.terrain.as_ref(), Some(&canyon));
+        assert!(matches!(object.primitive, Primitive::Terrain { .. }));
+        // the mesh regenerates identically from the restored parameters
+        assert_eq!(
+            object.render_mesh().positions,
+            scene.object(id).unwrap().render_mesh().positions
+        );
     }
 
     #[test]

@@ -554,6 +554,7 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
             rope_start: Default::default(),
             rope_end: Default::default(),
             rope_nodes: None,
+            terrain: None,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
         });

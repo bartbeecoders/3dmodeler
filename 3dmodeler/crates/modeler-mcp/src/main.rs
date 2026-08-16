@@ -93,11 +93,11 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "add_object",
-            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (visible in the Rendered viewport mode): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled. 'camera' adds a render camera (looks along local -Z; F12 in the app renders from it); fov_deg/clip_start/clip_end configure the lens.",
+            "description": "Add a primitive to the scene. Units are meters; the world is Z-up (the ground plane is XY). New objects appear at the origin unless a location is given. A 'wall' runs along its local +X axis from its origin, stands on z=0, and takes length/height/thickness plus rectangular door/window cutouts. 'light'/'sun'/'spot' add light sources (visible in the Rendered viewport mode): color/intensity set brightness, sun & spot shine along their local -Z (aim with rotation_euler_deg), spot takes spot_angle_deg, sun & spot cast shadows unless disabled. 'camera' adds a render camera (looks along local -Z; F12 in the app renders from it); fov_deg/clip_start/clip_end configure the lens. 'terrain' adds a procedural landscape generated from a noise-layer stack (size/resolution/height/seed; pick a look with terrain_preset, vary seed for variations; it stands on z=0 and other objects collide with the surface).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "rope", "cloth", "light", "sun", "spot", "camera"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "terrain", "rope", "cloth", "light", "sun", "spot", "camera"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
@@ -105,7 +105,12 @@ fn tool_definitions() -> Value {
                     "clip_start": {"type": "number", "description": "Camera only: near clip plane in meters (default 0.1)"},
                     "clip_end": {"type": "number", "description": "Camera only: far clip plane in meters (default 1000)"},
                     "length": {"type": "number", "description": "Wall or rope: length in meters (wall default 2, rope default 2)"},
-                    "height": {"type": "number", "description": "Wall or cloth: height in meters (wall default 2.5, cloth default 2)"},
+                    "height": {"type": "number", "description": "Wall, cloth or terrain: height in meters (wall default 2.5, cloth default 2, terrain max height default 12)"},
+                    "size": {"type": "number", "description": "Terrain only: side length in meters (default 100)"},
+                    "resolution": {"type": "integer", "description": "Terrain only: grid quads per side 8–512 (default 128)"},
+                    "seed": {"type": "integer", "description": "Terrain only: world seed — same seed + stack = same terrain (default 1)"},
+                    "terrain_preset": {"type": "string", "enum": ["Hills", "Alpine", "Dunes", "Archipelago", "Canyon", "Volcanic", "Rolling", "Craters"], "description": "Terrain only: replace the layer stack with a named preset"},
+                    "terrain": {"type": "object", "description": "Terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
                     "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
                     "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},

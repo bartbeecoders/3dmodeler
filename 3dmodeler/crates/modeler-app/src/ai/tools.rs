@@ -43,6 +43,7 @@ WORKFLOW
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Ropes: primitive "rope" (length/radius/segments) is a flexible multi-segment cord. Pin ends with rope_start / rope_end (object name or null) and optional rope_start_point / rope_end_point local points. Ropes always simulate when play runs; hang a weight by anchoring start to a fixed body and end to a dynamic cube.
+- Terrain: primitive "terrain" (size/resolution/height/seed) is a procedural landscape generated from a noise-layer stack. Pick a look with terrain_preset (Hills, Alpine, Dunes, Archipelago, Canyon, Volcanic, Rolling, Craters), change seed for a different variation of the same look, size/height for extent. It stands on z=0 and other objects collide with the surface. Default 100x100 m — scale scene objects accordingly or make the terrain smaller.
 - Cloth: primitive "cloth" (width/height/segments_u/segments_v/stiffness 0..1) is a soft sheet in local XY. Pin grid vertices with cloth_anchors: [{u, v, object, local_point?}]. Default four corners are free; attach top edge to a bar for a hanging curtain. Low stiffness (~0.2) drapes; 1.0 is stiff.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
 
@@ -75,8 +76,13 @@ fn object_properties() -> Value {
         "spot_angle_deg": {"type": "number", "description": "spot lights only, 1..160"},
         "shadows": {"type": "boolean", "description": "lights only"},
         "length": {"type": "number", "description": "walls or ropes, meters"},
-        "height": {"type": "number", "description": "walls or cloth, meters"},
+        "height": {"type": "number", "description": "walls, cloth or terrain (max height), meters"},
         "width": {"type": "number", "description": "cloth only, meters"},
+        "size": {"type": "number", "description": "terrain only: side length, meters"},
+        "resolution": {"type": "integer", "description": "terrain only: grid quads per side 8–512"},
+        "seed": {"type": "integer", "description": "terrain only: world seed (same seed = same terrain)"},
+        "terrain_preset": {"type": "string", "description": "terrain only: replace the layer stack with a named preset (Hills|Alpine|Dunes|Archipelago|Canyon|Volcanic|Rolling|Craters)"},
+        "terrain": {"type": "object", "description": "terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},
@@ -121,8 +127,8 @@ pub fn catalog() -> Vec<ToolSpec> {
     add_properties["primitive"] = json!({
         "type": "string",
         "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus",
-                 "wall", "floor", "empty", "rope", "cloth", "light", "sun", "spot"],
-        "description": "what to add ('light' = point light; 'rope'/'cloth' = soft physics)"
+                 "wall", "floor", "empty", "terrain", "rope", "cloth", "light", "sun", "spot"],
+        "description": "what to add ('light' = point light; 'rope'/'cloth' = soft physics; 'terrain' = procedural landscape)"
     });
     let mut update_properties = object_properties();
     update_properties["object"] = object_ref("object name or id");

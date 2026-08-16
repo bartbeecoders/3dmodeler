@@ -259,6 +259,13 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             segments_v.hash(h);
             hash_f32(h, stiffness);
         }
+        Primitive::Terrain { size, resolution, height, seed } => {
+            15u8.hash(h);
+            hash_f32(h, size);
+            resolution.hash(h);
+            hash_f32(h, height);
+            seed.hash(h);
+        }
     }
 }
 
@@ -365,6 +372,9 @@ fn shareable(object: &modeler_core::Object) -> bool {
         && object.rope_nodes.is_none()
         && object.cutouts.is_empty()
         && object.floor_outline.is_empty()
+        // the noise stack lives on the object, so terrain geometry is not
+        // a function of the primitive alone (edits bump mesh_revision)
+        && object.terrain.is_none()
         && object.subdivision_only_levels().is_some()
 }
 

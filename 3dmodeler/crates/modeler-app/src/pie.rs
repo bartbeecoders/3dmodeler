@@ -33,6 +33,8 @@ pub enum PieIcon {
     LightSun,
     LightSpot,
     Camera,
+    /// Mountain skyline (terrain).
+    Terrain,
     // actions (line-art)
     Duplicate,
     Anchor,
@@ -78,6 +80,7 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Empty { .. } => PieIcon::Empty,
         P::Rope { .. } => PieIcon::Rope,
         P::Cloth { .. } => PieIcon::Cloth,
+        P::Terrain { .. } => PieIcon::Terrain,
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
             modeler_core::LightKind::Sun => PieIcon::LightSun,
@@ -462,6 +465,20 @@ pub fn draw_icon(
             painter.circle_filled(tr, 0.1 * s, stroke.color);
         }
         // Floor: flat slab — parallelogram top with a visible thickness
+        // Terrain: two overlapping mountain peaks over a base line
+        PieIcon::Terrain => {
+            painter.add(egui::Shape::line(
+                vec![
+                    p(-1.0, 0.75),
+                    p(-0.45, -0.25),
+                    p(-0.15, 0.2),
+                    p(0.3, -0.8),
+                    p(1.0, 0.75),
+                ],
+                stroke,
+            ));
+            painter.line_segment([p(-1.0, 0.75), p(1.0, 0.75)], stroke);
+        }
         PieIcon::Floor => {
             let top = [p(-1.0, -0.1), p(-0.35, -0.85), p(1.0, -0.85), p(0.35, -0.1)];
             painter.add(egui::Shape::closed_line(top.to_vec(), stroke));

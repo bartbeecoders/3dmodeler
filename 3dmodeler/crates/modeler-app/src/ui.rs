@@ -3560,6 +3560,7 @@ fn properties(
     let mut anchor = object.anchor;
     let mut dirty = PropDirty::default();
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
+    let mut edited_terrain: Option<modeler_core::TerrainData> = None;
     let mut break_kind: Option<object_ops::BreakKind> = None;
     let mut master_action: Option<MasterAction> = None;
     let mut apply_function: Option<MaterialFunction> = None;
@@ -3717,6 +3718,15 @@ fn properties(
                     let mut cutouts = object.cutouts.clone();
                     if wall_cutout_rows(ui, &mut cutouts, length, height) {
                         edited_cutouts = Some(cutouts);
+                    }
+                }
+
+                if matches!(primitive, Primitive::Terrain { .. }) {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Terrain layers").strong());
+                    let mut stack = object.terrain.clone().unwrap_or_default();
+                    if terrain_stack_ui(ui, &mut stack) {
+                        edited_terrain = Some(stack);
                     }
                 }
 
@@ -4538,6 +4548,12 @@ fn properties(
             object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
+    if let Some(stack) = edited_terrain {
+        if let Some(object) = scene.object_mut(active_id) {
+            object.terrain = Some(stack);
+            object.mesh_revision += 1; // caches key on it (primitive unchanged)
+        }
+    }
     let mut status = None;
     if !modifier_edits.is_empty() || modifier_add.is_some() {
         if let Some(object) = scene.object_mut(active_id) {
@@ -4793,6 +4809,225 @@ fn rope_end_row(
     changed
 }
 
+/// Editor for a terrain's noise-layer stack (Data tab). Mutates `stack` in
+/// place; the caller writes it back to the object and bumps `mesh_revision`.
+fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) -> bool {
+    use modeler_core::terrain::{Band, BlendMode, LayerKind, NoiseMask, TerrainData, TerrainLayer, VoronoiOutput};
+
+    let mut changed = false;
+
+    // whole-stack presets
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("terrain-preset")
+            .selected_text("Load preset…")
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for (name, data) in TerrainData::presets() {
+                    if ui.button(name).clicked() {
+                        *stack = data;
+                        changed = true;
+                    }
+                }
+            });
+        ui.menu_button("＋ Add layer", |ui| {
+            for kind in LayerKind::catalog() {
+                if ui.button(kind.label()).clicked() {
+                    stack.layers.push(TerrainLayer::new(kind));
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+    });
+
+    let mut remove: Option<usize> = None;
+    let mut swap: Option<(usize, usize)> = None;
+    let count = stack.layers.len();
+    for (i, layer) in stack.layers.iter_mut().enumerate() {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut layer.enabled, "").changed();
+                    ui.label(egui::RichText::new(layer.kind.label()).strong());
+                    if layer.kind.is_modifier() {
+                        ui.label(egui::RichText::new("modifier").weak().size(10.0));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
+                            remove = Some(i);
+                        }
+                        if i + 1 < count && ui.small_button("⬇").clicked() {
+                            swap = Some((i, i + 1));
+                        }
+                        if i > 0 && ui.small_button("⬆").clicked() {
+                            swap = Some((i - 1, i));
+                        }
+                    });
+                });
+
+                match &mut layer.kind {
+                    LayerKind::Fbm { scale, octaves, gain, lacunarity, erosion, warp } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                        changed |= slider_row(ui, "Erosion", erosion, 0.0..=1.0);
+                        changed |= slider_row(ui, "Self-warp", warp, 0.0..=1.5);
+                    }
+                    LayerKind::Ridged { scale, octaves, gain, lacunarity, sharpness } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                        changed |= slider_row(ui, "Sharpness", sharpness, 0.2..=4.0);
+                    }
+                    LayerKind::Billow { scale, octaves, gain, lacunarity } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=10);
+                        changed |= slider_row(ui, "Gain", gain, 0.15..=0.85);
+                        changed |= slider_row(ui, "Lacunarity", lacunarity, 1.5..=3.5);
+                    }
+                    LayerKind::Value { scale } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                    }
+                    LayerKind::Voronoi { scale, jitter, output } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Jitter", jitter, 0.0..=1.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Output");
+                            egui::ComboBox::from_id_salt(("terrain-voronoi", i))
+                                .selected_text(output.label())
+                                .show_ui(ui, |ui| {
+                                    for o in VoronoiOutput::ALL {
+                                        if ui.selectable_label(*output == o, o.label()).clicked()
+                                            && *output != o
+                                        {
+                                            *output = o;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                    LayerKind::Crater { scale, density, depth, rim } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Density", density, 0.0..=1.0);
+                        changed |= slider_row(ui, "Depth", depth, 0.0..=2.0);
+                        changed |= slider_row(ui, "Rim", rim, 0.0..=1.0);
+                    }
+                    LayerKind::Dune { scale, direction_deg, sharpness } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Direction °", direction_deg, 0.0..=360.0);
+                        changed |= slider_row(ui, "Sharpness", sharpness, 0.2..=4.0);
+                    }
+                    LayerKind::Flow { scale, direction_deg, width, meander } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Direction °", direction_deg, 0.0..=360.0);
+                        changed |= float_row_ex(ui, "Width", width, 0.1, 0.1..=200.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Meander", meander, 0.1, 0.0..=200.0, Some(" m"));
+                    }
+                    LayerKind::Constant { value } => {
+                        changed |= slider_row(ui, "Value", value, -1.0..=1.0);
+                    }
+                    LayerKind::DomainWarp { scale, strength, octaves } => {
+                        changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Strength", strength, 0.2, 0.0..=200.0, Some(" m"));
+                        changed |= int_row(ui, "Octaves", octaves, 1..=6);
+                    }
+                    LayerKind::Terrace { steps, smoothness } => {
+                        changed |= int_row(ui, "Steps", steps, 2..=64);
+                        changed |= slider_row(ui, "Smoothness", smoothness, 0.0..=1.0);
+                    }
+                }
+
+                if !layer.kind.is_modifier() {
+                    ui.horizontal(|ui| {
+                        ui.label("Blend");
+                        egui::ComboBox::from_id_salt(("terrain-blend", i))
+                            .selected_text(layer.blend.label())
+                            .show_ui(ui, |ui| {
+                                for b in BlendMode::ALL {
+                                    if ui.selectable_label(layer.blend == b, b.label()).clicked()
+                                        && layer.blend != b
+                                    {
+                                        layer.blend = b;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    });
+                }
+                changed |= slider_row(ui, "Amount", &mut layer.amount, 0.0..=1.5);
+
+                egui::CollapsingHeader::new("Mask")
+                    .id_salt(("terrain-mask", i))
+                    .show(ui, |ui| {
+                        // height band
+                        let mut on = layer.mask.height.is_some();
+                        if ui.checkbox(&mut on, "By height").changed() {
+                            layer.mask.height = on.then_some(Band {
+                                min: 0.3,
+                                max: 1.5,
+                                falloff: 0.15,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(band) = &mut layer.mask.height {
+                            changed |= slider_row(ui, "Min", &mut band.min, -0.5..=1.5);
+                            changed |= slider_row(ui, "Max", &mut band.max, -0.5..=1.5);
+                            changed |= slider_row(ui, "Falloff", &mut band.falloff, 0.01..=0.5);
+                            changed |= ui.checkbox(&mut band.invert, "Invert").changed();
+                        }
+                        // slope band (rise/run: 1 = 45°)
+                        let mut on = layer.mask.slope.is_some();
+                        if ui.checkbox(&mut on, "By slope").changed() {
+                            layer.mask.slope = on.then_some(Band {
+                                min: 0.4,
+                                max: 10.0,
+                                falloff: 0.2,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(band) = &mut layer.mask.slope {
+                            changed |= slider_row(ui, "Min", &mut band.min, 0.0..=3.0);
+                            changed |= slider_row(ui, "Max", &mut band.max, 0.0..=10.0);
+                            changed |= slider_row(ui, "Falloff", &mut band.falloff, 0.01..=1.0);
+                            changed |= ui.checkbox(&mut band.invert, "Invert").changed();
+                        }
+                        // noise coverage
+                        let mut on = layer.mask.noise.is_some();
+                        if ui.checkbox(&mut on, "By noise").changed() {
+                            layer.mask.noise = on.then_some(NoiseMask {
+                                scale: 60.0,
+                                threshold: 0.5,
+                                softness: 0.15,
+                                invert: false,
+                            });
+                            changed = true;
+                        }
+                        if let Some(nm) = &mut layer.mask.noise {
+                            changed |= float_row_ex(ui, "Scale", &mut nm.scale, 0.5, 1.0..=1000.0, Some(" m"));
+                            changed |= slider_row(ui, "Threshold", &mut nm.threshold, 0.0..=1.0);
+                            changed |= slider_row(ui, "Softness", &mut nm.softness, 0.01..=0.5);
+                            changed |= ui.checkbox(&mut nm.invert, "Invert").changed();
+                        }
+                    });
+            });
+    }
+    if let Some((a, b)) = swap {
+        stack.layers.swap(a, b);
+        changed = true;
+    }
+    if let Some(i) = remove {
+        stack.layers.remove(i);
+        changed = true;
+    }
+    changed
+}
+
 /// `rope_ctx` is scene + object id for rope helpers (Adjust length from pin span).
 fn primitive_params(
     ui: &mut egui::Ui,
@@ -5031,6 +5266,32 @@ fn primitive_params(
                 egui::RichText::new(
                     "Sheet in local XY (default hangs vertically). Pin vertices \
                      with handles / Alt+click, then Play.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Terrain { size, resolution, height, seed } => {
+            changed |= float_row_ex(ui, "Size", size, 0.5, 1.0..=2000.0, Some(" m"));
+            changed |= int_row(ui, "Resolution", resolution, 8..=512);
+            changed |= float_row_ex(ui, "Height", height, 0.1, 0.1..=500.0, Some(" m"));
+            ui.horizontal(|ui| {
+                ui.label("Seed");
+                changed |= ui.add(egui::DragValue::new(seed).speed(1)).changed();
+                if ui
+                    .button("Shuffle")
+                    .on_hover_text("Jump to a different random seed")
+                    .clicked()
+                {
+                    // any avalanche step works; determinism doesn't matter here
+                    *seed = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Heights come from the layer stack below — same seed and \
+                     stack always rebuild the same terrain.",
                 )
                 .weak()
                 .size(11.0),

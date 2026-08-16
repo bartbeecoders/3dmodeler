@@ -568,6 +568,20 @@ impl PhysicsMirror {
                 let mesh = object.collision_mesh();
                 Self::create_mesh_shape(body, shape_def, &mesh, scale, meshes);
             }
+            // terrain is concave by nature: exact triangle mesh of the
+            // generated height grid so picking, drop-to-floor and rolling
+            // bodies follow the actual surface. Height fields are static-only
+            // in box3d (and Y-up, unlike this Z-up world), so a terrain made
+            // dynamic falls back to the convex hull below while playing.
+            Primitive::Terrain { .. } if !object.dynamic || sim == SimState::Stopped => {
+                let mesh = object.collision_mesh();
+                Self::create_mesh_shape(body, shape_def, &mesh, scale, meshes);
+            }
+            // dynamic terrain while playing: hull of the object's own stack
+            // mesh (the catch-all below would use the default stack)
+            Primitive::Terrain { .. } => {
+                Self::create_hull_shape(body, shape_def, &object.collision_mesh(), scale);
+            }
             // floors shaped to walls may be concave (L/U rooms): exact
             // triangle mesh so the notches stay open
             Primitive::Floor { .. }
