@@ -81,6 +81,12 @@ pub fn primitive_icon(primitive: &modeler_core::Primitive) -> PieIcon {
         P::Rope { .. } => PieIcon::Rope,
         P::Cloth { .. } => PieIcon::Cloth,
         P::Terrain { .. } => PieIcon::Terrain,
+        // props reuse close-enough line art (they are mostly scatter-made)
+        P::Prop { kind, .. } => match kind {
+            modeler_core::PropKind::Rock => PieIcon::IcoSphere,
+            modeler_core::PropKind::Bush => PieIcon::UvSphere,
+            _ => PieIcon::Cone,
+        },
         P::Light { kind, .. } => match kind {
             modeler_core::LightKind::Point => PieIcon::LightPoint,
             modeler_core::LightKind::Sun => PieIcon::LightSun,

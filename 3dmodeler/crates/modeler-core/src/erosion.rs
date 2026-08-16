@@ -217,6 +217,10 @@ pub fn erode_grid(
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9).wrapping_add(1));
     let brush = build_brush(s.brush_radius);
     let max_pos = (n - 1) as f32 - 1e-3;
+    // Bedrock: nothing erodes below the input's lowest point. Without this
+    // floor, a closed basin is a runaway — every droplet falling into the
+    // pit sees a steeper drop, gains more capacity, and digs it deeper.
+    let bedrock = map.iter().fold(f32::INFINITY, |m, v| m.min(*v)) - 0.02;
 
     // --- hydraulic droplets --------------------------------------------
     for _ in 0..s.droplets {
@@ -276,19 +280,24 @@ pub fn erode_grid(
                 let erode = ((capacity - sediment) * s.erosion_rate).min(-dh);
                 let cx = x.round() as i32;
                 let cy = y.round() as i32;
+                let mut taken = 0.0;
                 for &(bx, by, w) in &brush {
                     let px = cx + bx;
                     let py = cy + by;
                     if px >= 0 && px < n as i32 && py >= 0 && py < n as i32 {
                         let idx = py as usize * n + px as usize;
-                        let amount = erode * w;
+                        // never dig below bedrock (see above)
+                        let amount = (erode * w).min((map[idx] - bedrock).max(0.0));
                         map[idx] -= amount;
+                        taken += amount;
                     }
                 }
-                sediment += erode;
+                sediment += taken;
             }
 
-            speed = (speed * speed + (-dh) * s.gravity).max(0.0).sqrt();
+            // capped: a droplet circling a deep pit must not build
+            // unbounded capacity
+            speed = (speed * speed + (-dh) * s.gravity).max(0.0).sqrt().min(16.0);
             water *= 1.0 - s.evaporation;
             x = nx;
             y = ny;
@@ -416,8 +425,10 @@ mod tests {
         // between lightly-touched interfluves, not a uniform lowering
         let std = (mid.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / mid.len() as f32)
             .sqrt();
+        // (threshold calibrated against the bedrock-clamped sim: the old
+        // 0.35 passed only because runaway pits inflated the variance)
         assert!(
-            std > mean.abs() * 0.35,
+            std > mean.abs() * 0.1,
             "carving should be channeled, not uniform (mean {mean:.4}, std {std:.4})"
         );
     }
@@ -447,6 +458,37 @@ mod tests {
         );
         // the shed material lands next door
         assert!(delta[16 * n + 17] > 0.0);
+    }
+
+    /// Regression: a closed basin used to be a positive-feedback runaway
+    /// (droplets dug a pit, the pit steepened the drop, capacity grew) that
+    /// left kilometer-deep spikes. The bedrock floor pins it.
+    #[test]
+    fn closed_basins_stay_bounded() {
+        let res = 64u32;
+        let n = res as usize + 1;
+        // an inverted cone: everything drains INTO the center
+        let c = res as f32 / 2.0;
+        let h: Vec<f32> = (0..n * n)
+            .map(|i| {
+                let x = (i % n) as f32;
+                let y = (i / n) as f32;
+                let d = ((x - c).powi(2) + (y - c).powi(2)).sqrt() / c;
+                d.min(1.0) * 0.8
+            })
+            .collect();
+        let s = ErosionSettings {
+            droplets: 60_000,
+            ..ErosionSettings::default()
+        };
+        let delta = erode_grid(&h, res, 0.02, &s, 5);
+        let min = h.iter().zip(&delta).map(|(a, b)| a + b).fold(f32::INFINITY, f32::min);
+        assert!(
+            min > -0.1,
+            "the basin floor must stay at bedrock, went to {min}"
+        );
+        let worst = delta.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(worst < 1.0, "delta blew up: {worst}");
     }
 
     #[test]

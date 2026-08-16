@@ -266,6 +266,16 @@ pub(crate) fn hash_primitive<H: Hasher>(h: &mut H, p: &Primitive) {
             hash_f32(h, height);
             seed.hash(h);
         }
+        Primitive::Prop { kind, seed, size } => {
+            16u8.hash(h);
+            modeler_core::PropKind::ALL
+                .iter()
+                .position(|&k| k == kind)
+                .unwrap_or(0)
+                .hash(h);
+            seed.hash(h);
+            hash_f32(h, size);
+        }
     }
 }
 

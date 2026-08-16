@@ -97,7 +97,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "terrain", "rope", "cloth", "light", "sun", "spot", "camera"]},
+                    "primitive": {"type": "string", "enum": ["plane", "cube", "sphere", "icosphere", "cylinder", "cone", "torus", "wall", "floor", "roof", "empty", "terrain", "rock", "conifer", "broadleaf", "bush", "rope", "cloth", "light", "sun", "spot", "camera"]},
                     "intensity": {"type": "number", "description": "Lights only: brightness multiplier (default 3 point, 1.5 sun, 5 spot)"},
                     "spot_angle_deg": {"type": "number", "description": "Spot lights only: full cone angle in degrees (default 45)"},
                     "shadows": {"type": "boolean", "description": "Sun/spot lights only: cast shadows (default true; point lights never do)"},
@@ -117,6 +117,7 @@ fn tool_definitions() -> Value {
                     "erosion_enabled": {"type": "boolean", "description": "Terrain only: toggle the baked erosion without discarding it"},
                     "clear_erosion": {"type": "boolean", "description": "Terrain only: true discards the baked erosion layer"},
                     "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
+                    "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Props only: retype a nature prop"},
                     "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
                     "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},
@@ -274,6 +275,31 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "scatter_props",
+            "description": "Scatter nature props over a terrain: deterministic placements standing on the evaluated surface, grouped under one Empty root parented to the terrain (one click selects the whole set; delete_object with_children removes it). Built-in props: rock, conifer, broadleaf, bush — thousands render as a handful of instanced meshes. Or stamp copies of a library asset (capped at 300).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": ["string", "integer"], "description": "The terrain, by name or id"},
+                    "type": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Built-in prop to scatter (or use 'asset')"},
+                    "asset": {"type": "string", "description": "Library asset name to stamp copies of"},
+                    "density": {"type": "number", "description": "0..1 acceptance per candidate (default 0.5)"},
+                    "seed": {"type": "integer", "description": "Scatter seed - same seed re-places identically"},
+                    "cell_size": {"type": "number", "description": "Candidate spacing in meters (default 6)"},
+                    "max_slope": {"type": "number", "description": "Reject ground steeper than this rise/run (default 0.7)"},
+                    "height_min": {"type": "number", "description": "Meters above the base plane"},
+                    "height_max": {"type": "number"},
+                    "scale_min": {"type": "number", "description": "Per-prop scale range (default 0.8..1.4)"},
+                    "scale_max": {"type": "number"},
+                    "patchiness": {"type": "number", "description": "0 even .. 1 strongly clustered (default 0.5)"},
+                    "spacing": {"type": "boolean", "description": "Local-max anti-clumping (default true)"},
+                    "avoid_paint": {"type": "boolean", "description": "Skip hand-painted rock/cliff/snow/sand ground (default true)"},
+                    "max": {"type": "integer", "description": "Placement cap (default 800, max 2000)"}
+                },
+                "required": ["object"]
+            }
+        },
+        {
             "name": "update_object",
             "description": "Change any properties of an existing object (same optional fields as add_object, plus new_name to rename). Reference the object by name or id.",
             "inputSchema": {
@@ -328,7 +354,8 @@ fn tool_definitions() -> Value {
             "description": "Delete an object by name or id. Its children (if any) keep their world position and become unparented.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"object": {"type": "string"}},
+                "properties": {"object": {"type": "string"},
+                    "with_children": {"type": "boolean", "description": "true = delete the object and every descendant (scatter groups, assemblies); default keeps children, re-rooted"}},
                 "required": ["object"]
             }
         },
@@ -641,7 +668,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         }
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
-        "add_object" | "add_floor" | "add_roof" | "break_into_bricks" | "break_into_balls"
+        "add_object" | "add_floor" | "add_roof" | "scatter_props" | "break_into_bricks" | "break_into_balls"
         | "boolean_objects"
         | "add_modifier" | "update_modifier" | "remove_modifier" | "apply_modifiers"
         | "update_object" | "delete_object" | "set_parent" | "attach_object"

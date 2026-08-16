@@ -64,7 +64,6 @@ struct ResolvedMaps {
     orm: Texture2D,
     /// Which maps were actually present (drives scalar neutralization).
     pub has_albedo: bool,
-    pub has_normal: bool,
     pub has_roughness: bool,
     pub has_metallic: bool,
     pub has_occlusion: bool,
@@ -79,6 +78,9 @@ pub struct TextureSet {
     pub has_albedo: bool,
     pub has_roughness: bool,
     pub has_metallic: bool,
+    /// Kept for symmetry; AO strength stays the scalar knob either way
+    /// (the shader's `mix(1, orm.r, strength)` needs no neutralization).
+    #[allow(dead_code)]
     pub has_occlusion: bool,
 }
 
@@ -390,7 +392,6 @@ fn load_file_maps(textures: &modeler_core::MaterialTextures) -> Option<ResolvedM
         normal: normal.unwrap_or_else(|| flat_normal(1, 1)),
         orm,
         has_albedo: has.0,
-        has_normal: has.1,
         has_roughness: has.2,
         has_metallic: has.3,
         has_occlusion: has.4,

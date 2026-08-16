@@ -1207,6 +1207,161 @@ pub fn torus(major_segments: u32, minor_segments: u32, major_radius: f32, minor_
     m
 }
 
+// --- parametric props (terrain scattering) ------------------------------
+//
+// Single-mesh nature props, standing on z = 0, roughly `size` meters tall
+// (rocks: `size` across). Deterministic per seed, so identical
+// (kind, seed, size) props share one GPU upload and instance-batch. Trunks
+// are triangle slot 0 (the object's own material), foliage slot 1
+// (`Object::face_materials[0]`).
+
+/// Per-seed pseudo-random in [0, 1) (decorrelated by `salt`).
+fn prop_rand(seed: u32, salt: u32) -> f32 {
+    let h = crate::terrain::hash_u32(
+        seed.wrapping_mul(0x9e37_79b9).wrapping_add(salt.wrapping_mul(0x85eb_ca6b)),
+    );
+    (h >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// A lumpy boulder: displaced icosphere, squashed a little, flat-shaded by
+/// the caller's `smooth = false` default.
+pub fn prop_rock(seed: u32, size: f32) -> MeshData {
+    let mut m = ico_sphere(1, 0.5 * size);
+    let squash = 0.55 + 0.35 * prop_rand(seed, 1);
+    let stretch = 0.85 + 0.4 * prop_rand(seed, 2);
+    for (i, p) in m.positions.iter_mut().enumerate() {
+        // per-vertex radial displacement, seeded, low-frequency enough to
+        // read as facets rather than noise
+        let bump = 0.72 + 0.55 * prop_rand(seed, 10 + i as u32);
+        *p *= bump;
+        p.x *= stretch;
+        p.z *= squash;
+    }
+    // stand on the ground: lift by the (squashed) lowest point
+    let min_z = m.positions.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+    for p in &mut m.positions {
+        p.z -= min_z;
+    }
+    m.recompute_normals();
+    m
+}
+
+/// A conifer: short trunk (slot 0) under two stacked foliage cones (slot 1).
+pub fn prop_conifer(seed: u32, size: f32) -> MeshData {
+    let mut m = MeshData::default();
+    let lean = 0.94 + 0.12 * prop_rand(seed, 1);
+    let trunk_h = 0.18 * size;
+    let trunk_r = 0.035 * size;
+    add_frustum(&mut m, Vec3::ZERO, trunk_r, trunk_r * 0.8, trunk_h, 7, 0);
+    let girth = (0.30 + 0.08 * prop_rand(seed, 2)) * size * lean;
+    // two overlapping cones make the classic silhouette
+    add_frustum(
+        &mut m,
+        Vec3::new(0.0, 0.0, trunk_h * 0.8),
+        girth,
+        girth * 0.28,
+        0.52 * size,
+        8,
+        1,
+    );
+    add_frustum(
+        &mut m,
+        Vec3::new(0.0, 0.0, trunk_h * 0.8 + 0.38 * size),
+        girth * 0.62,
+        0.0,
+        (1.0 - 0.38) * size * 0.9,
+        8,
+        1,
+    );
+    m
+}
+
+/// A broadleaf tree: trunk (slot 0) under a lumpy canopy blob (slot 1).
+pub fn prop_broadleaf(seed: u32, size: f32) -> MeshData {
+    let mut m = MeshData::default();
+    let trunk_h = (0.34 + 0.08 * prop_rand(seed, 1)) * size;
+    let trunk_r = 0.045 * size;
+    add_frustum(&mut m, Vec3::ZERO, trunk_r, trunk_r * 0.7, trunk_h, 7, 0);
+    let canopy_r = (0.30 + 0.06 * prop_rand(seed, 2)) * size;
+    let mut canopy = ico_sphere(1, canopy_r);
+    for (i, p) in canopy.positions.iter_mut().enumerate() {
+        let bump = 0.8 + 0.4 * prop_rand(seed, 20 + i as u32);
+        *p *= bump;
+        p.z *= 0.85;
+    }
+    canopy.recompute_normals();
+    let base = m.positions.len() as u32;
+    let center = Vec3::new(0.0, 0.0, trunk_h + canopy_r * 0.55);
+    m.positions.extend(canopy.positions.iter().map(|p| *p + center));
+    m.normals.extend_from_slice(&canopy.normals);
+    let tri0 = m.indices.len() / 3;
+    m.indices.extend(canopy.indices.iter().map(|i| i + base));
+    let tris = m.indices.len() / 3;
+    m.tri_materials.resize(tri0, 0);
+    m.tri_materials.resize(tris, 1);
+    m
+}
+
+/// A low shrub: squashed displaced icosphere, foliage slot 1 throughout
+/// (so bushes and tree canopies share their leaf material).
+pub fn prop_bush(seed: u32, size: f32) -> MeshData {
+    let mut m = ico_sphere(1, 0.5 * size);
+    for (i, p) in m.positions.iter_mut().enumerate() {
+        let bump = 0.75 + 0.5 * prop_rand(seed, 30 + i as u32);
+        *p *= bump;
+        p.z *= 0.6;
+    }
+    let min_z = m.positions.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+    for p in &mut m.positions {
+        p.z -= min_z * 0.6; // roots slightly sunk
+    }
+    m.recompute_normals();
+    m.tri_materials = vec![1; m.indices.len() / 3];
+    m
+}
+
+/// Append an open frustum (cone/trunk segment) standing at `base`, tagging
+/// its triangles with material `slot`.
+fn add_frustum(
+    m: &mut MeshData,
+    base: Vec3,
+    radius_bottom: f32,
+    radius_top: f32,
+    height: f32,
+    sides: u32,
+    slot: u32,
+) {
+    let start = m.positions.len() as u32;
+    let sides = sides.max(3);
+    for ring in 0..2 {
+        let (r, z) = if ring == 0 {
+            (radius_bottom, 0.0)
+        } else {
+            (radius_top.max(0.001), height)
+        };
+        for i in 0..sides {
+            let a = i as f32 / sides as f32 * TAU;
+            let (sa, ca) = a.sin_cos();
+            m.positions.push(base + Vec3::new(r * ca, r * sa, z));
+            // slope-less approximation; recompute_normals would weld with
+            // other parts, and props are viewed from afar
+            let slope = (radius_bottom - radius_top) / height.max(1e-3);
+            m.normals.push(Vec3::new(ca, sa, slope).normalize());
+        }
+    }
+    let tri0 = m.indices.len() / 3;
+    for i in 0..sides {
+        let a = start + i;
+        let b = start + (i + 1) % sides;
+        let c = b + sides;
+        let d = a + sides;
+        m.indices.extend_from_slice(&[a, b, c, a, c, d]);
+    }
+    let tris = m.indices.len() / 3;
+    m.tri_materials.resize(tri0, 0);
+    m.tri_materials.resize(tris, slot);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

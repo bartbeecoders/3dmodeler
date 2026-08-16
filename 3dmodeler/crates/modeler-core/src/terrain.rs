@@ -22,7 +22,7 @@ pub const MAX_RESOLUTION: u32 = 512;
 // --- deterministic hashed value noise ----------------------------------
 
 /// 32-bit avalanche hash (PCG output permutation).
-fn hash_u32(mut x: u32) -> u32 {
+pub(crate) fn hash_u32(mut x: u32) -> u32 {
     x = x.wrapping_mul(0x2c1b_3c6d).rotate_right(15);
     x = x.wrapping_mul(0x297a_2d39);
     x ^= x >> 15;
@@ -31,7 +31,7 @@ fn hash_u32(mut x: u32) -> u32 {
 }
 
 /// Lattice hash → [0, 1).
-fn hash2(ix: i32, iy: i32, seed: u32) -> f32 {
+pub(crate) fn hash2(ix: i32, iy: i32, seed: u32) -> f32 {
     let h = hash_u32(
         (ix as u32)
             .wrapping_mul(0x8da6_b343)
@@ -1183,6 +1183,174 @@ impl TerrainData {
     }
 }
 
+// --- prop scattering -----------------------------------------------------
+
+/// One scatter run's rules. Candidates sit on a hash-jittered grid of
+/// `cell_size`-meter cells; each passes through slope/height/paint gates,
+/// macro patchiness and a density lottery — all deterministic per seed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScatterParams {
+    /// Candidate spacing in meters (the minimum distance floor).
+    pub cell_size: f32,
+    /// 0..1 acceptance chance per candidate.
+    pub density: f32,
+    /// Scatter seed — same seed re-places the same props.
+    pub seed: u32,
+    /// Reject ground steeper than this (rise/run).
+    pub max_slope: f32,
+    /// Only place between these heights (meters above the base plane).
+    pub height_min: f32,
+    pub height_max: f32,
+    /// Per-prop uniform scale range.
+    pub scale_min: f32,
+    pub scale_max: f32,
+    /// Local-max spacing test (trees): a candidate only wins if its hash
+    /// beats all 8 neighbours', spreading placements apart.
+    pub spacing: bool,
+    /// 0 = even coverage, 1 = strong clustering by low-frequency noise.
+    pub patchiness: f32,
+    /// Skip ground hand-painted rock/cliff/snow/sand (vegetation avoids
+    /// painted clearings; rocks ignore this).
+    pub avoid_paint: bool,
+}
+
+impl Default for ScatterParams {
+    fn default() -> Self {
+        Self {
+            cell_size: 6.0,
+            density: 0.5,
+            seed: 1,
+            max_slope: 0.7,
+            height_min: -1000.0,
+            height_max: 1000.0,
+            scale_min: 0.8,
+            scale_max: 1.4,
+            spacing: true,
+            patchiness: 0.5,
+            avoid_paint: true,
+        }
+    }
+}
+
+/// One placement, in terrain-LOCAL space (apply the terrain's transform —
+/// or parent the prop to the terrain — to get world coordinates).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub position: Vec3,
+    /// Random yaw in radians.
+    pub yaw: f32,
+    pub scale: f32,
+}
+
+impl TerrainData {
+    /// Deterministically scatter prop placements over this terrain.
+    /// Capped at `max` (nearest-the-center candidates win beyond it, by
+    /// simple truncation of the row-major sweep).
+    pub fn scatter(
+        &self,
+        terrain_seed: u32,
+        resolution: u32,
+        size: f32,
+        height: f32,
+        params: &ScatterParams,
+        max: usize,
+    ) -> Vec<Placement> {
+        let grid = self.eval_grid(terrain_seed, resolution, size, height);
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        let step = size / res as f32;
+        let cell = params.cell_size.max(0.5);
+        let cells = ((size / cell).floor() as i32).max(1);
+        let seed = params.seed.wrapping_mul(0x9e37_79b9).wrapping_add(0x5ca7);
+        let mut out = Vec::new();
+
+        'rows: for cy in 0..cells {
+            'candidates: for cx in 0..cells {
+                if out.len() >= max {
+                    break 'rows;
+                }
+                let priority = hash2(cx, cy, seed);
+                // anti-clumping: only the locally strongest candidate places
+                if params.spacing {
+                    for (dx, dy) in [
+                        (-1, -1), (0, -1), (1, -1),
+                        (-1, 0), (1, 0),
+                        (-1, 1), (0, 1), (1, 1),
+                    ] {
+                        if hash2(cx + dx, cy + dy, seed) > priority {
+                            continue 'candidates;
+                        }
+                    }
+                }
+                // jittered position inside the cell, kept off the rim
+                let jx = (hash2(cx, cy, seed.wrapping_add(11)) - 0.5) * 0.84;
+                let jy = (hash2(cx, cy, seed.wrapping_add(12)) - 0.5) * 0.84;
+                let x = ((cx as f32 + 0.5 + jx) * cell - 0.5 * size)
+                    .clamp(-0.49 * size, 0.49 * size);
+                let y = ((cy as f32 + 0.5 + jy) * cell - 0.5 * size)
+                    .clamp(-0.49 * size, 0.49 * size);
+
+                // macro patchiness: clustered coverage instead of confetti
+                let patch = if params.patchiness > 0.0 {
+                    let p = fbm(
+                        Vec2::new(x, y) / (size * 0.25).max(1.0),
+                        seed.wrapping_add(0xbead),
+                        3,
+                        0.5,
+                        2.0,
+                        0.0,
+                        0.0,
+                    );
+                    (1.0 - params.patchiness) + params.patchiness * (p * 1.6 - 0.2)
+                } else {
+                    1.0
+                };
+                // the lottery uses its OWN hash: the spacing test above
+                // keeps locally-maximal `priority` values, which would lose
+                // every `priority < density` draw
+                let lottery = hash2(cx, cy, seed.wrapping_add(15));
+                if lottery >= (params.density * patch).clamp(0.0, 1.0) {
+                    continue;
+                }
+
+                // ground rules
+                let u = x / size + 0.5;
+                let v = y / size + 0.5;
+                let h = sample_grid_normalized(&grid, res as usize, u, v);
+                if h < params.height_min || h > params.height_max {
+                    continue;
+                }
+                let gx = ((u * res as f32) as usize).min(res as usize - 1);
+                let gy = ((v * res as f32) as usize).min(res as usize - 1);
+                let idx = gy * n + gx;
+                let dzdx = (grid[idx + 1] - grid[idx]) / step;
+                let dzdy = (grid[idx + n] - grid[idx]) / step;
+                if (dzdx * dzdx + dzdy * dzdy).sqrt() > params.max_slope {
+                    continue;
+                }
+                if params.avoid_paint {
+                    if let Some(paint) = &self.paint {
+                        let (slot, w) = paint.sample(u, v);
+                        // channels 2..=5: rock, cliff, snow, sand
+                        if slot >= 2 && w > 0.5 {
+                            continue;
+                        }
+                    }
+                }
+
+                out.push(Placement {
+                    position: Vec3::new(x, y, h),
+                    yaw: hash2(cx, cy, seed.wrapping_add(13)) * std::f32::consts::TAU,
+                    scale: params.scale_min
+                        + (params.scale_max - params.scale_min)
+                            * hash2(cx, cy, seed.wrapping_add(14)),
+                });
+            }
+        }
+        out
+    }
+}
+
 /// Order-and-bit-exact fingerprint of an evaluated grid (stale detection).
 pub fn grid_stamp(grid: &[f32]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -2317,6 +2485,74 @@ mod tests {
         let json = serde_json::to_string(&paint).unwrap();
         let back: PaintLayer = serde_json::from_str(&json).unwrap();
         assert_eq!(back, paint);
+    }
+
+    #[test]
+    fn scatter_is_deterministic_and_respects_the_rules() {
+        let data = TerrainData::default();
+        let params = ScatterParams {
+            density: 0.8,
+            max_slope: 0.6,
+            height_min: 1.0,
+            height_max: 9.0,
+            ..Default::default()
+        };
+        let a = data.scatter(1, 128, 100.0, 12.0, &params, 5000);
+        let b = data.scatter(1, 128, 100.0, 12.0, &params, 5000);
+        assert_eq!(a, b, "same seeds must reproduce");
+        assert!(!a.is_empty(), "dense scatter on hills must place props");
+        let grid = data.eval_grid(1, 128, 100.0, 12.0);
+        for p in &a {
+            assert!(p.position.x.abs() <= 50.0 && p.position.y.abs() <= 50.0);
+            assert!(p.position.z >= 1.0 - 1e-3 && p.position.z <= 9.0 + 1e-3);
+            let h = sample_height(&grid, 128, 100.0, p.position.x, p.position.y);
+            assert!((h - p.position.z).abs() < 0.6, "sits on the surface");
+            assert!(p.scale >= 0.8 && p.scale <= 1.4);
+        }
+        // different scatter seed → different layout
+        let c = data.scatter(
+            1,
+            128,
+            100.0,
+            12.0,
+            &ScatterParams { seed: 9, ..params },
+            5000,
+        );
+        assert_ne!(a, c);
+        // spacing: no two placements share a cell-size neighbourhood
+        for (i, p) in a.iter().enumerate() {
+            for q in &a[i + 1..] {
+                let d = (p.position - q.position).truncate().length();
+                assert!(d > 3.0, "spacing keeps props apart, got {d}");
+            }
+        }
+        // the cap truncates
+        assert_eq!(data.scatter(1, 128, 100.0, 12.0, &params, 3).len(), 3);
+    }
+
+    #[test]
+    fn prop_meshes_are_sane() {
+        use crate::mesh;
+        for (mesh, two_slots) in [
+            (mesh::prop_rock(3, 1.5), false),
+            (mesh::prop_conifer(3, 4.0), true),
+            (mesh::prop_broadleaf(3, 5.0), true),
+            (mesh::prop_bush(3, 1.0), true),
+        ] {
+            assert!(!mesh.indices.is_empty());
+            assert!(mesh.positions.len() == mesh.normals.len());
+            let min_z = mesh.positions.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+            assert!(min_z > -0.5, "props stand near z=0, got {min_z}");
+            if two_slots {
+                assert!(
+                    mesh.tri_materials.iter().any(|s| *s == 1),
+                    "foliage triangles tagged slot 1"
+                );
+                assert_eq!(mesh.tri_materials.len(), mesh.indices.len() / 3);
+            }
+            // determinism
+        }
+        assert_eq!(mesh::prop_rock(7, 2.0), mesh::prop_rock(7, 2.0));
     }
 
     #[test]

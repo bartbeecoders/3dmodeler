@@ -290,6 +290,16 @@ pub enum Primitive {
         #[serde(default = "default_cloth_stiffness")]
         stiffness: f32,
     },
+    /// A single-mesh nature prop (rock, conifer, broadleaf, bush) standing
+    /// on z = 0, `size` meters tall (rocks: across). `seed` varies the
+    /// shape: props sharing (kind, seed, size) share one GPU upload, which
+    /// is what makes terrain scattering cheap to draw. Trunk/rock surfaces
+    /// use the object's own material; foliage is `face_materials[0]`.
+    Prop {
+        kind: PropKind,
+        seed: u32,
+        size: f32,
+    },
     /// Procedural terrain: a `size` × `size` height grid standing on z = 0,
     /// centered on the origin in XY, rising to at most `height` meters
     /// (rivers may dig slightly below the base plane). The heights come
@@ -311,6 +321,55 @@ pub enum Primitive {
 /// Default cloth stiffness (soft enough to drape; 1.0 would be nearly rigid).
 fn default_cloth_stiffness() -> f32 {
     0.25
+}
+
+/// The built-in nature props (`Primitive::Prop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropKind {
+    Rock,
+    Conifer,
+    Broadleaf,
+    Bush,
+}
+
+impl PropKind {
+    pub const ALL: [PropKind; 4] =
+        [PropKind::Rock, PropKind::Conifer, PropKind::Broadleaf, PropKind::Bush];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropKind::Rock => "Rock",
+            PropKind::Conifer => "Conifer",
+            PropKind::Broadleaf => "Broadleaf",
+            PropKind::Bush => "Bush",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PropKind> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.label().eq_ignore_ascii_case(name))
+    }
+
+    /// Foliage color for `face_materials[0]` (None: single-material prop).
+    pub fn foliage_color(self) -> Option<[f32; 3]> {
+        match self {
+            PropKind::Rock => None,
+            PropKind::Conifer => Some([0.13, 0.25, 0.12]),
+            PropKind::Broadleaf => Some([0.20, 0.34, 0.13]),
+            PropKind::Bush => Some([0.22, 0.36, 0.16]),
+        }
+    }
+
+    /// Base (trunk / rock) color for the object's own material.
+    pub fn base_color(self) -> [f32; 3] {
+        match self {
+            PropKind::Rock => [0.45, 0.42, 0.38],
+            PropKind::Bush => [0.25, 0.20, 0.12],
+            _ => [0.30, 0.21, 0.12], // bark
+        }
+    }
 }
 
 /// One end of a `Primitive::Rope`: free, or pinned to a point on another object.
@@ -454,6 +513,7 @@ impl Primitive {
             Primitive::Rope { .. } => "Rope",
             Primitive::Cloth { .. } => "Cloth",
             Primitive::Terrain { .. } => "Terrain",
+            Primitive::Prop { kind, .. } => kind.label(),
         }
     }
 
@@ -518,6 +578,7 @@ impl Primitive {
             Primitive::Terrain { size, height, .. } => {
                 (0.5 * size * size + height * height).sqrt()
             }
+            Primitive::Prop { size, .. } => size * 1.2,
         }
     }
 
@@ -570,6 +631,11 @@ impl Primitive {
             }
             Primitive::Cloth { width, height, .. } => Vec3::new(width, height, 0.0),
             Primitive::Terrain { size, height, .. } => Vec3::new(size, size, height),
+            Primitive::Prop { kind, size, .. } => match kind {
+                PropKind::Rock => Vec3::new(size, size, 0.6 * size),
+                PropKind::Bush => Vec3::new(size, size, 0.5 * size),
+                _ => Vec3::new(0.7 * size, 0.7 * size, size),
+            },
         }
     }
 
@@ -594,6 +660,7 @@ impl Primitive {
             Primitive::Rope { radius, .. } => radius,
             Primitive::Cloth { .. } => 0.0,
             Primitive::Terrain { .. } => 0.0, // stands on its base plane
+            Primitive::Prop { .. } => 0.0,    // stands on its roots
         }
     }
 
@@ -642,6 +709,12 @@ impl Primitive {
             Primitive::Terrain { size, resolution, height, seed } => {
                 terrain::generate_mesh(&TerrainData::default(), size, resolution, height, seed)
             }
+            Primitive::Prop { kind, seed, size } => match kind {
+                PropKind::Rock => mesh::prop_rock(seed, size),
+                PropKind::Conifer => mesh::prop_conifer(seed, size),
+                PropKind::Broadleaf => mesh::prop_broadleaf(seed, size),
+                PropKind::Bush => mesh::prop_bush(seed, size),
+            },
         };
         if smooth {
             m
@@ -1309,6 +1382,19 @@ impl Scene {
                 object.terrain = Some(TerrainData::default());
                 object.material.base_color = [0.35, 0.48, 0.28];
                 object.material.roughness = 0.95;
+            }
+        }
+        // Nature props: bark/rock base material + a foliage face material.
+        if let Primitive::Prop { kind, .. } = primitive {
+            if let Some(object) = self.objects.last_mut() {
+                object.material.base_color = kind.base_color();
+                object.material.roughness = 0.9;
+                if let Some(c) = kind.foliage_color() {
+                    let mut foliage = Material::default();
+                    foliage.base_color = c;
+                    foliage.roughness = 0.95;
+                    object.face_materials.push(foliage);
+                }
             }
         }
         // Ropes / cloth are physical by default — they only do something useful under gravity.

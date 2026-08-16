@@ -305,6 +305,19 @@ fn primitive_from_name(name: &str) -> Option<Primitive> {
             stiffness: 0.25,
         }),
         "terrain" => Some(Primitive::default_terrain()),
+        "rock" | "conifer" | "broadleaf" | "bush" => {
+            let kind = modeler_core::PropKind::from_name(name).expect("matched above");
+            Some(Primitive::Prop {
+                kind,
+                seed: 1,
+                size: match kind {
+                    modeler_core::PropKind::Rock => 1.4,
+                    modeler_core::PropKind::Conifer => 5.0,
+                    modeler_core::PropKind::Broadleaf => 5.5,
+                    modeler_core::PropKind::Bush => 1.2,
+                },
+            })
+        }
         "light" | "point_light" | "pointlight" => Some(Primitive::light_catalog()[0]),
         "sun" | "sun_light" => Some(Primitive::light_catalog()[1]),
         "spot" | "spot_light" | "spotlight" => Some(Primitive::light_catalog()[2]),
@@ -619,6 +632,27 @@ fn apply_object_params(
                             .map_err(|e| format!("bad 'terrain_color': {e}"))?,
                     );
                 }
+            }
+        }
+        // prop parameters (props only)
+        if let Primitive::Prop { kind, seed, size } = object.primitive {
+            let kind = match params.get("prop_kind").and_then(Value::as_str) {
+                Some(name) => modeler_core::PropKind::from_name(name).ok_or_else(|| {
+                    format!("unknown prop_kind '{name}' (rock|conifer|broadleaf|bush)")
+                })?,
+                None => kind,
+            };
+            let sz = params.get("size").and_then(Value::as_f64).map(|v| v as f32);
+            let sd = params.get("seed").and_then(Value::as_u64).map(|v| v as u32);
+            if kind != (if let Primitive::Prop { kind, .. } = object.primitive { kind } else { kind })
+                || sz.is_some()
+                || sd.is_some()
+            {
+                object.primitive = Primitive::Prop {
+                    kind,
+                    seed: sd.unwrap_or(seed),
+                    size: sz.unwrap_or(size).clamp(0.1, 100.0),
+                };
             }
         }
         if let Some(cutouts) = cutouts {
@@ -1608,11 +1642,100 @@ fn execute_inner(
             apply_object_params(scene, id, command)?;
             Ok(json!({"object": object_json(scene, scene.object(id).unwrap())}))
         }
+        "scatter_props" => {
+            let id = resolve(scene, &command["object"])?;
+            let mut params = modeler_core::terrain::ScatterParams::default();
+            let get_f = |k: &str| command.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            if let Some(v) = get_f("density") {
+                params.density = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = command.get("seed").and_then(Value::as_u64) {
+                params.seed = v as u32;
+            }
+            if let Some(v) = get_f("cell_size") {
+                params.cell_size = v.max(0.5);
+            }
+            if let Some(v) = get_f("max_slope") {
+                params.max_slope = v;
+            }
+            if let Some(v) = get_f("height_min") {
+                params.height_min = v;
+            }
+            if let Some(v) = get_f("height_max") {
+                params.height_max = v;
+            }
+            if let Some(v) = get_f("scale_min") {
+                params.scale_min = v.max(0.05);
+            }
+            if let Some(v) = get_f("scale_max") {
+                params.scale_max = v.max(params.scale_min);
+            }
+            if let Some(v) = get_f("patchiness") {
+                params.patchiness = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = command.get("spacing").and_then(Value::as_bool) {
+                params.spacing = v;
+            }
+            if let Some(v) = command.get("avoid_paint").and_then(Value::as_bool) {
+                params.avoid_paint = v;
+            }
+            let max = command
+                .get("max")
+                .and_then(Value::as_u64)
+                .unwrap_or(800) as usize;
+            let (root, count) = if let Some(name) =
+                command.get("type").and_then(Value::as_str)
+            {
+                let kind = modeler_core::PropKind::from_name(name).ok_or_else(|| {
+                    format!("unknown prop type '{name}' (rock|conifer|broadleaf|bush)")
+                })?;
+                crate::object_ops::scatter_props(
+                    scene,
+                    id,
+                    crate::object_ops::ScatterSource::Kind(kind),
+                    &params,
+                    max,
+                )?
+            } else if let Some(name) = command.get("asset").and_then(Value::as_str) {
+                let asset = library_doc
+                    .assets()
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .ok_or_else(|| format!("no library asset named '{name}'"))?;
+                crate::object_ops::scatter_props(
+                    scene,
+                    id,
+                    crate::object_ops::ScatterSource::Asset(&asset),
+                    &params,
+                    max,
+                )?
+            } else {
+                return Err(
+                    "scatter_props needs 'type' (rock|conifer|broadleaf|bush) or a \
+                     library 'asset' name"
+                        .into(),
+                );
+            };
+            let name = scene.object(root).map(|o| o.name.clone()).unwrap_or_default();
+            Ok(json!({"count": count, "root": root.0, "root_name": name}))
+        }
         "delete_object" => {
             let id = resolve(scene, &command["object"])?;
-            scene.remove_object(id);
+            // with_children removes the whole subtree (scatter groups,
+            // assemblies); default keeps children, re-rooted
+            let mut removed = 1;
+            if command.get("with_children").and_then(Value::as_bool) == Some(true) {
+                let subtree = scene.subtree(id);
+                removed = subtree.len();
+                for child in subtree {
+                    scene.remove_object(child);
+                }
+            } else {
+                scene.remove_object(id);
+            }
             selection.retain_existing(|i| scene.object(i).is_some());
-            Ok(json!({}))
+            Ok(json!({"removed": removed}))
         }
         "set_parent" => {
             let child = resolve(scene, &command["child"])?;

@@ -104,6 +104,9 @@ pub struct UiState {
     /// Set by the Object menu, the properties panel and the context wheel;
     /// the window itself lives in `break_dialog_window`.
     break_dialog: Option<(object_ops::BreakKind, i32)>,
+    /// Persistent settings of the terrain Scatter section (Data tab).
+    scatter_kind: modeler_core::PropKind,
+    scatter_params: modeler_core::terrain::ScatterParams,
     /// Active Properties panel tab (Blender-style icon tabs).
     properties_tab: PropertiesTab,
     /// Eyedropper armed on a boolean modifier: (object owning the stack,
@@ -181,6 +184,8 @@ impl UiState {
             import_buffer: String::new(),
             pick_boolean_tool: None,
             break_dialog: None,
+            scatter_kind: modeler_core::PropKind::Conifer,
+            scatter_params: modeler_core::terrain::ScatterParams::default(),
             properties_tab: PropertiesTab::Transform,
             status_message: None,
             current_file: None,
@@ -1393,6 +1398,8 @@ impl UiState {
                     &mut self.pbr_library_panel,
                     &mut self.pick_boolean_tool,
                     sculpt_tool,
+                    &mut self.scatter_kind,
+                    &mut self.scatter_params,
                 ) {
                     self.status_message = Some(message);
                 }
@@ -3488,6 +3495,8 @@ fn properties(
     pbr_library: &mut PbrLibraryPanel,
     pick_boolean_tool: &mut Option<(ObjectId, usize)>,
     sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
+    scatter_kind: &mut modeler_core::PropKind,
+    scatter_params: &mut modeler_core::terrain::ScatterParams,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
         // PBR library can be browsed without a selection (Apply still needs one).
@@ -3567,6 +3576,7 @@ fn properties(
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
     // (new stack, remesh?) — remesh=false persists setting edits only
     let mut edited_terrain: Option<(modeler_core::TerrainData, bool)> = None;
+    let mut scatter_request = false;
     let mut break_kind: Option<object_ops::BreakKind> = None;
     let mut master_action: Option<MasterAction> = None;
     let mut apply_function: Option<MaterialFunction> = None;
@@ -3747,6 +3757,62 @@ fn properties(
                         terrain_erosion_ui(ui, &mut stack, &primitive);
                     ui.add_space(6.0);
                     let color_dirty = terrain_color_ui(ui, &mut stack);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Scatter props").strong());
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("scatter-kind")
+                            .selected_text(scatter_kind.label())
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for k in modeler_core::PropKind::ALL {
+                                    if ui.selectable_label(*scatter_kind == k, k.label()).clicked() {
+                                        *scatter_kind = k;
+                                    }
+                                }
+                            });
+                        if ui
+                            .button("Scatter")
+                            .on_hover_text(
+                                "Place props over the terrain (grouped under one \
+                                 root; click any prop to select the whole set, \
+                                 X deletes it, Ctrl+Z undoes)",
+                            )
+                            .clicked()
+                        {
+                            scatter_request = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Density");
+                        ui.add(egui::Slider::new(&mut scatter_params.density, 0.05..=1.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Seed");
+                        ui.add(egui::DragValue::new(&mut scatter_params.seed).speed(1));
+                        ui.label("Spacing");
+                        ui.add(
+                            egui::DragValue::new(&mut scatter_params.cell_size)
+                                .speed(0.1)
+                                .range(0.5..=100.0)
+                                .suffix(" m"),
+                        );
+                    });
+                    egui::CollapsingHeader::new("Rules")
+                        .id_salt("scatter-rules")
+                        .show(ui, |ui| {
+                            slider_row(ui, "Max slope", &mut scatter_params.max_slope, 0.05..=3.0);
+                            float_row_ex(ui, "Min height", &mut scatter_params.height_min, 0.1, -1000.0..=1000.0, Some(" m"));
+                            float_row_ex(ui, "Max height", &mut scatter_params.height_max, 0.1, -1000.0..=1000.0, Some(" m"));
+                            slider_row(ui, "Scale min", &mut scatter_params.scale_min, 0.1..=3.0);
+                            slider_row(ui, "Scale max", &mut scatter_params.scale_max, 0.1..=4.0);
+                            slider_row(ui, "Patchiness", &mut scatter_params.patchiness, 0.0..=1.0);
+                            ui.checkbox(&mut scatter_params.spacing, "Keep props apart");
+                            ui.checkbox(
+                                &mut scatter_params.avoid_paint,
+                                "Avoid painted rock/snow/sand",
+                            );
+                        });
+
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Terrain layers").strong());
                     let stack_changed = terrain_stack_ui(ui, &mut stack);
@@ -4581,6 +4647,24 @@ fn properties(
             }
         }
     }
+    let mut status_override = None;
+    if scatter_request {
+        scatter_params.scale_max = scatter_params.scale_max.max(scatter_params.scale_min);
+        status_override = Some(
+            match object_ops::scatter_props(
+                scene,
+                active_id,
+                object_ops::ScatterSource::Kind(*scatter_kind),
+                scatter_params,
+                800,
+            ) {
+                Ok((_, count)) => {
+                    format!("scattered {count} {}", scatter_kind.label().to_lowercase())
+                }
+                Err(e) => e,
+            },
+        );
+    }
     let mut status = None;
     if !modifier_edits.is_empty() || modifier_add.is_some() {
         if let Some(object) = scene.object_mut(active_id) {
@@ -4613,7 +4697,7 @@ fn properties(
     if let Some(kind) = break_kind {
         *break_dialog = Some((kind, object_ops::DEFAULT_PARTICLES as i32));
     }
-    status
+    status_override.or(status)
 }
 
 /// Toolbar toggle for the edit-mode element select, with a painted
@@ -5529,6 +5613,36 @@ fn primitive_params(
                 egui::RichText::new(
                     "Heights come from the layer stack below — same seed and \
                      stack always rebuild the same terrain.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+        Primitive::Prop { kind, seed, size } => {
+            ui.horizontal(|ui| {
+                ui.label("Kind");
+                egui::ComboBox::from_id_salt("prop-kind")
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in modeler_core::PropKind::ALL {
+                            if ui.selectable_label(*kind == k, k.label()).clicked()
+                                && *kind != k
+                            {
+                                *kind = k;
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            changed |= float_row_ex(ui, "Size", size, 0.05, 0.1..=100.0, Some(" m"));
+            ui.horizontal(|ui| {
+                ui.label("Variant");
+                changed |= ui.add(egui::DragValue::new(seed).speed(1)).changed();
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Foliage color lives in the face material; trunk/rock is \
+                     the object material.",
                 )
                 .weak()
                 .size(11.0),
