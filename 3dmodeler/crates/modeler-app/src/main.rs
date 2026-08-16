@@ -188,6 +188,8 @@ pub fn main() {
     let mut lights = scene_render::SceneLights::new();
 
     let mut egui_kb_last_frame = false;
+    // last OS window title we asked for (avoid a set_title call per frame)
+    let mut last_title = "3D Modeler";
 
     // The interface and the drawing surface are passed in rather than captured:
     // both are created after the window exists, which on winit 0.30 is inside
@@ -1476,7 +1478,20 @@ pub fn main() {
             }
         }
 
-        FrameOutput::default()
+        // Simulation mode belongs in the OS window title too — the taskbar
+        // and window list should say the scene is live, not just the status
+        // bar. State goes first so it survives title truncation.
+        let wanted_title = match physics.sim_state() {
+            physics::SimState::Playing => "▶ Simulating — 3D Modeler",
+            physics::SimState::Paused => "⏸ Simulation paused — 3D Modeler",
+            physics::SimState::Stopped => "3D Modeler",
+        };
+        let title = (wanted_title != last_title).then(|| {
+            last_title = wanted_title;
+            wanted_title.to_string()
+        });
+
+        FrameOutput { title, ..Default::default() }
     };
 
     #[cfg(target_arch = "wasm32")]
@@ -1554,6 +1569,9 @@ where
         };
         running.gfx.queue().submit([encoder.finish()]);
 
+        if let Some(title) = &frame_output.title {
+            running.window.set_title(title);
+        }
         if frame_output.exit {
             event_loop.exit();
             return;
