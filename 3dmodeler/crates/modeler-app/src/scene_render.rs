@@ -362,6 +362,9 @@ fn mesh_key(scene: &Scene, object: &modeler_core::Object) -> u64 {
     if !shareable(object) {
         object.id.0.hash(&mut h);
         object.mesh_revision.hash(&mut h);
+        // live sculpt strokes: the renderer follows every dab, while the
+        // physics ShapeKey deliberately ignores this counter (see Object)
+        object.sculpt_revision.hash(&mut h);
     }
     h.finish()
 }

@@ -196,6 +196,12 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
             "resolution": resolution,
             "height": height,
             "seed": seed,
+            // hand-sculpted offsets present (clear with clear_sculpt=true)
+            "has_sculpt": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.sculpt.as_ref())
+                .is_some_and(|s| !s.is_empty()),
             // the full stack (round-trippable through update_object {terrain: ...})
             "layers": object
                 .terrain
@@ -481,6 +487,13 @@ fn apply_object_params(
                     .map_err(|e| format!("bad 'terrain' stack: {e}"))?;
                 object.terrain = Some(data);
                 object.mesh_revision += 1;
+            }
+            if params.get("clear_sculpt").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    if data.sculpt.take().is_some() {
+                        object.mesh_revision += 1;
+                    }
+                }
             }
         }
         if let Some(cutouts) = cutouts {

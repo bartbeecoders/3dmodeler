@@ -238,6 +238,7 @@ impl UiState {
         edit: Option<&mut EditMode>,
         wall_tool: &mut crate::wall_tool::WallTool,
         roof_tool: &mut crate::roof_tool::RoofTool,
+        sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
         snap_to_grid: &mut bool,
         snap_to_vertex: &mut bool,
         shade_mode: &mut ShadeMode,
@@ -344,6 +345,7 @@ impl UiState {
         let right_offset = if self.show_sidebar {
             self.sidebar(
                 ctx, scene, selection, settings, calibrate, marker_tool, library, edit_point,
+                sculpt_tool,
             )
         } else {
             0.0
@@ -1285,6 +1287,7 @@ impl UiState {
         marker_tool: &mut MarkerTool,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
+        sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
     ) -> f32 {
         #[allow(deprecated)]
         let response = egui::Panel::right("sidebar")
@@ -1389,6 +1392,7 @@ impl UiState {
                     &mut self.properties_tab,
                     &mut self.pbr_library_panel,
                     &mut self.pick_boolean_tool,
+                    sculpt_tool,
                 ) {
                     self.status_message = Some(message);
                 }
@@ -3483,6 +3487,7 @@ fn properties(
     tab: &mut PropertiesTab,
     pbr_library: &mut PbrLibraryPanel,
     pick_boolean_tool: &mut Option<(ObjectId, usize)>,
+    sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
 ) -> Option<String> {
     let Some(active_id) = selection.active() else {
         // PBR library can be browsed without a selection (Apply still needs one).
@@ -3722,6 +3727,19 @@ fn properties(
                 }
 
                 if matches!(primitive, Primitive::Terrain { .. }) {
+                    ui.add_space(6.0);
+                    let sculpting = sculpt_tool.target() == Some(active_id);
+                    let label = if sculpting { "Sculpting…" } else { "Sculpt terrain" };
+                    if ui
+                        .add_enabled(!sculpting, egui::Button::new(label))
+                        .on_hover_text(
+                            "Paint height with a brush in the viewport: raise, \
+                             lower, smooth, flatten. Esc exits.",
+                        )
+                        .clicked()
+                    {
+                        sculpt_tool.start(active_id);
+                    }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Terrain layers").strong());
                     let mut stack = object.terrain.clone().unwrap_or_default();
@@ -4837,6 +4855,15 @@ fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) ->
                     ui.close();
                 }
             }
+            ui.separator();
+            ui.label(egui::RichText::new("Stamps").weak().size(10.0));
+            for shape in modeler_core::terrain::ShapeKind::ALL {
+                if ui.button(shape.label()).clicked() {
+                    stack.layers.push(TerrainLayer::new(LayerKind::shape(shape)));
+                    changed = true;
+                    ui.close();
+                }
+            }
         });
     });
 
@@ -4929,6 +4956,30 @@ fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) ->
                     }
                     LayerKind::Constant { value } => {
                         changed |= slider_row(ui, "Value", value, -1.0..=1.0);
+                    }
+                    LayerKind::Shape { shape, x, y, radius, rotation_deg, aspect, falloff, detail } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Shape");
+                            egui::ComboBox::from_id_salt(("terrain-shape", i))
+                                .selected_text(shape.label())
+                                .show_ui(ui, |ui| {
+                                    for s in modeler_core::terrain::ShapeKind::ALL {
+                                        if ui.selectable_label(*shape == s, s.label()).clicked()
+                                            && *shape != s
+                                        {
+                                            *shape = s;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        changed |= float_row_ex(ui, "X", x, 0.25, -2000.0..=2000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Y", y, 0.25, -2000.0..=2000.0, Some(" m"));
+                        changed |= float_row_ex(ui, "Radius", radius, 0.25, 0.5..=1000.0, Some(" m"));
+                        changed |= slider_row(ui, "Rotation °", rotation_deg, 0.0..=360.0);
+                        changed |= slider_row(ui, "Stretch", aspect, 0.2..=8.0);
+                        changed |= slider_row(ui, "Falloff", falloff, 0.05..=1.0);
+                        changed |= slider_row(ui, "Detail", detail, 0.0..=1.0);
                     }
                     LayerKind::DomainWarp { scale, strength, octaves } => {
                         changed |= float_row_ex(ui, "Scale", scale, 0.5, 1.0..=1000.0, Some(" m"));

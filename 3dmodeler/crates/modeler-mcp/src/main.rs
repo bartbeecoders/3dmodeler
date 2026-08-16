@@ -111,6 +111,7 @@ fn tool_definitions() -> Value {
                     "seed": {"type": "integer", "description": "Terrain only: world seed — same seed + stack = same terrain (default 1)"},
                     "terrain_preset": {"type": "string", "enum": ["Hills", "Alpine", "Dunes", "Archipelago", "Canyon", "Volcanic", "Rolling", "Craters"], "description": "Terrain only: replace the layer stack with a named preset"},
                     "terrain": {"type": "object", "description": "Terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
+                    "clear_sculpt": {"type": "boolean", "description": "Terrain only: true removes all hand-sculpted brush offsets, restoring the pure procedural surface"},
                     "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
                     "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},

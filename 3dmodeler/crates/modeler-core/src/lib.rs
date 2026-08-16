@@ -815,6 +815,13 @@ pub struct Object {
     /// they change it so the render/physics caches resync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terrain: Option<TerrainData>,
+    /// Bumped on every sculpt-brush dab. The RENDERER keys on it (so the
+    /// stroke shows live) but the physics mirror does not — rebuilding a
+    /// terrain collider per dab would stall the stroke. The sculpt tool
+    /// bumps `mesh_revision` once at stroke end to resync collision.
+    /// Not saved: like `mesh_revision`, caches start fresh per session.
+    #[serde(skip)]
+    pub sculpt_revision: u64,
     /// Cloth pin points (grid vertices). Only meaningful for `Primitive::Cloth`.
     #[serde(default)]
     pub cloth_anchors: Vec<ClothAnchor>,
@@ -1290,6 +1297,7 @@ impl Scene {
             rope_end: RopeEnd::default(),
             rope_nodes: None,
             terrain: None,
+            sculpt_revision: 0,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
         });

@@ -199,6 +199,20 @@ pub enum LayerKind {
     Flow { scale: f32, direction_deg: f32, width: f32, meander: f32 },
     /// Flat offset (raise / lower everything the mask lets through).
     Constant { value: f32 },
+    /// A single stamped landform placed at `(x, y)` in terrain-local meters:
+    /// mountain, ridge, valley, plateau or crater. `rotation_deg`/`aspect`
+    /// orient and stretch the footprint (ridges); `detail` roughens the
+    /// profile with noise.
+    Shape {
+        shape: ShapeKind,
+        x: f32,
+        y: f32,
+        radius: f32,
+        rotation_deg: f32,
+        aspect: f32,
+        falloff: f32,
+        detail: f32,
+    },
     /// MODIFIER: bends the sample position of every layer BELOW it.
     DomainWarp { scale: f32, strength: f32, octaves: u32 },
     /// MODIFIER: quantizes the accumulated height into steps.
@@ -217,6 +231,7 @@ impl LayerKind {
             LayerKind::Dune { .. } => "Dunes",
             LayerKind::Flow { .. } => "River",
             LayerKind::Constant { .. } => "Constant",
+            LayerKind::Shape { shape, .. } => shape.label(),
             LayerKind::DomainWarp { .. } => "Domain warp",
             LayerKind::Terrace { .. } => "Terrace",
         }
@@ -242,6 +257,52 @@ impl LayerKind {
             LayerKind::DomainWarp { scale: 70.0, strength: 12.0, octaves: 3 },
             LayerKind::Terrace { steps: 8, smoothness: 0.4 },
         ]
+    }
+
+    /// A default stamp of the given shape, centered on the terrain.
+    pub fn shape(shape: ShapeKind) -> LayerKind {
+        LayerKind::Shape {
+            shape,
+            x: 0.0,
+            y: 0.0,
+            radius: 25.0,
+            rotation_deg: 0.0,
+            aspect: if shape == ShapeKind::Ridge { 3.0 } else { 1.0 },
+            falloff: 0.5,
+            detail: 0.3,
+        }
+    }
+}
+
+/// The stampable landforms of `LayerKind::Shape`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    Mountain,
+    Ridge,
+    /// Negative mountain — defaults to the Subtract blend when added.
+    Valley,
+    Plateau,
+    Crater,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 5] = [
+        ShapeKind::Mountain,
+        ShapeKind::Ridge,
+        ShapeKind::Valley,
+        ShapeKind::Plateau,
+        ShapeKind::Crater,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Mountain => "Mountain",
+            ShapeKind::Ridge => "Ridge",
+            ShapeKind::Valley => "Valley",
+            ShapeKind::Plateau => "Plateau",
+            ShapeKind::Crater => "Crater (stamp)",
+        }
     }
 }
 
@@ -367,6 +428,8 @@ impl TerrainLayer {
     pub fn new(kind: LayerKind) -> Self {
         let blend = match kind {
             LayerKind::Flow { .. } => BlendMode::Carve,
+            // valleys dig; carving keeps the surrounding terrain untouched
+            LayerKind::Shape { shape: ShapeKind::Valley, .. } => BlendMode::Carve,
             _ => BlendMode::Add,
         };
         Self {
@@ -389,6 +452,387 @@ impl TerrainLayer {
 pub struct TerrainData {
     #[serde(default)]
     pub layers: Vec<TerrainLayer>,
+    /// Hand-sculpted height offsets (meters), added on top of the stack.
+    /// Non-destructive: clearing it restores the pure procedural surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sculpt: Option<SculptLayer>,
+    /// Memoized stack evaluation, so sculpt strokes don't re-run the noise
+    /// layers every frame. Never serialized, never cloned, always equal.
+    #[serde(skip)]
+    cache: BaseCache,
+}
+
+/// Interior-mutable memo of the last `eval_base_grid` run. Deliberately
+/// inert for Clone/PartialEq so undo snapshots and change detection see
+/// two logically-equal terrains as equal regardless of cache state.
+#[derive(Default)]
+struct BaseCache(std::cell::RefCell<Option<(BaseKey, Vec<f32>)>>);
+
+#[derive(PartialEq, Clone)]
+struct BaseKey {
+    layers: Vec<TerrainLayer>,
+    seed: u32,
+    resolution: u32,
+    size: f32,
+    height: f32,
+}
+
+impl Clone for BaseCache {
+    fn clone(&self) -> Self {
+        Self::default() // caches don't travel with copies
+    }
+}
+
+impl PartialEq for BaseCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for BaseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BaseCache")
+    }
+}
+
+// --- hand sculpting ------------------------------------------------------
+
+/// Which way a sculpt brush pushes the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushMode {
+    Raise,
+    Lower,
+    /// Blur the surface toward the local average.
+    Smooth,
+    /// Pull the surface toward the height under the cursor at stroke start.
+    Flatten,
+}
+
+impl BrushMode {
+    pub const ALL: [BrushMode; 4] =
+        [BrushMode::Raise, BrushMode::Lower, BrushMode::Smooth, BrushMode::Flatten];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrushMode::Raise => "Raise",
+            BrushMode::Lower => "Lower",
+            BrushMode::Smooth => "Smooth",
+            BrushMode::Flatten => "Flatten",
+        }
+    }
+}
+
+/// Hand-sculpted signed height offsets in meters, on its own `(res+1)²`
+/// vertex grid over the terrain footprint. Stored losslessly in scene files
+/// as base64 of the raw little-endian f32 bytes (see the serde impls).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SculptLayer {
+    /// Grid quads per side (vertices = resolution + 1 per side).
+    pub resolution: u32,
+    /// Row-major `(resolution+1)²` offsets, meters.
+    pub deltas: Vec<f32>,
+}
+
+impl SculptLayer {
+    pub fn new(resolution: u32) -> Self {
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        Self { resolution: res, deltas: vec![0.0; n * n] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.deltas.iter().all(|d| *d == 0.0)
+    }
+
+    /// Bilinear sample at normalized coordinates (0..1 across the grid).
+    pub fn sample_normalized(&self, u: f32, v: f32) -> f32 {
+        sample_grid_normalized(&self.deltas, self.resolution as usize, u, v)
+    }
+
+    /// Re-grid to a new resolution (bilinear), keeping the sculpt intact
+    /// when the terrain's mesh resolution changes.
+    pub fn resample(&self, resolution: u32) -> Self {
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        if res == self.resolution {
+            return self.clone();
+        }
+        let n = res as usize + 1;
+        let mut out = Self::new(res);
+        for iy in 0..n {
+            for ix in 0..n {
+                let u = ix as f32 / res as f32;
+                let v = iy as f32 / res as f32;
+                out.deltas[iy * n + ix] = self.sample_normalized(u, v);
+            }
+        }
+        out
+    }
+
+    /// Apply one brush dab at `center` (terrain-local meters, footprint
+    /// `[-size/2, size/2]²`). `amount` is meters of push for Raise/Lower and
+    /// a 0..1 lerp factor for Smooth/Flatten; `falloff` (0..1) is the soft
+    /// fraction of the radius; `current` is the current TOTAL height grid at
+    /// this layer's resolution (Smooth/Flatten read it; Raise/Lower ignore
+    /// it); `flatten_target` is the height Flatten pulls toward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brush(
+        &mut self,
+        mode: BrushMode,
+        center: Vec2,
+        radius: f32,
+        amount: f32,
+        falloff: f32,
+        size: f32,
+        current: &[f32],
+        flatten_target: f32,
+    ) {
+        let res = self.resolution as usize;
+        let n = res + 1;
+        let step = size / res as f32;
+        let radius = radius.max(step * 0.5);
+        // touched vertex range
+        let to_idx = |w: f32| ((w / size + 0.5) * res as f32).round() as i32;
+        let x0 = (to_idx(center.x - radius)).clamp(0, res as i32) as usize;
+        let x1 = (to_idx(center.x + radius)).clamp(0, res as i32) as usize;
+        let y0 = (to_idx(center.y - radius)).clamp(0, res as i32) as usize;
+        let y1 = (to_idx(center.y + radius)).clamp(0, res as i32) as usize;
+        let inner = 1.0 - falloff.clamp(0.05, 1.0);
+        let have_current = current.len() == n * n;
+
+        for iy in y0..=y1 {
+            for ix in x0..=x1 {
+                let w = Vec2::new(
+                    (ix as f32 / res as f32 - 0.5) * size,
+                    (iy as f32 / res as f32 - 0.5) * size,
+                );
+                let t = (w - center).length() / radius;
+                if t >= 1.0 {
+                    continue;
+                }
+                // 1 inside the hard core, easing to 0 at the rim
+                let weight = 1.0 - smoothstep((inner, 1.0), t);
+                let idx = iy * n + ix;
+                match mode {
+                    BrushMode::Raise => self.deltas[idx] += amount * weight,
+                    BrushMode::Lower => self.deltas[idx] -= amount * weight,
+                    BrushMode::Smooth if have_current => {
+                        let avg = {
+                            let mut sum = 0.0;
+                            let mut count = 0.0;
+                            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (0, 0)] {
+                                let jx = ix as i32 + dx;
+                                let jy = iy as i32 + dy;
+                                if jx >= 0 && jx <= res as i32 && jy >= 0 && jy <= res as i32 {
+                                    sum += current[jy as usize * n + jx as usize];
+                                    count += 1.0;
+                                }
+                            }
+                            sum / count
+                        };
+                        let lerp = (amount * weight).clamp(0.0, 1.0);
+                        self.deltas[idx] += (avg - current[idx]) * lerp;
+                    }
+                    BrushMode::Flatten if have_current => {
+                        let lerp = (amount * weight).clamp(0.0, 1.0);
+                        self.deltas[idx] += (flatten_target - current[idx]) * lerp;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Serialized form: raw little-endian f32 deltas, base64 (lossless — the
+/// grid survives any number of save/load cycles bit-exactly).
+#[derive(Serialize, Deserialize)]
+struct SculptLayerRepr {
+    resolution: u32,
+    data: String,
+}
+
+impl Serialize for SculptLayer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(self.deltas.len() * 4);
+        for d in &self.deltas {
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        SculptLayerRepr {
+            resolution: self.resolution,
+            data: base64_encode(&bytes),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for SculptLayer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let repr = SculptLayerRepr::deserialize(d)?;
+        let bytes = base64_decode(&repr.data)
+            .ok_or_else(|| serde::de::Error::custom("bad sculpt base64"))?;
+        let res = repr.resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        if bytes.len() != n * n * 4 {
+            return Err(serde::de::Error::custom("sculpt data size mismatch"));
+        }
+        let deltas = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .map(|v| if v.is_finite() { v } else { 0.0 })
+            .collect();
+        Ok(Self { resolution: res, deltas })
+    }
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let v = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(BASE64_ALPHABET[(v >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in text.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = BASE64_ALPHABET.iter().position(|&a| a == c)? as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Bilinear sample of a row-major `(res+1)²` grid at normalized (0..1)
+/// coordinates, clamped at the borders.
+pub fn sample_grid_normalized(grid: &[f32], resolution: usize, u: f32, v: f32) -> f32 {
+    let n = resolution + 1;
+    if grid.len() != n * n {
+        return 0.0;
+    }
+    let fx = (u.clamp(0.0, 1.0)) * resolution as f32;
+    let fy = (v.clamp(0.0, 1.0)) * resolution as f32;
+    let x0 = (fx.floor() as usize).min(resolution - 1 + 1).min(resolution);
+    let y0 = (fy.floor() as usize).min(resolution);
+    let x1 = (x0 + 1).min(resolution);
+    let y1 = (y0 + 1).min(resolution);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let a = grid[y0 * n + x0];
+    let b = grid[y0 * n + x1];
+    let c = grid[y1 * n + x0];
+    let d = grid[y1 * n + x1];
+    a + (b - a) * tx + (c - a) * ty + (a - b - c + d) * tx * ty
+}
+
+/// Bilinear height at terrain-local `(x, y)` meters (footprint
+/// `[-size/2, size/2]²`) of a full evaluated grid.
+pub fn sample_height(grid: &[f32], resolution: u32, size: f32, x: f32, y: f32) -> f32 {
+    sample_grid_normalized(
+        grid,
+        resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize,
+        x / size + 0.5,
+        y / size + 0.5,
+    )
+}
+
+/// Intersect a local-space ray with the evaluated height grid: coarse march
+/// at half-cell steps, then bisection. Returns the local-space hit point.
+pub fn raycast_grid(
+    grid: &[f32],
+    resolution: u32,
+    size: f32,
+    origin: Vec3,
+    dir: Vec3,
+) -> Option<Vec3> {
+    let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+    let dir = dir.normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return None;
+    }
+    let half = 0.5 * size;
+    let (zmin, zmax) = grid
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    // clip the ray to the grid's bounding box (padded a little)
+    let mut t0 = 0.0f32;
+    let mut t1 = f32::INFINITY;
+    for (o, d, lo, hi) in [
+        (origin.x, dir.x, -half, half),
+        (origin.y, dir.y, -half, half),
+        (origin.z, dir.z, zmin - 0.1, zmax + 0.1),
+    ] {
+        if d.abs() < 1e-9 {
+            if o < lo || o > hi {
+                return None;
+            }
+            continue;
+        }
+        let (ta, tb) = ((lo - o) / d, (hi - o) / d);
+        t0 = t0.max(ta.min(tb));
+        t1 = t1.min(ta.max(tb));
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let above = |t: f32| {
+        let p = origin + dir * t;
+        p.z - sample_height(grid, res, size, p.x, p.y)
+    };
+    let step = (size / res as f32) * 0.5;
+    let mut t_prev = t0;
+    let mut d_prev = above(t0);
+    if d_prev < 0.0 {
+        // starting under the surface: report the entry point
+        let p = origin + dir * t0;
+        return Some(Vec3::new(p.x, p.y, sample_height(grid, res, size, p.x, p.y)));
+    }
+    let mut t = t0 + step;
+    while t <= t1 + step {
+        let tc = t.min(t1);
+        let d = above(tc);
+        if d <= 0.0 {
+            // bracketed: bisect
+            let (mut lo, mut hi) = (t_prev, tc);
+            for _ in 0..12 {
+                let mid = 0.5 * (lo + hi);
+                if above(mid) > 0.0 {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let p = origin + dir * hi;
+            return Some(Vec3::new(p.x, p.y, sample_height(grid, res, size, p.x, p.y)));
+        }
+        t_prev = tc;
+        d_prev = d;
+        if tc >= t1 {
+            break;
+        }
+        t += step;
+    }
+    let _ = d_prev;
+    None
 }
 
 impl Default for TerrainData {
@@ -405,6 +849,8 @@ impl Default for TerrainData {
         ridges.amount = 0.55;
         ridges.mask.height = Some(Band { min: 0.25, max: 1.5, falloff: 0.2, invert: false });
         Self {
+            sculpt: None,
+            cache: Default::default(),
             layers: vec![
                 TerrainLayer::new(LayerKind::DomainWarp { scale: 90.0, strength: 14.0, octaves: 3 }),
                 TerrainLayer {
@@ -446,7 +892,7 @@ impl TerrainData {
             ("Hills", TerrainData::default()),
             (
                 "Alpine",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 120.0, strength: 18.0, octaves: 3 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Ridged { scale: 130.0, octaves: 6, gain: 0.52, lacunarity: 2.1, sharpness: 2.0 }, BlendMode::Add, 0.85),
@@ -456,7 +902,7 @@ impl TerrainData {
             ),
             (
                 "Dunes",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Billow { scale: 120.0, octaves: 3, gain: 0.5, lacunarity: 2.0 }, BlendMode::Add, 0.25),
                         layer(LayerKind::DomainWarp { scale: 60.0, strength: 6.0, octaves: 2 }, BlendMode::Add, 1.0),
@@ -466,7 +912,7 @@ impl TerrainData {
             ),
             (
                 "Archipelago",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Constant { value: 1.0 }, BlendMode::Subtract, 0.35),
                         layer(LayerKind::DomainWarp { scale: 100.0, strength: 20.0, octaves: 3 }, BlendMode::Add, 1.0),
@@ -476,7 +922,7 @@ impl TerrainData {
             ),
             (
                 "Canyon",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         // high base plateau, stepped strata, then the river
                         // digs deep through all of it
@@ -489,7 +935,7 @@ impl TerrainData {
             ),
             (
                 "Volcanic",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Ridged { scale: 80.0, octaves: 5, gain: 0.5, lacunarity: 2.2, sharpness: 2.4 }, BlendMode::Add, 0.6),
                         masked(
@@ -501,7 +947,7 @@ impl TerrainData {
             ),
             (
                 "Rolling",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 80.0, strength: 10.0, octaves: 2 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Fbm { scale: 60.0, octaves: 5, gain: 0.45, lacunarity: 2.0, erosion: 0.5, warp: 0.0 }, BlendMode::Add, 0.4),
@@ -510,7 +956,7 @@ impl TerrainData {
             ),
             (
                 "Craters",
-                TerrainData {
+                TerrainData { sculpt: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Fbm { scale: 70.0, octaves: 4, gain: 0.5, lacunarity: 2.0, erosion: 0.0, warp: 0.0 }, BlendMode::Add, 0.2),
                         layer(LayerKind::Crater { scale: 35.0, density: 0.6, depth: 0.7, rim: 0.3 }, BlendMode::Add, 0.6),
@@ -528,10 +974,45 @@ impl TerrainData {
             .map(|(_, d)| d)
     }
 
-    /// Evaluate the stack over an `(n+1)²` vertex grid covering
-    /// `[-size/2, size/2]²`, row-major, in meters (already scaled by
-    /// `height`). `height` also calibrates the slope masks.
+    /// Evaluate the terrain over an `(n+1)²` vertex grid covering
+    /// `[-size/2, size/2]²`, row-major, in meters: the layer stack (memoized
+    /// — repeat calls with unchanged layers reuse the last run, which is
+    /// what keeps sculpt strokes cheap) plus the sculpt offsets on top.
     pub fn eval_grid(&self, seed: u32, resolution: u32, size: f32, height: f32) -> Vec<f32> {
+        let key = BaseKey {
+            layers: self.layers.clone(),
+            seed,
+            resolution,
+            size,
+            height,
+        };
+        let mut out = {
+            let mut slot = self.cache.0.borrow_mut();
+            match slot.as_ref() {
+                Some((cached_key, grid)) if *cached_key == key => grid.clone(),
+                _ => {
+                    let grid = self.eval_base_grid(seed, resolution, size, height);
+                    *slot = Some((key, grid.clone()));
+                    grid
+                }
+            }
+        };
+        if let Some(sculpt) = &self.sculpt {
+            let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize;
+            let n = res + 1;
+            for iy in 0..n {
+                for ix in 0..n {
+                    let u = ix as f32 / res as f32;
+                    let v = iy as f32 / res as f32;
+                    out[iy * n + ix] += sculpt.sample_normalized(u, v);
+                }
+            }
+        }
+        out
+    }
+
+    /// The pure layer-stack evaluation (no sculpt, no cache).
+    fn eval_base_grid(&self, seed: u32, resolution: u32, size: f32, height: f32) -> Vec<f32> {
         let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize;
         let n = res + 1;
         let step = size / res as f32;
@@ -596,9 +1077,14 @@ impl TerrainData {
             for iy in 0..n {
                 for ix in 0..n {
                     let idx = iy * n + ix;
-                    let mut pw = Vec2::new(world(ix), world(iy));
-                    if let Some(w) = warp.get(idx) {
-                        pw += *w;
+                    let raw = Vec2::new(world(ix), world(iy));
+                    let mut pw = raw;
+                    // hand-placed stamps stay where the user put them —
+                    // domain warp must not slide them around
+                    if !matches!(layer.kind, LayerKind::Shape { .. }) {
+                        if let Some(w) = warp.get(idx) {
+                            pw += *w;
+                        }
                     }
 
                     let v = sample_kind(&layer.kind, pw, seed);
@@ -735,6 +1221,50 @@ fn sample_kind(kind: &LayerKind, pw: Vec2, seed: u32) -> f32 {
             (1.0 - smoothstep((0.4, 1.0), d)) * (1.0 - 0.35 * d * d).max(0.0)
         }
         LayerKind::Constant { value } => value,
+        LayerKind::Shape { shape, x, y, radius, rotation_deg, aspect, falloff, detail } => {
+            // footprint distance, elongated along the rotated local X
+            let rel = pw - Vec2::new(x, y);
+            let dir = Vec2::from_angle(-rotation_deg.to_radians());
+            let local = Vec2::new(
+                rel.x * dir.x - rel.y * dir.y,
+                rel.x * dir.y + rel.y * dir.x,
+            );
+            let aspect = aspect.max(0.2);
+            let d = (Vec2::new(local.x / aspect, local.y) / radius.max(0.1)).length();
+            if d >= 1.5 {
+                return 0.0;
+            }
+            // noise roughening: wobble the distance so edges aren't perfect
+            let rough = if detail > 0.0 {
+                (fbm(pw / (radius.max(0.1) * 0.5), seed, 3, 0.5, 2.0, 0.0, 0.0) - 0.5)
+                    * detail
+                    * 0.6
+            } else {
+                0.0
+            };
+            let d = (d + rough).max(0.0);
+            let soft = falloff.clamp(0.05, 1.0);
+            match shape {
+                // rounded peak easing to 0 at the rim
+                ShapeKind::Mountain => (1.0 - smoothstep((1.0 - soft, 1.0), d))
+                    * (1.0 - d * d * 0.35).max(0.0),
+                // tent profile across the elongated footprint
+                ShapeKind::Ridge => (1.0 - smoothstep((1.0 - soft, 1.0), d))
+                    * (1.0 - d).clamp(0.0, 1.0).powf(0.75),
+                // same dome as Mountain; the sign comes from the blend
+                // (TerrainLayer::new defaults valleys to Subtract)
+                ShapeKind::Valley => (1.0 - smoothstep((1.0 - soft, 1.0), d))
+                    * (1.0 - d * d * 0.35).max(0.0),
+                // flat top, all the shaping in the rim
+                ShapeKind::Plateau => 1.0 - smoothstep((1.0 - soft, 1.0), d),
+                // parabolic bowl with a raised rim
+                ShapeKind::Crater => {
+                    let bowl = if d < 1.0 { (d * d - 1.0) * 0.8 } else { 0.0 };
+                    let rim_d = (d - 1.0) / (0.35 * soft.max(0.2));
+                    bowl + 0.45 * (-rim_d * rim_d).exp()
+                }
+            }
+        }
         LayerKind::DomainWarp { .. } | LayerKind::Terrace { .. } => 0.0,
     }
 }
@@ -852,7 +1382,7 @@ mod tests {
 
     #[test]
     fn empty_stack_is_flat() {
-        let data = TerrainData { layers: Vec::new() };
+        let data = TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
         for v in data.eval_grid(1, 16, 10.0, 5.0) {
             assert_eq!(v, 0.0);
         }
@@ -866,7 +1396,7 @@ mod tests {
         top_up.blend = BlendMode::Add;
         top_up.amount = 1.0;
         top_up.mask.height = Some(Band { min: 0.75, max: 2.0, falloff: 0.01, invert: false });
-        let data = TerrainData {
+        let data = TerrainData { sculpt: None, cache: Default::default(),
             layers: vec![
                 TerrainLayer {
                     amount: 0.5,
@@ -878,6 +1408,166 @@ mod tests {
         for v in data.eval_grid(1, 16, 10.0, 1.0) {
             assert!((v - 0.5).abs() < 1e-4, "masked layer leaked: {v}");
         }
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        for len in [0usize, 1, 2, 3, 4, 5, 100] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
+            assert_eq!(base64_decode(&base64_encode(&bytes)).unwrap(), bytes, "len {len}");
+        }
+    }
+
+    #[test]
+    fn sculpt_survives_serde_bit_exactly() {
+        let mut sculpt = SculptLayer::new(16);
+        for (i, d) in sculpt.deltas.iter_mut().enumerate() {
+            *d = (i as f32 * 0.37).sin() * 5.0;
+        }
+        let mut data = TerrainData::default();
+        data.sculpt = Some(sculpt.clone());
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TerrainData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sculpt.as_ref().unwrap().deltas, sculpt.deltas);
+    }
+
+    #[test]
+    fn raise_brush_lifts_the_surface_inside_the_radius_only() {
+        let mut data = TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+        let mut sculpt = SculptLayer::new(32);
+        sculpt.brush(
+            BrushMode::Raise,
+            Vec2::new(10.0, -5.0),
+            8.0,
+            2.0,
+            0.5,
+            100.0,
+            &[],
+            0.0,
+        );
+        data.sculpt = Some(sculpt);
+        let grid = data.eval_grid(1, 32, 100.0, 10.0);
+        let center = sample_height(&grid, 32, 100.0, 10.0, -5.0);
+        let far = sample_height(&grid, 32, 100.0, -40.0, 40.0);
+        assert!(center > 1.5, "center must lift ~2 m, got {center}");
+        assert_eq!(far, 0.0, "outside the radius stays untouched");
+    }
+
+    #[test]
+    fn flatten_brush_pulls_toward_the_target() {
+        let mut data =
+            TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+        // constant 0.5 → flat 5 m surface at height 10
+        data.layers.push(TerrainLayer {
+            amount: 0.5,
+            ..TerrainLayer::new(LayerKind::Constant { value: 1.0 })
+        });
+        let current = data.eval_grid(1, 32, 100.0, 10.0);
+        let mut sculpt = SculptLayer::new(32);
+        sculpt.brush(
+            BrushMode::Flatten,
+            Vec2::ZERO,
+            10.0,
+            1.0, // full lerp
+            0.3,
+            100.0,
+            &current,
+            8.0, // pull to 8 m
+        );
+        data.sculpt = Some(sculpt);
+        let grid = data.eval_grid(1, 32, 100.0, 10.0);
+        let center = sample_height(&grid, 32, 100.0, 0.0, 0.0);
+        assert!((center - 8.0).abs() < 0.05, "flattened to target, got {center}");
+    }
+
+    #[test]
+    fn sculpt_resample_keeps_the_shape() {
+        let mut sculpt = SculptLayer::new(32);
+        sculpt.brush(BrushMode::Raise, Vec2::ZERO, 20.0, 3.0, 0.5, 100.0, &[], 0.0);
+        let fine = sculpt.resample(64);
+        assert!((fine.sample_normalized(0.5, 0.5) - sculpt.sample_normalized(0.5, 0.5)).abs() < 0.05);
+        assert_eq!(fine.resolution, 64);
+    }
+
+    #[test]
+    fn raycast_hits_the_surface_from_above() {
+        let data = TerrainData::default();
+        let grid = data.eval_grid(1, 64, 100.0, 10.0);
+        let hit = raycast_grid(
+            &grid,
+            64,
+            100.0,
+            Vec3::new(5.0, 5.0, 50.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        )
+        .expect("straight-down ray must hit");
+        let expected = sample_height(&grid, 64, 100.0, 5.0, 5.0);
+        assert!((hit.z - expected).abs() < 0.05, "hit {hit:?} vs surface {expected}");
+        assert!((hit.x - 5.0).abs() < 1e-3 && (hit.y - 5.0).abs() < 1e-3);
+        // a ray that misses the footprint entirely
+        assert!(raycast_grid(
+            &grid,
+            64,
+            100.0,
+            Vec3::new(200.0, 0.0, 50.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        )
+        .is_none());
+        // a shallow diagonal ray from outside the box
+        let diag = raycast_grid(
+            &grid,
+            64,
+            100.0,
+            Vec3::new(-80.0, 0.0, 30.0),
+            Vec3::new(1.0, 0.1, -0.35).normalize(),
+        );
+        assert!(diag.is_some(), "diagonal ray should land on the terrain");
+    }
+
+    #[test]
+    fn shape_stamp_lands_where_placed() {
+        let mut data =
+            TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+        let mut layer = TerrainLayer::new(LayerKind::Shape {
+            shape: ShapeKind::Mountain,
+            x: 20.0,
+            y: -10.0,
+            radius: 15.0,
+            rotation_deg: 0.0,
+            aspect: 1.0,
+            falloff: 0.5,
+            detail: 0.0,
+        });
+        layer.amount = 1.0;
+        data.layers.push(layer);
+        let grid = data.eval_grid(1, 64, 100.0, 10.0);
+        let peak = sample_height(&grid, 64, 100.0, 20.0, -10.0);
+        let away = sample_height(&grid, 64, 100.0, -30.0, 30.0);
+        assert!(peak > 7.0, "mountain peak at the stamp center, got {peak}");
+        assert!(away.abs() < 0.01, "far field flat, got {away}");
+    }
+
+    #[test]
+    fn base_cache_makes_sculpt_only_changes_cheap_and_correct() {
+        let mut data = TerrainData::default();
+        let a = data.eval_grid(1, 64, 100.0, 10.0);
+        // second call hits the cache — must be identical
+        let b = data.eval_grid(1, 64, 100.0, 10.0);
+        assert_eq!(a, b);
+        // sculpt on top: base unchanged, delta added exactly
+        let mut sculpt = SculptLayer::new(64);
+        sculpt.brush(BrushMode::Raise, Vec2::ZERO, 10.0, 1.0, 0.5, 100.0, &[], 0.0);
+        data.sculpt = Some(sculpt);
+        let c = data.eval_grid(1, 64, 100.0, 10.0);
+        let mid = (64 / 2) * 65 + 64 / 2;
+        assert!((c[mid] - a[mid] - 1.0).abs() < 1e-4);
+        // changing a layer invalidates the cache
+        data.layers.push(TerrainLayer {
+            amount: 0.3,
+            ..TerrainLayer::new(LayerKind::Constant { value: 1.0 })
+        });
+        let d = data.eval_grid(1, 64, 100.0, 10.0);
+        assert!((d[0] - c[0] - 3.0).abs() < 0.2, "new layer must take effect");
     }
 
     #[test]

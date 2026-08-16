@@ -83,6 +83,7 @@ fn object_properties() -> Value {
         "seed": {"type": "integer", "description": "terrain only: world seed (same seed = same terrain)"},
         "terrain_preset": {"type": "string", "description": "terrain only: replace the layer stack with a named preset (Hills|Alpine|Dunes|Archipelago|Canyon|Volcanic|Rolling|Craters)"},
         "terrain": {"type": "object", "description": "terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
+        "clear_sculpt": {"type": "boolean", "description": "terrain only: true removes all hand-sculpted brush offsets, restoring the pure procedural surface"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},
