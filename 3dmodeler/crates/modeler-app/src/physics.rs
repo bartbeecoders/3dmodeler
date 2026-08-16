@@ -188,13 +188,19 @@ struct WaterVolume {
     waves: modeler_core::water::WaveSet,
 }
 
-/// Buoyancy inputs for one dynamic body, frozen at play.
+/// Buoyancy inputs for one dynamic body, frozen at play. Solids from the
+/// scene get one entry each; rope segments and cloth nodes get one per
+/// chain body so cords and sheets float too.
 struct BuoyBody {
-    id: ObjectId,
+    body: ffi::b3BodyId,
     /// Bounding-sphere radius (world units) — the submersion probe.
     radius: f32,
     /// Body density relative to water (= 1.0). Lighter floats, denser sinks.
     density: f32,
+    /// Solids sample lift at four offset probes so wave slopes rock them
+    /// and the per-probe drag damps the rocking; chain nodes are too small
+    /// to rock and take one center sample.
+    probes: bool,
 }
 
 /// Water density in the app's (box3d-relative) density units: the default
@@ -202,6 +208,9 @@ struct BuoyBody {
 const WATER_DENSITY: f32 = 1.0;
 /// Linear drag factor for submerged bodies (per unit submerged fraction).
 const WATER_DRAG: f32 = 1.4;
+/// How hard the surface slope pushes floaters downhill — the game-scale
+/// stand-in for Stokes drift; floaters slowly surf along the wave travel.
+const WATER_SURF: f32 = 0.35;
 
 /// Simulated rope: a chain of segment bodies + distance joints, not a
 /// single mirrored body. Segment positions drive `Object::rope_nodes`.
@@ -790,9 +799,10 @@ impl PhysicsMirror {
                     // buoyancy probe for this body (sphere approximation)
                     let max_scale = world.scale.abs().max_element().max(1e-6);
                     self.buoy_bodies.push(BuoyBody {
-                        id: object.id,
+                        body: entry.body,
                         radius: (object.bounding_radius() * max_scale).max(1e-3),
                         density: object.density.max(0.01),
+                        probes: true,
                     });
                 }
                 // a water-sim terrain contributes a wave volume: the flag
@@ -833,6 +843,59 @@ impl PhysicsMirror {
                 }
                 if let Some(cloth) = self.build_cloth(scene, object) {
                     self.cloths.insert(object.id, cloth);
+                }
+            }
+            // pass 4: chain nodes join the buoyancy pass (only worth the
+            // bookkeeping when there is water to float in)
+            if !self.water_volumes.is_empty() {
+                for rope in self.ropes.values() {
+                    let (node_radius, density) = scene
+                        .object(rope.object_id)
+                        .map(|o| {
+                            let r = match o.primitive {
+                                Primitive::Rope { radius, .. } => radius.max(0.02),
+                                _ => 0.03,
+                            };
+                            (r, o.density.max(0.01))
+                        })
+                        .unwrap_or((0.03, 1.0));
+                    for body in rope.bodies.iter().take(rope.node_count) {
+                        self.buoy_bodies.push(BuoyBody {
+                            body: *body,
+                            radius: node_radius,
+                            density,
+                            probes: false,
+                        });
+                    }
+                }
+                for cloth in self.cloths.values() {
+                    let (node_radius, density) = scene
+                        .object(cloth.object_id)
+                        .map(|o| {
+                            let r = match o.primitive {
+                                Primitive::Cloth {
+                                    width,
+                                    height,
+                                    segments_u,
+                                    segments_v,
+                                    ..
+                                } => (width / segments_u.clamp(1, 24) as f32)
+                                    .min(height / segments_v.clamp(1, 24) as f32)
+                                    .max(0.04)
+                                    * 0.5,
+                                _ => 0.05,
+                            };
+                            (r, o.density.max(0.01))
+                        })
+                        .unwrap_or((0.05, 1.0));
+                    for body in cloth.bodies.iter().take(cloth.node_count) {
+                        self.buoy_bodies.push(BuoyBody {
+                            body: *body,
+                            radius: node_radius,
+                            density,
+                            probes: false,
+                        });
+                    }
                 }
             }
         }
@@ -1526,40 +1589,70 @@ impl PhysicsMirror {
         }
     }
 
-    /// Buoyancy + drag on dynamic bodies inside a water volume, applied per
-    /// fixed step (the box3d docs prefer steady forces over impulses with
-    /// the sub-stepping solver). Sphere approximation: the submerged
-    /// fraction of the body's bounding sphere scales an Archimedes lift
-    /// (`ρ_water · V · g` with `V ≈ mass / density`) plus linear drag.
+    /// Buoyancy, drag and wave push on dynamic bodies inside a water volume,
+    /// applied per fixed step (the box3d docs prefer steady forces over
+    /// impulses with the sub-stepping solver).
+    ///
+    /// Sphere approximation: the submerged fraction of a body's bounding
+    /// sphere scales an Archimedes lift (`ρ_water · V · g` with
+    /// `V ≈ mass / density`). Solids split that lift across four offset
+    /// probes — wave slopes then rock them, and per-probe drag (at the
+    /// probe's own point velocity) damps the rocking. Everything also gets
+    /// a downhill surface push, the game-scale stand-in for Stokes drift,
+    /// so floaters slowly travel with the waves like in the OceanThreejs
+    /// reference's surface motion.
     unsafe fn apply_buoyancy(&self) {
         use modeler_core::glam::Vec2;
         for buoy in &self.buoy_bodies {
-            let Some(entry) = self.entries.get(&buoy.id) else { continue };
-            let p = ffi::b3Body_GetPosition(entry.body);
-            for volume in &self.water_volumes {
-                let local = Vec2::new(p.x - volume.origin.x, p.y - volume.origin.y);
-                if local.x.abs() > volume.half || local.y.abs() > volume.half {
-                    continue;
-                }
-                let surface =
-                    volume.origin.z + volume.level + volume.waves.height(local, self.sim_time);
-                let r = buoy.radius;
-                let submerged = ((surface - (p.z - r)) / (2.0 * r)).clamp(0.0, 1.0);
+            let p = ffi::b3Body_GetPosition(buoy.body);
+            let Some(volume) = self.water_volumes.iter().find(|v| {
+                (p.x - v.origin.x).abs() <= v.half && (p.y - v.origin.y).abs() <= v.half
+            }) else {
+                continue;
+            };
+            let mass = ffi::b3Body_GetMass(buoy.body).max(1e-6);
+            let r = buoy.radius;
+            // world-axis probe offsets: rocking comes from the surface
+            // varying across them, so body rotation need not be sampled
+            let offsets: &[Vec2] = if buoy.probes {
+                &[
+                    Vec2::new(0.5 * r, 0.0),
+                    Vec2::new(-0.5 * r, 0.0),
+                    Vec2::new(0.0, 0.5 * r),
+                    Vec2::new(0.0, -0.5 * r),
+                ]
+            } else {
+                &[Vec2::ZERO]
+            };
+            let share = 1.0 / offsets.len() as f32;
+            for offset in offsets {
+                let probe = ffi::b3Pos {
+                    x: p.x + offset.x,
+                    y: p.y + offset.y,
+                    z: p.z,
+                };
+                let local =
+                    Vec2::new(probe.x - volume.origin.x, probe.y - volume.origin.y);
+                let (wave, normal) = volume.waves.displace(local, self.sim_time);
+                let surface = volume.origin.z + volume.level + wave.z;
+                let submerged = ((surface - (probe.z - r)) / (2.0 * r)).clamp(0.0, 1.0);
                 if submerged <= 0.0 {
                     continue;
                 }
-                let mass = ffi::b3Body_GetMass(entry.body).max(1e-6);
-                let lift = WATER_DENSITY / buoy.density * mass * 9.81 * submerged;
-                let v = ffi::b3Body_GetLinearVelocity(entry.body);
-                let drag = WATER_DRAG * mass * submerged;
+                let lift =
+                    WATER_DENSITY / buoy.density * mass * 9.81 * submerged * share;
+                let v = ffi::b3Body_GetWorldPointVelocity(buoy.body, probe);
+                let drag = WATER_DRAG * mass * submerged * share;
+                // the tilted surface normal leans away from the crest ahead:
+                // pushing along its horizontal part surfs the body downhill
+                let push = normal.truncate() * (WATER_SURF * mass * 9.81 * submerged * share);
                 let force = bvec(Vec3::new(
-                    -v.x * drag,
-                    -v.y * drag,
+                    push.x - v.x * drag,
+                    push.y - v.y * drag,
                     lift - v.z * drag,
                 ));
                 // wake = true: a floating body must not fall asleep mid-bob
-                ffi::b3Body_ApplyForceToCenter(entry.body, force, true);
-                break; // the first covering volume wins
+                ffi::b3Body_ApplyForce(buoy.body, force, probe, true);
             }
         }
     }
@@ -2045,6 +2138,55 @@ mod tests {
             scene.object(tid).unwrap().water_time.is_none(),
             "stop must freeze the surface back to the static sheet"
         );
+    }
+
+    /// Chain bodies float too: a light rope dropped over simulated water
+    /// must settle draped near the surface, not sink to the ground.
+    #[test]
+    fn a_light_rope_floats_on_simulated_water() {
+        let _guard = ffi_lock();
+        let mut scene = Scene::new();
+        let tid = scene.add_object(
+            Primitive::Terrain { size: 60.0, resolution: 32, height: 8.0, seed: 1 },
+            Transform::default(),
+        );
+        {
+            let terrain = scene.object_mut(tid).unwrap();
+            terrain.dynamic = true;
+            let mut data = modeler_core::TerrainData::default();
+            data.layers.clear(); // flat ground at z = 0
+            data.water = Some(modeler_core::terrain::WaterLayer {
+                level: 5.0,
+                ..Default::default()
+            });
+            terrain.terrain = Some(data);
+        }
+        let mut drop = Transform::default();
+        drop.location.z = 8.0;
+        let rid = scene.add_object(
+            Primitive::Rope { length: 4.0, radius: 0.05, segments: 8 },
+            drop,
+        );
+        scene.object_mut(rid).unwrap().density = 0.2;
+
+        let mut physics = PhysicsMirror::new();
+        physics.play(&scene);
+        for _ in 0..600 {
+            physics.update(&mut scene, FIXED_DT);
+        }
+
+        let nodes = scene
+            .object(rid)
+            .unwrap()
+            .rope_nodes
+            .clone()
+            .expect("rope simulates");
+        let mean_z = nodes.iter().map(|n| n.z).sum::<f32>() / nodes.len() as f32;
+        assert!(
+            (3.5..6.5).contains(&mean_z),
+            "a density-0.2 rope should drape on the z=5 surface, got mean z {mean_z}"
+        );
+        physics.stop(&mut scene);
     }
 
     /// Drop a cube and report the highest point it reaches after its first
