@@ -625,6 +625,11 @@ impl EditMode {
                             self.start_edge_tool(true, scene, camera, viewport, unit);
                             *handled = true;
                         }
+                        // 1/2/3 switch the select mode (their Text twin,
+                        // below); swallow the KeyPress so the camera doesn't
+                        // ALSO treat it as a view key — top-row digits and
+                        // the numpad share Key::Num1-3 after translation
+                        Key::Num1 | Key::Num2 | Key::Num3 => *handled = true,
                         // the tool owns the keyboard while grabbing (digits
                         // are camera views otherwise)
                         _ if self.grab.is_some() || self.tool.is_some() => *handled = true,
@@ -1775,6 +1780,39 @@ mod tests {
         edit.cancel_tool(&mut scene);
         assert!(scene.object(id).unwrap().edited_mesh.is_none());
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
+    }
+
+    /// 1/2/3 in edit mode switch the select mode via their Text event, and
+    /// the KeyPress twin must come back handled — top-row digits and the
+    /// numpad share Key::Num1-3, so an unhandled press would ALSO snap the
+    /// camera to a numpad view.
+    #[test]
+    fn select_mode_digits_do_not_leak_to_the_camera() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        let mut events = vec![
+            Event::KeyPress {
+                kind: Key::Num2,
+                modifiers: Default::default(),
+                handled: false,
+            },
+            Event::Text("2".to_string()),
+        ];
+        edit.handle_events(
+            &mut events, &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert_eq!(edit.mode, SelectMode::Edge, "the Text event switches the mode");
+        assert!(
+            matches!(events[0], Event::KeyPress { handled: true, .. }),
+            "the KeyPress twin must be swallowed, not left for the camera"
+        );
     }
 
     /// The real input path: Ctrl+R starts the cut, the wheel scrubs it, and
