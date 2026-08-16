@@ -64,7 +64,11 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom"], "description": "Switch the viewport to this orthographic axis view before capturing"},
                     "frame": {"type": "string", "enum": ["all", "selection"], "description": "Fit the view to the whole scene or to the selection before capturing"},
-                    "save_path": {"type": "string", "description": "Write the PNG here (absolute path recommended) instead of returning the image inline"}
+                    "save_path": {"type": "string", "description": "Write the PNG here (absolute path recommended) instead of returning the image inline"},
+                    "yaw": {"type": "number", "description": "Compose the shot: viewport camera yaw in degrees (0 = front, 90 = right)"},
+                    "pitch": {"type": "number", "description": "Compose the shot: camera elevation in degrees (0 = level, 90 = top-down)"},
+                    "target": {"type": "array", "items": {"type": "number"}, "description": "Compose the shot: [x,y,z] the camera orbits/looks at"},
+                    "distance": {"type": "number", "description": "Compose the shot: camera distance from the target in meters"}
                 }
             }
         },
@@ -117,7 +121,7 @@ fn tool_definitions() -> Value {
                     "erosion_enabled": {"type": "boolean", "description": "Terrain only: toggle the baked erosion without discarding it"},
                     "clear_erosion": {"type": "boolean", "description": "Terrain only: true discards the baked erosion layer"},
                     "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
-                    "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
+                    "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple, waves:{amplitude, wavelength, direction_deg, spread_deg, choppiness, speed}} (all optional; level in meters above the base plane, colors [r,g,b] 0..1). Set dynamic=true on the terrain to SIMULATE the water during playback: travelling Gerstner waves plus buoyancy (bodies with density < 1 float) — the terrain ground itself always stays a static collider"},
                     "clear_water": {"type": "boolean", "description": "Terrain only: true removes the water layer entirely"},
                     "terrain_stamp": {"type": "object", "description": "Terrain only: append ONE landform layer without resending the stack: {shape: mountain|ridge|valley|plateau|crater, x, y (terrain-local meters, 0,0 = center), radius? (default 25), rotation_deg?, aspect? (footprint stretch; ridges default 3), falloff? 0..1, detail? 0..1 noise roughening, amount? 0..2, blend? add|subtract|multiply|max|min|replace|carve|flatten}. Valleys default to carve. Repeat the call to stack several landforms"},
                     "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Props only: retype a nature prop"},
@@ -324,7 +328,7 @@ fn tool_definitions() -> Value {
                     "erosion_enabled": {"type": "boolean", "description": "Terrain only: toggle the baked erosion without discarding it"},
                     "clear_erosion": {"type": "boolean", "description": "Terrain only: true discards the baked erosion layer"},
                     "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
-                    "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
+                    "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple, waves:{amplitude, wavelength, direction_deg, spread_deg, choppiness, speed}} (all optional; level in meters above the base plane, colors [r,g,b] 0..1). Set dynamic=true on the terrain to SIMULATE the water during playback: travelling Gerstner waves plus buoyancy (bodies with density < 1 float) — the terrain ground itself always stays a static collider"},
                     "clear_water": {"type": "boolean", "description": "Terrain only: true removes the water layer entirely"},
                     "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Props only: retype a nature prop"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters"},

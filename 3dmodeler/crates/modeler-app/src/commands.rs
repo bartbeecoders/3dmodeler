@@ -226,7 +226,10 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                         t.erosion_stale(seed, resolution, size, height)
                     }),
                 })),
-            // water table (set with water, remove with clear_water)
+            // water table (set with water, remove with clear_water).
+            // simulate mirrors the object's physics flag: on a terrain it
+            // arms wave animation + buoyancy during playback instead of
+            // making the ground dynamic (set via dynamic=true).
             "water": object
                 .terrain
                 .as_ref()
@@ -235,6 +238,8 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                     "enabled": w.enabled,
                     "level": w.level,
                     "opacity": w.opacity,
+                    "simulate": object.dynamic,
+                    "waves": serde_json::to_value(w.waves).unwrap_or(Value::Null),
                 })),
             // the full stack (round-trippable through update_object {terrain: ...})
             "layers": object
@@ -1442,6 +1447,37 @@ pub fn apply_view_args(
         if let Some((center, radius)) = bounds {
             camera.frame(center, radius);
         }
+    }
+    // Explicit pose on top (or instead) of the presets: yaw/pitch degrees,
+    // target [x,y,z], distance meters — lets an agent compose a real shot
+    // (a low camera over a lake, a three-quarter view) rather than being
+    // limited to the six axis views. Any of them switches to perspective.
+    let mut posed = false;
+    if let Some(yaw) = command.get("yaw").and_then(Value::as_f64) {
+        camera.yaw = (yaw as f32).to_radians();
+        posed = true;
+    }
+    if let Some(pitch) = command.get("pitch").and_then(Value::as_f64) {
+        camera.pitch = (pitch as f32)
+            .clamp(-89.9, 89.9)
+            .to_radians();
+        posed = true;
+    }
+    if let Some(target) = command.get("target").and_then(Value::as_array) {
+        if target.len() == 3 {
+            let f = |i: usize| target[i].as_f64().unwrap_or(0.0) as f32;
+            camera.pivot = modeler_core::glam::Vec3::new(f(0), f(1), f(2));
+            posed = true;
+        } else {
+            return Some(json!({"ok": false, "error": "target must be [x, y, z]"}));
+        }
+    }
+    if let Some(distance) = command.get("distance").and_then(Value::as_f64) {
+        camera.distance = (distance as f32).max(0.05);
+        posed = true;
+    }
+    if posed {
+        camera.ortho = false;
     }
     None
 }

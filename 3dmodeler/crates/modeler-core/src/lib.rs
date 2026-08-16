@@ -10,6 +10,7 @@ pub mod library;
 pub mod material;
 pub mod mesh;
 pub mod terrain;
+pub mod water;
 
 use glam::{Quat, Vec2, Vec3};
 pub use boolean::{mesh_boolean, mesh_to_frame, BooleanOp};
@@ -902,6 +903,11 @@ pub struct Object {
     /// Live world-space cloth grid (row-major) while simulating. Not saved.
     #[serde(skip)]
     pub cloth_nodes: Option<Vec<Vec3>>,
+    /// Simulation clock for the terrain's water waves, set by the physics
+    /// mirror while ▶ plays on a water-sim terrain (see `WaterLayer::waves`).
+    /// `None` = static water. Not saved.
+    #[serde(skip)]
+    pub water_time: Option<f32>,
 }
 
 impl Object {
@@ -1000,7 +1006,15 @@ impl Object {
                 &default_stack
             }
         };
-        terrain::generate_mesh_ex(data, size, resolution, height, seed, with_water)
+        terrain::generate_mesh_at(
+            data,
+            size,
+            resolution,
+            height,
+            seed,
+            with_water,
+            self.water_time,
+        )
     }
 
     /// Radius of the bounding sphere around the local origin.
@@ -1387,6 +1401,7 @@ impl Scene {
             sculpt_revision: 0,
             cloth_anchors: Vec::new(),
             cloth_nodes: None,
+            water_time: None,
         });
         // Terrain: smooth-shaded with its default stack, in a grassy green.
         if matches!(primitive, Primitive::Terrain { .. }) {

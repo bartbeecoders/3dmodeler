@@ -4690,130 +4690,169 @@ fn properties(
             let mut density = object.density;
             let mut force = object.initial_force;
             let mut bounciness = object.bounciness;
-            if ui
-                .checkbox(&mut dynamic, "Dynamic")
-                .on_hover_text("Falls and collides during simulation (▶)")
-                .changed()
-            {
-                dirty.dynamic = true;
-            }
-
-            // Surface response. Deliberately NOT gated on Dynamic: a static
-            // floor's bounciness is what makes balls dropped on it bounce
-            // (contacts take the higher of the two values).
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Bounciness").on_hover_text(
-                    "Elasticity of the surface (coefficient of restitution): \
-                     0 is a dead thud, 1 is a superball. Works on static \
-                     objects too — set it on the floor to make everything \
-                     bounce off it",
-                );
+            if matches!(object.primitive, Primitive::Terrain { .. }) {
+                // A terrain never becomes a rigid body — its physics flag
+                // arms the WATER simulation while ▶ plays: Gerstner waves on
+                // the sheet, buoyancy + drag on dynamic bodies in the water.
                 if ui
-                    .add(
-                        egui::DragValue::new(&mut bounciness)
-                            .speed(0.01)
-                            .range(0.0..=1.0)
-                            .fixed_decimals(2),
+                    .checkbox(&mut dynamic, "Simulate water")
+                    .on_hover_text(
+                        "While the simulation plays (▶) the water surface \
+                         animates with travelling waves and dynamic objects \
+                         float or sink in it. The terrain itself stays \
+                         static ground. Wave settings: Data ▸ Water ▸ Waves.",
                     )
                     .changed()
                 {
-                    dirty.bounciness = true;
+                    dirty.dynamic = true;
                 }
-                ui.label(egui::RichText::new(bounciness_label(bounciness)).weak().size(11.0));
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                for (label, value, hint) in BOUNCE_PRESETS {
-                    if ui.small_button(*label).on_hover_text(*hint).clicked() {
-                        bounciness = *value;
-                        dirty.bounciness = true;
-                    }
+                let has_water = object
+                    .terrain
+                    .as_ref()
+                    .and_then(|t| t.water)
+                    .is_some_and(|w| w.enabled);
+                if dynamic && !has_water {
+                    ui.label(
+                        egui::RichText::new(
+                            "No water to simulate — enable it under Data ▸ Water.",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
                 }
-            });
-            if object.primitive.is_soft_sim() {
                 ui.label(
                     egui::RichText::new(
-                        "Rope and cloth nodes always use a non-bouncy contact \
-                         for stability — Bounciness does not affect them.",
+                        "Objects with density below 1 float, above 1 sink.",
                     )
                     .weak()
                     .size(11.0),
                 );
-            }
-            ui.add_space(4.0);
+            } else {
+                if ui
+                    .checkbox(&mut dynamic, "Dynamic")
+                    .on_hover_text("Falls and collides during simulation (▶)")
+                    .changed()
+                {
+                    dirty.dynamic = true;
+                }
 
-            ui.add_enabled_ui(dynamic, |ui| {
+                // Surface response. Deliberately NOT gated on Dynamic: a static
+                // floor's bounciness is what makes balls dropped on it bounce
+                // (contacts take the higher of the two values).
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label("Density");
+                    ui.label("Bounciness").on_hover_text(
+                        "Elasticity of the surface (coefficient of restitution): \
+                         0 is a dead thud, 1 is a superball. Works on static \
+                         objects too — set it on the floor to make everything \
+                         bounce off it",
+                    );
                     if ui
                         .add(
-                            egui::DragValue::new(&mut density)
-                                .speed(0.05)
-                                .range(0.01..=1000.0)
-                                .fixed_decimals(2)
-                                .min_decimals(1)
-                                .suffix(" kg/m³"),
+                            egui::DragValue::new(&mut bounciness)
+                                .speed(0.01)
+                                .range(0.0..=1.0)
+                                .fixed_decimals(2),
                         )
                         .changed()
                     {
-                        dirty.density = true;
+                        dirty.bounciness = true;
+                    }
+                    ui.label(egui::RichText::new(bounciness_label(bounciness)).weak().size(11.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    for (label, value, hint) in BOUNCE_PRESETS {
+                        if ui.small_button(*label).on_hover_text(*hint).clicked() {
+                            bounciness = *value;
+                            dirty.bounciness = true;
+                        }
                     }
                 });
-                // Soft bodies use their own particle mass; keep the field but
-                // explain so Density doesn't look broken.
                 if object.primitive.is_soft_sim() {
                     ui.label(
                         egui::RichText::new(
-                            "Soft bodies (rope/cloth) use fixed particle mass \
-                             for stability — Density does not affect them.",
+                            "Rope and cloth nodes always use a non-bouncy contact \
+                             for stability — Bounciness does not affect them.",
                         )
                         .weak()
                         .size(11.0),
                     );
                 }
                 ui.add_space(4.0);
-                ui.label("Initial force").on_hover_text(
-                    "World-space impulse (N·s) applied once when simulation \
-                     starts. Drawn as an orange arrow; Shift+drag the tip in \
-                     the viewport to aim it",
-                );
-                if vec3_row(ui, "  XYZ", &mut force, 0.5) {
-                    dirty.force = true;
-                }
-                let mut mag = force.length();
-                ui.horizontal(|ui| {
-                    ui.label("  Amount");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut mag)
-                                .speed(0.5)
-                                .range(0.0..=10_000.0)
-                                .fixed_decimals(2)
-                                .min_decimals(0)
-                                .suffix(" N·s"),
-                        )
-                        .changed()
-                    {
-                        if mag < 1e-6 {
-                            force = Vec3::ZERO;
-                        } else if force.length_squared() < 1e-12 {
-                            force = Vec3::new(mag, 0.0, 0.0);
-                        } else {
-                            force = force.normalize() * mag;
+
+                ui.add_enabled_ui(dynamic, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Density");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut density)
+                                    .speed(0.05)
+                                    .range(0.01..=1000.0)
+                                    .fixed_decimals(2)
+                                    .min_decimals(1)
+                                    .suffix(" kg/m³"),
+                            )
+                            .changed()
+                        {
+                            dirty.density = true;
                         }
+                    });
+                    // Soft bodies use their own particle mass; keep the field but
+                    // explain so Density doesn't look broken.
+                    if object.primitive.is_soft_sim() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Soft bodies (rope/cloth) use fixed particle mass \
+                                 for stability — Density does not affect them.",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label("Initial force").on_hover_text(
+                        "World-space impulse (N·s) applied once when simulation \
+                         starts. Drawn as an orange arrow; Shift+drag the tip in \
+                         the viewport to aim it",
+                    );
+                    if vec3_row(ui, "  XYZ", &mut force, 0.5) {
                         dirty.force = true;
                     }
-                    if ui
-                        .small_button("Clear")
-                        .on_hover_text("Set initial force to zero")
-                        .clicked()
-                    {
-                        force = Vec3::ZERO;
-                        dirty.force = true;
-                    }
+                    let mut mag = force.length();
+                    ui.horizontal(|ui| {
+                        ui.label("  Amount");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut mag)
+                                    .speed(0.5)
+                                    .range(0.0..=10_000.0)
+                                    .fixed_decimals(2)
+                                    .min_decimals(0)
+                                    .suffix(" N·s"),
+                            )
+                            .changed()
+                        {
+                            if mag < 1e-6 {
+                                force = Vec3::ZERO;
+                            } else if force.length_squared() < 1e-12 {
+                                force = Vec3::new(mag, 0.0, 0.0);
+                            } else {
+                                force = force.normalize() * mag;
+                            }
+                            dirty.force = true;
+                        }
+                        if ui
+                            .small_button("Clear")
+                            .on_hover_text("Set initial force to zero")
+                            .clicked()
+                        {
+                            force = Vec3::ZERO;
+                            dirty.force = true;
+                        }
+                    });
                 });
-            });
+            }
             phys = (dynamic, density, force, bounciness);
         }
     }
@@ -5408,6 +5447,53 @@ fn terrain_water_ui(
                     0.0..=2.0,
                     Some(" m"),
                 );
+            });
+        egui::CollapsingHeader::new("Waves")
+            .id_salt("terrain-water-waves")
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Travelling Gerstner waves while the simulation plays — \
+                         arm them with Physics ▸ Simulate water.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                let waves = &mut water.waves;
+                dirty |= float_row_ex(
+                    ui,
+                    "Amplitude",
+                    &mut waves.amplitude,
+                    0.02,
+                    0.0..=10.0,
+                    Some(" m"),
+                );
+                dirty |= float_row_ex(
+                    ui,
+                    "Wavelength",
+                    &mut waves.wavelength,
+                    0.5,
+                    0.5..=500.0,
+                    Some(" m"),
+                );
+                dirty |= float_row_ex(
+                    ui,
+                    "Direction",
+                    &mut waves.direction_deg,
+                    1.0,
+                    -360.0..=360.0,
+                    Some("°"),
+                );
+                dirty |= float_row_ex(
+                    ui,
+                    "Spread",
+                    &mut waves.spread_deg,
+                    1.0,
+                    0.0..=90.0,
+                    Some("°"),
+                );
+                dirty |= slider_row(ui, "Choppiness", &mut waves.choppiness, 0.0..=1.0);
+                dirty |= slider_row(ui, "Speed", &mut waves.speed, 0.1..=3.0);
             });
     }
     dirty |= remesh;
