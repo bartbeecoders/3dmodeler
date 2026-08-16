@@ -14,7 +14,7 @@
 //! for agents that read images from disk.
 
 // the tool_definitions() json! literal nests deeply (wall cutout schemas)
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -119,6 +119,7 @@ fn tool_definitions() -> Value {
                     "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
                     "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
                     "clear_water": {"type": "boolean", "description": "Terrain only: true removes the water layer entirely"},
+                    "terrain_stamp": {"type": "object", "description": "Terrain only: append ONE landform layer without resending the stack: {shape: mountain|ridge|valley|plateau|crater, x, y (terrain-local meters, 0,0 = center), radius? (default 25), rotation_deg?, aspect? (footprint stretch; ridges default 3), falloff? 0..1, detail? 0..1 noise roughening, amount? 0..2, blend? add|subtract|multiply|max|min|replace|carve|flatten}. Valleys default to carve. Repeat the call to stack several landforms"},
                     "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Props only: retype a nature prop"},
                     "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
@@ -303,14 +304,29 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "update_object",
-            "description": "Change any properties of an existing object (same optional fields as add_object, plus new_name to rename). Reference the object by name or id.",
+            "description": "Change any properties of an existing object (same optional fields as add_object, plus new_name to rename). Reference the object by name or id. This is also how terrains are edited after creation: reshape (terrain_preset / terrain / terrain_stamp / size / resolution / seed), bake erosion (erode), color (terrain_color) and water (water / clear_water).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "object": {"type": "string", "description": "Object name (or id as string)"},
                     "new_name": {"type": "string"},
                     "length": {"type": "number", "description": "Wall only: length in meters"},
-                    "height": {"type": "number", "description": "Wall or roof: height/rise in meters"},
+                    "height": {"type": "number", "description": "Wall or roof: height/rise in meters; terrain: max height"},
+                    "size": {"type": "number", "description": "Terrain only: side length in meters"},
+                    "resolution": {"type": "integer", "description": "Terrain only: grid quads per side 8–512"},
+                    "seed": {"type": "integer", "description": "Terrain only: world seed — same seed + stack = same terrain"},
+                    "terrain_preset": {"type": "string", "enum": ["Hills", "Alpine", "Dunes", "Archipelago", "Canyon", "Volcanic", "Rolling", "Craters"], "description": "Terrain only: replace the layer stack with a named preset (sculpt/erosion/color/water survive)"},
+                    "terrain": {"type": "object", "description": "Terrain only: full generator state as reported by get_scene ({layers:[...]}, optionally sculpt/erosion/color/water); replaces everything"},
+                    "terrain_stamp": {"type": "object", "description": "Terrain only: append ONE landform layer without resending the stack: {shape: mountain|ridge|valley|plateau|crater, x, y (terrain-local meters, 0,0 = center), radius? (default 25), rotation_deg?, aspect? (footprint stretch; ridges default 3), falloff? 0..1, detail? 0..1 noise roughening, amount? 0..2, blend? add|subtract|multiply|max|min|replace|carve|flatten}. Valleys default to carve. Repeat the call to stack several landforms"},
+                    "clear_sculpt": {"type": "boolean", "description": "Terrain only: true removes all hand-sculpted brush offsets, restoring the pure procedural surface"},
+                    "erode": {"description": "Terrain only: bake rain erosion (carved channels + settled scree). true = Natural recipe, or {preset: Lite|Natural|Mountain|Canyon|Heavy Rain|Dry Thermal, droplets?, erosion_rate?, deposition?, capacity?, brush_radius?, thermal_iterations?, talus_angle_deg?, smoothing?}. Non-destructive; get_scene reports erosion.stale when the terrain changed since the bake"},
+                    "erosion_strength": {"type": "number", "description": "Terrain only: blend of the baked erosion, 0..2 (1 = as simulated)"},
+                    "erosion_enabled": {"type": "boolean", "description": "Terrain only: toggle the baked erosion without discarding it"},
+                    "clear_erosion": {"type": "boolean", "description": "Terrain only: true discards the baked erosion layer"},
+                    "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
+                    "water": {"description": "Terrain only: still water filling basins/rivers below a level. true (defaults), false (keep settings, hide), or {level, shallow, deep, depth_falloff, foam_width, opacity, roughness, ripple} (all optional; level in meters above the base plane, colors [r,g,b] 0..1)"},
+                    "clear_water": {"type": "boolean", "description": "Terrain only: true removes the water layer entirely"},
+                    "prop_kind": {"type": "string", "enum": ["rock", "conifer", "broadleaf", "bush"], "description": "Props only: retype a nature prop"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters"},
                     "roof_kind": {"type": "string", "enum": ["point", "gable", "hip", "flat", "shed", "gambrel", "mansard"], "description": "Roofs only: change the roof shape"},
                     "width": {"type": "number", "description": "Roofs only: footprint width (X) in meters"},
@@ -545,6 +561,26 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "list_pbr",
+            "description": "List the locally imported PBR materials (the app's PBR Library panel imports them from ambientCG / Poly Haven). Returns id, name, category and which texture maps each material carries. Use apply_pbr to put one on objects.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "apply_pbr",
+            "description": "Apply a locally imported PBR material (see list_pbr) to one or more objects — terrains included (the material textures the ground; biome color, if enabled, overrides slot 0). Makes each target's material unique first, so shared masters are not edited through it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "material": {"type": "string", "description": "Material id or name from list_pbr"},
+                    "object": {"type": "string", "description": "Target object name or id"},
+                    "objects": {"type": "array", "items": {"type": "string"}, "description": "Several targets at once (overrides 'object'; defaults to the current selection when both are omitted)"},
+                    "uv_scale": {"description": "Texture repeats per UV unit: a number (uniform) or [u, v]"},
+                    "uv_rotation": {"type": "number", "description": "UV rotation in degrees"}
+                },
+                "required": ["material"]
+            }
+        },
+        {
             "name": "add_image_marker",
             "description": "Draw an AI marker on a reference image: a point, a line (open polyline) or an area (closed polygon), with an optional free-text note. Markers anchor instructions to spots on the image — e.g. mark a line and ask for a wall along it. Points are given in SOURCE-IMAGE PIXELS (origin top-left, like calibrate_reference_image); get_scene reports each marker back with both pixel and world coordinates (points_world) plus its world length, so you can build exactly on the marked geometry. Users can also draw markers directly in the app.",
             "inputSchema": {
@@ -678,7 +714,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         | "add_reference_image" | "update_reference_image" | "delete_reference_image"
         | "calibrate_reference_image" | "add_image_marker" | "update_image_marker"
         | "delete_image_marker" | "create_library_object" | "update_library_object"
-        | "delete_library_object" | "place_library_object" => {
+        | "delete_library_object" | "place_library_object" | "list_pbr" | "apply_pbr" => {
             let mut command = arguments.clone();
             if !command.is_object() {
                 command = json!({});

@@ -207,6 +207,11 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                 .terrain
                 .as_ref()
                 .is_some_and(|t| t.color.is_some()),
+            // hand-painted biome patches present (paintable in-app only)
+            "has_paint": object
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.paint.is_some()),
             // baked erosion layer (bake with erode, clear with clear_erosion)
             "erosion": object
                 .terrain
@@ -533,6 +538,46 @@ fn apply_object_params(
                 let data: modeler_core::TerrainData = serde_json::from_value(v.clone())
                     .map_err(|e| format!("bad 'terrain' stack: {e}"))?;
                 object.terrain = Some(data);
+                object.mesh_revision += 1;
+            }
+            // terrain_stamp: append ONE Shape landform layer without
+            // resending the whole stack. Valleys default to the Carve blend
+            // (TerrainLayer::new), like the UI's Add-layer menu.
+            if let Some(v) = params.get("terrain_stamp").filter(|v| !v.is_null()) {
+                use modeler_core::terrain::{LayerKind, ShapeKind, TerrainLayer};
+                let shape: ShapeKind = serde_json::from_value(
+                    v.get("shape").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|_| {
+                    "terrain_stamp requires 'shape' \
+                     (mountain|ridge|valley|plateau|crater)"
+                        .to_string()
+                })?;
+                let f = |key: &str, default: f32| {
+                    v.get(key).and_then(Value::as_f64).map(|n| n as f32).unwrap_or(default)
+                };
+                let kind = LayerKind::Shape {
+                    shape,
+                    x: f("x", 0.0),
+                    y: f("y", 0.0),
+                    radius: f("radius", 25.0).max(0.1),
+                    rotation_deg: f("rotation_deg", 0.0),
+                    aspect: f("aspect", if shape == ShapeKind::Ridge { 3.0 } else { 1.0 })
+                        .clamp(0.2, 10.0),
+                    falloff: f("falloff", 0.5).clamp(0.0, 1.0),
+                    detail: f("detail", 0.3).clamp(0.0, 1.0),
+                };
+                let mut layer = TerrainLayer::new(kind);
+                layer.amount = f("amount", 1.0).clamp(0.0, 2.0);
+                if let Some(b) = v.get("blend").filter(|b| !b.is_null()) {
+                    layer.blend = serde_json::from_value(b.clone()).map_err(|_| {
+                        "bad terrain_stamp 'blend' \
+                         (add|subtract|multiply|max|min|replace|carve|flatten)"
+                            .to_string()
+                    })?;
+                }
+                let data = object.terrain.get_or_insert_with(Default::default);
+                data.layers.push(layer);
                 object.mesh_revision += 1;
             }
             if params.get("clear_sculpt").and_then(Value::as_bool) == Some(true) {
