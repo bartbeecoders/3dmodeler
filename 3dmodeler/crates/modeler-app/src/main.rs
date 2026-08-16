@@ -1337,14 +1337,18 @@ pub fn main() {
             overlay.draws.clear();
             ref_render.sync(&scene, &gpu, overlay);
 
-            grid::draw(
-                &mut overlay.draws,
-                settings.grid_spacing,
-                settings.grid_minor_color,
-                settings.grid_major_color,
-            );
-            if let Some(plane) = camera.vertical_axis_plane() {
-                grid::draw_zero_lines(&mut overlay.draws, plane);
+            // Rendered mode is the "final image" look: no editor floor grid
+            // (it reads as a huge net under any transparent water surface).
+            if shade_mode != scene_render::ShadeMode::Rendered {
+                grid::draw(
+                    &mut overlay.draws,
+                    settings.grid_spacing,
+                    settings.grid_minor_color,
+                    settings.grid_major_color,
+                );
+                if let Some(plane) = camera.vertical_axis_plane() {
+                    grid::draw_zero_lines(&mut overlay.draws, plane);
+                }
             }
 
             if shade_mode == scene_render::ShadeMode::Wireframe {

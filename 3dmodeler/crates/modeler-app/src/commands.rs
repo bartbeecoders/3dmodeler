@@ -1448,6 +1448,37 @@ pub fn apply_view_args(
             camera.frame(center, radius);
         }
     }
+    // Explicit pose on top (or instead) of the presets: yaw/pitch degrees,
+    // target [x,y,z], distance meters — lets an agent compose a real shot
+    // (a low camera over a lake, a three-quarter view) rather than being
+    // limited to the six axis views. Any of them switches to perspective.
+    let mut posed = false;
+    if let Some(yaw) = command.get("yaw").and_then(Value::as_f64) {
+        camera.yaw = (yaw as f32).to_radians();
+        posed = true;
+    }
+    if let Some(pitch) = command.get("pitch").and_then(Value::as_f64) {
+        camera.pitch = (pitch as f32)
+            .clamp(-89.9, 89.9)
+            .to_radians();
+        posed = true;
+    }
+    if let Some(target) = command.get("target").and_then(Value::as_array) {
+        if target.len() == 3 {
+            let f = |i: usize| target[i].as_f64().unwrap_or(0.0) as f32;
+            camera.pivot = modeler_core::glam::Vec3::new(f(0), f(1), f(2));
+            posed = true;
+        } else {
+            return Some(json!({"ok": false, "error": "target must be [x, y, z]"}));
+        }
+    }
+    if let Some(distance) = command.get("distance").and_then(Value::as_f64) {
+        camera.distance = (distance as f32).max(0.05);
+        posed = true;
+    }
+    if posed {
+        camera.ortho = false;
+    }
     None
 }
 

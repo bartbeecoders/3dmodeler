@@ -108,7 +108,9 @@ impl ControlServer {
             if command["cmd"] == "screenshot" {
                 // view/frame arguments must land before this frame renders
                 let mut command = command;
-                let moved_camera = command.get("view").is_some() || command.get("frame").is_some();
+                let moved_camera = ["view", "frame", "yaw", "pitch", "target", "distance"]
+                    .iter()
+                    .any(|key| command.get(*key).is_some());
                 if let Some(error) =
                     commands::apply_view_args(&command, camera, scene, selection)
                 {

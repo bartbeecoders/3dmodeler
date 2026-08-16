@@ -64,7 +64,11 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom"], "description": "Switch the viewport to this orthographic axis view before capturing"},
                     "frame": {"type": "string", "enum": ["all", "selection"], "description": "Fit the view to the whole scene or to the selection before capturing"},
-                    "save_path": {"type": "string", "description": "Write the PNG here (absolute path recommended) instead of returning the image inline"}
+                    "save_path": {"type": "string", "description": "Write the PNG here (absolute path recommended) instead of returning the image inline"},
+                    "yaw": {"type": "number", "description": "Compose the shot: viewport camera yaw in degrees (0 = front, 90 = right)"},
+                    "pitch": {"type": "number", "description": "Compose the shot: camera elevation in degrees (0 = level, 90 = top-down)"},
+                    "target": {"type": "array", "items": {"type": "number"}, "description": "Compose the shot: [x,y,z] the camera orbits/looks at"},
+                    "distance": {"type": "number", "description": "Compose the shot: camera distance from the target in meters"}
                 }
             }
         },
