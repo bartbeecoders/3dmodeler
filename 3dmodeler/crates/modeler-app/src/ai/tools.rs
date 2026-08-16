@@ -43,7 +43,7 @@ WORKFLOW
 - new_scene erases everything without confirmation — only call it when the user explicitly asks for a fresh/empty scene.
 - Physics: simulate {"action":"play"|"pause"|"stop"} runs the box3d simulation; objects with dynamic=true fall and collide.
 - Ropes: primitive "rope" (length/radius/segments) is a flexible multi-segment cord. Pin ends with rope_start / rope_end (object name or null) and optional rope_start_point / rope_end_point local points. Ropes always simulate when play runs; hang a weight by anchoring start to a fixed body and end to a dynamic cube.
-- Terrain: primitive "terrain" (size/resolution/height/seed) is a procedural landscape generated from a noise-layer stack. Pick a look with terrain_preset (Hills, Alpine, Dunes, Archipelago, Canyon, Volcanic, Rolling, Craters), change seed for a different variation of the same look, size/height for extent. It stands on z=0 and other objects collide with the surface. Default 100x100 m — scale scene objects accordingly or make the terrain smaller.
+- Terrain: primitive "terrain" (size/resolution/height/seed) is a procedural landscape generated from a noise-layer stack. Pick a look with terrain_preset (Hills, Alpine, Dunes, Archipelago, Canyon, Volcanic, Rolling, Craters), change seed for a different variation of the same look, size/height for extent. It stands on z=0 and other objects collide with the surface. Default 100x100 m — scale scene objects accordingly or make the terrain smaller. For realism, bake erosion after shaping: update_object with erode=true (or a preset) carves rain channels and settles scree; erosion_strength blends it.
 - Cloth: primitive "cloth" (width/height/segments_u/segments_v/stiffness 0..1) is a soft sheet in local XY. Pin grid vertices with cloth_anchors: [{u, v, object, local_point?}]. Default four corners are free; attach top edge to a bar for a hanging curtain. Low stiffness (~0.2) drapes; 1.0 is stiff.
 - Scale sanity: a person is ~1.8 m, a door ~2.1x0.9 m, a storey ~3 m, a car ~4.5 m long. Keep proportions realistic unless asked otherwise.
 
@@ -84,6 +84,10 @@ fn object_properties() -> Value {
         "terrain_preset": {"type": "string", "description": "terrain only: replace the layer stack with a named preset (Hills|Alpine|Dunes|Archipelago|Canyon|Volcanic|Rolling|Craters)"},
         "terrain": {"type": "object", "description": "terrain only: full noise-layer stack {layers:[...]} as reported by get_scene; replaces the stack"},
         "clear_sculpt": {"type": "boolean", "description": "terrain only: true removes all hand-sculpted brush offsets, restoring the pure procedural surface"},
+        "erode": {"description": "terrain only: bake rain erosion (carved channels + settled scree). true = Natural recipe, or {preset: Lite|Natural|Mountain|Canyon|Heavy Rain|Dry Thermal, droplets?, erosion_rate?, deposition?, capacity?, brush_radius?, thermal_iterations?, talus_angle_deg?, smoothing?}. Non-destructive; re-run after big terrain changes (get_scene reports erosion.stale)"},
+        "erosion_strength": {"type": "number", "description": "terrain only: blend of the baked erosion, 0..2 (1 = as simulated)"},
+        "erosion_enabled": {"type": "boolean", "description": "terrain only: toggle the baked erosion without discarding it"},
+        "clear_erosion": {"type": "boolean", "description": "terrain only: true discards the baked erosion layer"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},

@@ -202,6 +202,20 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                 .as_ref()
                 .and_then(|t| t.sculpt.as_ref())
                 .is_some_and(|s| !s.is_empty()),
+            // baked erosion layer (bake with erode, clear with clear_erosion)
+            "erosion": object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.erosion.as_ref())
+                .map(|e| json!({
+                    "enabled": e.enabled,
+                    "strength": e.strength,
+                    "droplets": e.settings.droplets,
+                    // true = terrain edited since the bake; re-run erode
+                    "stale": object.terrain.as_ref().is_some_and(|t| {
+                        t.erosion_stale(seed, resolution, size, height)
+                    }),
+                })),
             // the full stack (round-trippable through update_object {terrain: ...})
             "layers": object
                 .terrain
@@ -494,6 +508,83 @@ fn apply_object_params(
                         object.mesh_revision += 1;
                     }
                 }
+            }
+            // erosion: bake / tune / clear
+            let mut erosion_touched = false;
+            if let Some(v) = params
+                .get("erode")
+                .filter(|v| !v.is_null() && v.as_bool() != Some(false))
+            {
+                // re-read: size/resolution/height/seed may have changed above
+                let Primitive::Terrain { size, resolution, height, seed } = object.primitive
+                else {
+                    unreachable!("inside the terrain arm");
+                };
+                let mut settings = match v.get("preset").and_then(Value::as_str) {
+                    Some(name) => modeler_core::erosion::ErosionSettings::preset(name)
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown erosion preset '{name}' \
+                                 (Lite|Natural|Mountain|Canyon|Heavy Rain|Dry Thermal)"
+                            )
+                        })?,
+                    // default: the last bake's settings, else Natural
+                    None => object
+                        .terrain
+                        .as_ref()
+                        .and_then(|t| t.erosion.as_ref())
+                        .map(|e| e.settings)
+                        .unwrap_or_default(),
+                };
+                let get_f = |k: &str| v.get(k).and_then(Value::as_f64).map(|x| x as f32);
+                let get_u = |k: &str| v.get(k).and_then(Value::as_u64).map(|x| x as u32);
+                if let Some(x) = get_u("droplets") {
+                    settings.droplets = x;
+                }
+                if let Some(x) = get_f("erosion_rate") {
+                    settings.erosion_rate = x;
+                }
+                if let Some(x) = get_f("deposition") {
+                    settings.deposition = x;
+                }
+                if let Some(x) = get_f("capacity") {
+                    settings.capacity = x;
+                }
+                if let Some(x) = get_u("brush_radius") {
+                    settings.brush_radius = x;
+                }
+                if let Some(x) = get_u("thermal_iterations") {
+                    settings.thermal_iterations = x;
+                }
+                if let Some(x) = get_f("talus_angle_deg") {
+                    settings.talus_angle_deg = x;
+                }
+                if let Some(x) = get_f("smoothing") {
+                    settings.smoothing = x;
+                }
+                let data = object.terrain.get_or_insert_with(Default::default);
+                data.bake_erosion(seed, resolution, size, height, settings.sanitized());
+                erosion_touched = true;
+            }
+            if let Some(s) = params.get("erosion_strength").and_then(Value::as_f64) {
+                if let Some(e) = object.terrain.as_mut().and_then(|t| t.erosion.as_mut()) {
+                    e.strength = (s as f32).clamp(0.0, 2.0);
+                    erosion_touched = true;
+                }
+            }
+            if let Some(b) = params.get("erosion_enabled").and_then(Value::as_bool) {
+                if let Some(e) = object.terrain.as_mut().and_then(|t| t.erosion.as_mut()) {
+                    e.enabled = b;
+                    erosion_touched = true;
+                }
+            }
+            if params.get("clear_erosion").and_then(Value::as_bool) == Some(true) {
+                if let Some(data) = &mut object.terrain {
+                    erosion_touched |= data.erosion.take().is_some();
+                }
+            }
+            if erosion_touched {
+                object.mesh_revision += 1; // render/physics caches key on it
             }
         }
         if let Some(cutouts) = cutouts {

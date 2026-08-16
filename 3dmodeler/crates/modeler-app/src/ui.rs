@@ -3565,7 +3565,8 @@ fn properties(
     let mut anchor = object.anchor;
     let mut dirty = PropDirty::default();
     let mut edited_cutouts: Option<Vec<modeler_core::WallCutout>> = None;
-    let mut edited_terrain: Option<modeler_core::TerrainData> = None;
+    // (new stack, remesh?) — remesh=false persists setting edits only
+    let mut edited_terrain: Option<(modeler_core::TerrainData, bool)> = None;
     let mut break_kind: Option<object_ops::BreakKind> = None;
     let mut master_action: Option<MasterAction> = None;
     let mut apply_function: Option<MaterialFunction> = None;
@@ -3741,10 +3742,14 @@ fn properties(
                         sculpt_tool.start(active_id);
                     }
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Terrain layers").strong());
                     let mut stack = object.terrain.clone().unwrap_or_default();
-                    if terrain_stack_ui(ui, &mut stack) {
-                        edited_terrain = Some(stack);
+                    let (erosion_dirty, erosion_remesh) =
+                        terrain_erosion_ui(ui, &mut stack, &primitive);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Terrain layers").strong());
+                    let stack_changed = terrain_stack_ui(ui, &mut stack);
+                    if erosion_dirty || stack_changed {
+                        edited_terrain = Some((stack, erosion_remesh || stack_changed));
                     }
                 }
 
@@ -4566,10 +4571,12 @@ fn properties(
             object.mesh_revision += 1; // caches key on it (primitive unchanged)
         }
     }
-    if let Some(stack) = edited_terrain {
+    if let Some((stack, remesh)) = edited_terrain {
         if let Some(object) = scene.object_mut(active_id) {
             object.terrain = Some(stack);
-            object.mesh_revision += 1; // caches key on it (primitive unchanged)
+            if remesh {
+                object.mesh_revision += 1; // caches key on it (primitive unchanged)
+            }
         }
     }
     let mut status = None;
@@ -4825,6 +4832,121 @@ fn rope_end_row(
         });
     }
     changed
+}
+
+/// Erosion section of the Data tab: bake / re-bake the hydraulic + thermal
+/// simulation into the terrain's non-destructive erosion layer, tune its
+/// blend, and warn when the bake went stale. Mutates `stack` in place; the
+/// caller writes it back and bumps `mesh_revision`.
+fn terrain_erosion_ui(
+    ui: &mut egui::Ui,
+    stack: &mut modeler_core::TerrainData,
+    primitive: &Primitive,
+) -> (bool, bool) {
+    use modeler_core::erosion::ErosionSettings;
+
+    let Primitive::Terrain { size, resolution, height, seed } = *primitive else {
+        return (false, false);
+    };
+    // `changed` = geometry moved (remesh + physics resync);
+    // `dirty` alone = only stored settings edited (persist, no rebuild)
+    let mut changed = false;
+    let mut dirty = false;
+    ui.label(egui::RichText::new("Erosion").strong());
+
+    let mut bake_with: Option<ErosionSettings> = None;
+    if stack.erosion.is_none() {
+        ui.horizontal(|ui| {
+            ui.menu_button("Bake erosion", |ui| {
+                for (name, settings) in ErosionSettings::presets() {
+                    if ui.button(name).clicked() {
+                        bake_with = Some(settings);
+                        ui.close();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("rain-carves channels & scree slopes")
+                    .weak()
+                    .size(10.0),
+            );
+        });
+    } else {
+        // stale check reads &stack, so it runs before the &mut borrows
+        let stale = stack.erosion_stale(seed, resolution, size, height);
+        {
+            let erosion = stack.erosion.as_mut().expect("checked above");
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut erosion.enabled, "Enabled").changed();
+                ui.label("Strength");
+                changed |= ui
+                    .add(egui::Slider::new(&mut erosion.strength, 0.0..=1.5))
+                    .changed();
+            });
+            if stale {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠ Terrain changed since the bake — re-bake to match",
+                    )
+                    .color(egui::Color32::from_rgb(220, 170, 60))
+                    .size(11.0),
+                );
+            }
+            egui::CollapsingHeader::new("Settings")
+                .id_salt("terrain-erosion-settings")
+                .show(ui, |ui| {
+                    let s = &mut erosion.settings;
+                    let mut droplets_k = s.droplets as f32 / 1000.0;
+                    if slider_row(ui, "Droplets (k)", &mut droplets_k, 1.0..=400.0) {
+                        s.droplets = (droplets_k * 1000.0) as u32;
+                        dirty = true;
+                    }
+                    dirty |= slider_row(ui, "Erosion rate", &mut s.erosion_rate, 0.0..=1.0);
+                    dirty |= slider_row(ui, "Deposition", &mut s.deposition, 0.0..=1.0);
+                    dirty |= slider_row(ui, "Capacity", &mut s.capacity, 0.5..=16.0);
+                    dirty |= int_row(ui, "Brush radius", &mut s.brush_radius, 1..=8);
+                    dirty |= int_row(ui, "Thermal sweeps", &mut s.thermal_iterations, 0..=200);
+                    dirty |= slider_row(ui, "Talus angle °", &mut s.talus_angle_deg, 5.0..=75.0);
+                    dirty |= slider_row(ui, "Smoothing", &mut s.smoothing, 0.0..=1.0);
+                    ui.label(
+                        egui::RichText::new("Settings apply on the next re-bake.")
+                            .weak()
+                            .size(10.0),
+                    );
+                });
+        }
+        let rebake_settings = stack.erosion.as_ref().expect("checked above").settings;
+        ui.horizontal(|ui| {
+            if ui
+                .button("Re-bake")
+                .on_hover_text("Run the simulation again with the settings above")
+                .clicked()
+            {
+                bake_with = Some(rebake_settings);
+            }
+            ui.menu_button("Re-bake as…", |ui| {
+                for (name, settings) in ErosionSettings::presets() {
+                    if ui.button(name).clicked() {
+                        bake_with = Some(settings);
+                        ui.close();
+                    }
+                }
+            });
+            if ui
+                .button("Remove")
+                .on_hover_text("Drop the baked erosion (undoable)")
+                .clicked()
+            {
+                stack.erosion = None;
+                changed = true;
+            }
+        });
+    }
+    if let Some(settings) = bake_with {
+        stack.bake_erosion(seed, resolution, size, height, settings);
+        changed = true;
+    }
+    (changed || dirty, changed)
 }
 
 /// Editor for a terrain's noise-layer stack (Data tab). Mutates `stack` in

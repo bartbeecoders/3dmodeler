@@ -456,6 +456,12 @@ pub struct TerrainData {
     /// Non-destructive: clearing it restores the pure procedural surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sculpt: Option<SculptLayer>,
+    /// Baked erosion offsets (meters), applied after the sculpt:
+    /// `final = stack + sculpt + erosion.delta × strength`. Baked once on
+    /// demand (`bake_erosion`), toggleable, and stale-checkable when the
+    /// surface it was baked against has changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erosion: Option<ErosionLayer>,
     /// Memoized stack evaluation, so sculpt strokes don't re-run the noise
     /// layers every frame. Never serialized, never cloned, always equal.
     #[serde(skip)]
@@ -684,6 +690,89 @@ impl<'de> Deserialize<'de> for SculptLayer {
     }
 }
 
+/// A baked erosion result: signed offsets (meters) on an `(res+1)²` grid,
+/// blended in as `delta × strength`. `bake_stamp` fingerprints the surface
+/// it was computed against, so the UI can flag a stale bake after stack or
+/// sculpt edits. Serialized like the sculpt layer (lossless base64 f32).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErosionLayer {
+    pub enabled: bool,
+    /// Blend factor: 0 = off, 1 = the full baked result. Live-adjustable.
+    pub strength: f32,
+    /// The recipe used for the bake (re-bakes reuse it).
+    pub settings: crate::erosion::ErosionSettings,
+    pub resolution: u32,
+    /// Row-major `(resolution+1)²` offsets, meters.
+    pub delta: Vec<f32>,
+    /// `grid_stamp` of the pre-erosion surface at bake time.
+    pub bake_stamp: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ErosionLayerRepr {
+    enabled: bool,
+    strength: f32,
+    settings: crate::erosion::ErosionSettings,
+    resolution: u32,
+    bake_stamp: u64,
+    data: String,
+}
+
+impl Serialize for ErosionLayer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(self.delta.len() * 4);
+        for d in &self.delta {
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        ErosionLayerRepr {
+            enabled: self.enabled,
+            strength: self.strength,
+            settings: self.settings,
+            resolution: self.resolution,
+            bake_stamp: self.bake_stamp,
+            data: base64_encode(&bytes),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ErosionLayer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let repr = ErosionLayerRepr::deserialize(d)?;
+        let bytes = base64_decode(&repr.data)
+            .ok_or_else(|| serde::de::Error::custom("bad erosion base64"))?;
+        let res = repr.resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        if bytes.len() != n * n * 4 {
+            return Err(serde::de::Error::custom("erosion data size mismatch"));
+        }
+        let delta = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .map(|v| if v.is_finite() { v } else { 0.0 })
+            .collect();
+        Ok(Self {
+            enabled: repr.enabled,
+            strength: repr.strength,
+            settings: repr.settings,
+            resolution: res,
+            delta,
+            bake_stamp: repr.bake_stamp,
+        })
+    }
+}
+
+/// Order-and-bit-exact fingerprint of an evaluated grid (stale detection).
+pub fn grid_stamp(grid: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    grid.len().hash(&mut h);
+    for v in grid {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -850,6 +939,7 @@ impl Default for TerrainData {
         ridges.mask.height = Some(Band { min: 0.25, max: 1.5, falloff: 0.2, invert: false });
         Self {
             sculpt: None,
+            erosion: None,
             cache: Default::default(),
             layers: vec![
                 TerrainLayer::new(LayerKind::DomainWarp { scale: 90.0, strength: 14.0, octaves: 3 }),
@@ -892,7 +982,7 @@ impl TerrainData {
             ("Hills", TerrainData::default()),
             (
                 "Alpine",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 120.0, strength: 18.0, octaves: 3 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Ridged { scale: 130.0, octaves: 6, gain: 0.52, lacunarity: 2.1, sharpness: 2.0 }, BlendMode::Add, 0.85),
@@ -902,7 +992,7 @@ impl TerrainData {
             ),
             (
                 "Dunes",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Billow { scale: 120.0, octaves: 3, gain: 0.5, lacunarity: 2.0 }, BlendMode::Add, 0.25),
                         layer(LayerKind::DomainWarp { scale: 60.0, strength: 6.0, octaves: 2 }, BlendMode::Add, 1.0),
@@ -912,7 +1002,7 @@ impl TerrainData {
             ),
             (
                 "Archipelago",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Constant { value: 1.0 }, BlendMode::Subtract, 0.35),
                         layer(LayerKind::DomainWarp { scale: 100.0, strength: 20.0, octaves: 3 }, BlendMode::Add, 1.0),
@@ -922,7 +1012,7 @@ impl TerrainData {
             ),
             (
                 "Canyon",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         // high base plateau, stepped strata, then the river
                         // digs deep through all of it
@@ -935,7 +1025,7 @@ impl TerrainData {
             ),
             (
                 "Volcanic",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Ridged { scale: 80.0, octaves: 5, gain: 0.5, lacunarity: 2.2, sharpness: 2.4 }, BlendMode::Add, 0.6),
                         masked(
@@ -947,7 +1037,7 @@ impl TerrainData {
             ),
             (
                 "Rolling",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 80.0, strength: 10.0, octaves: 2 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Fbm { scale: 60.0, octaves: 5, gain: 0.45, lacunarity: 2.0, erosion: 0.5, warp: 0.0 }, BlendMode::Add, 0.4),
@@ -956,7 +1046,7 @@ impl TerrainData {
             ),
             (
                 "Craters",
-                TerrainData { sculpt: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Fbm { scale: 70.0, octaves: 4, gain: 0.5, lacunarity: 2.0, erosion: 0.0, warp: 0.0 }, BlendMode::Add, 0.2),
                         layer(LayerKind::Crater { scale: 35.0, density: 0.6, depth: 0.7, rim: 0.3 }, BlendMode::Add, 0.6),
@@ -977,8 +1067,38 @@ impl TerrainData {
     /// Evaluate the terrain over an `(n+1)²` vertex grid covering
     /// `[-size/2, size/2]²`, row-major, in meters: the layer stack (memoized
     /// — repeat calls with unchanged layers reuse the last run, which is
-    /// what keeps sculpt strokes cheap) plus the sculpt offsets on top.
+    /// what keeps sculpt strokes cheap) plus the sculpt offsets, plus the
+    /// baked erosion delta scaled by its strength.
     pub fn eval_grid(&self, seed: u32, resolution: u32, size: f32, height: f32) -> Vec<f32> {
+        let mut out = self.eval_pre_erosion(seed, resolution, size, height);
+        if let Some(erosion) = self.erosion.as_ref().filter(|e| e.enabled && e.strength != 0.0)
+        {
+            let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) as usize;
+            let n = res + 1;
+            let s = erosion.strength;
+            if erosion.resolution as usize == res {
+                for (o, d) in out.iter_mut().zip(&erosion.delta) {
+                    *o += d * s;
+                }
+            } else {
+                // bake at another resolution: bilinear resample on the fly
+                let er = erosion.resolution as usize;
+                for iy in 0..n {
+                    for ix in 0..n {
+                        let u = ix as f32 / res as f32;
+                        let v = iy as f32 / res as f32;
+                        out[iy * n + ix] +=
+                            sample_grid_normalized(&erosion.delta, er, u, v) * s;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The surface erosion runs on and is compared against for staleness:
+    /// layer stack (memoized) + sculpt, without any erosion applied.
+    pub fn eval_pre_erosion(&self, seed: u32, resolution: u32, size: f32, height: f32) -> Vec<f32> {
         let key = BaseKey {
             layers: self.layers.clone(),
             seed,
@@ -1009,6 +1129,55 @@ impl TerrainData {
             }
         }
         out
+    }
+
+    /// Run the erosion simulation against the current stack + sculpt and
+    /// store the result as the (non-destructive) erosion layer. A previous
+    /// layer's enabled/strength survive the re-bake.
+    pub fn bake_erosion(
+        &mut self,
+        seed: u32,
+        resolution: u32,
+        size: f32,
+        height: f32,
+        settings: crate::erosion::ErosionSettings,
+    ) {
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let pre = self.eval_pre_erosion(seed, res, size, height);
+        let stamp = grid_stamp(&pre);
+        // the sim runs on normalized heights so presets behave identically
+        // at every terrain height
+        let h = height.max(1e-3);
+        let normalized: Vec<f32> = pre.iter().map(|v| v / h).collect();
+        let cell_norm = (size / res as f32) / h;
+        let delta_norm =
+            crate::erosion::erode_grid(&normalized, res, cell_norm, &settings, seed);
+        let (enabled, strength) = self
+            .erosion
+            .as_ref()
+            .map(|e| (e.enabled, e.strength))
+            .unwrap_or((true, 1.0));
+        self.erosion = Some(ErosionLayer {
+            enabled,
+            strength,
+            settings,
+            resolution: res,
+            delta: delta_norm.into_iter().map(|d| d * h).collect(),
+            bake_stamp: stamp,
+        });
+    }
+
+    /// True when an erosion bake exists but the surface under it (stack,
+    /// sculpt, seed, resolution or size) has changed since — the carved
+    /// channels no longer match the terrain they were carved into.
+    pub fn erosion_stale(&self, seed: u32, resolution: u32, size: f32, height: f32) -> bool {
+        let Some(erosion) = &self.erosion else {
+            return false;
+        };
+        if erosion.resolution != resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION) {
+            return true;
+        }
+        grid_stamp(&self.eval_pre_erosion(seed, resolution, size, height)) != erosion.bake_stamp
     }
 
     /// The pure layer-stack evaluation (no sculpt, no cache).
@@ -1382,7 +1551,7 @@ mod tests {
 
     #[test]
     fn empty_stack_is_flat() {
-        let data = TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+        let data = TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
         for v in data.eval_grid(1, 16, 10.0, 5.0) {
             assert_eq!(v, 0.0);
         }
@@ -1396,7 +1565,7 @@ mod tests {
         top_up.blend = BlendMode::Add;
         top_up.amount = 1.0;
         top_up.mask.height = Some(Band { min: 0.75, max: 2.0, falloff: 0.01, invert: false });
-        let data = TerrainData { sculpt: None, cache: Default::default(),
+        let data = TerrainData { sculpt: None, erosion: None, cache: Default::default(),
             layers: vec![
                 TerrainLayer {
                     amount: 0.5,
@@ -1433,7 +1602,7 @@ mod tests {
 
     #[test]
     fn raise_brush_lifts_the_surface_inside_the_radius_only() {
-        let mut data = TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+        let mut data = TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
         let mut sculpt = SculptLayer::new(32);
         sculpt.brush(
             BrushMode::Raise,
@@ -1456,7 +1625,7 @@ mod tests {
     #[test]
     fn flatten_brush_pulls_toward_the_target() {
         let mut data =
-            TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
         // constant 0.5 → flat 5 m surface at height 10
         data.layers.push(TerrainLayer {
             amount: 0.5,
@@ -1527,7 +1696,7 @@ mod tests {
     #[test]
     fn shape_stamp_lands_where_placed() {
         let mut data =
-            TerrainData { sculpt: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
         let mut layer = TerrainLayer::new(LayerKind::Shape {
             shape: ShapeKind::Mountain,
             x: 20.0,
@@ -1568,6 +1737,68 @@ mod tests {
         });
         let d = data.eval_grid(1, 64, 100.0, 10.0);
         assert!((d[0] - c[0] - 3.0).abs() < 0.2, "new layer must take effect");
+    }
+
+    #[test]
+    fn erosion_bake_applies_and_scales_with_strength() {
+        let mut data = TerrainData::default();
+        let before = data.eval_grid(1, 64, 100.0, 12.0);
+        let settings = crate::erosion::ErosionSettings {
+            droplets: 8_000,
+            ..Default::default()
+        };
+        data.bake_erosion(1, 64, 100.0, 12.0, settings);
+        let full = data.eval_grid(1, 64, 100.0, 12.0);
+        assert_ne!(before, full, "erosion must change the surface");
+        // half strength = half the delta at every vertex
+        data.erosion.as_mut().unwrap().strength = 0.5;
+        let half = data.eval_grid(1, 64, 100.0, 12.0);
+        for ((b, f), h) in before.iter().zip(&full).zip(&half) {
+            assert!((h - b) - (f - b) * 0.5 < 1e-4, "strength must scale linearly");
+        }
+        // disabled = the un-eroded surface
+        data.erosion.as_mut().unwrap().enabled = false;
+        assert_eq!(data.eval_grid(1, 64, 100.0, 12.0), before);
+    }
+
+    #[test]
+    fn erosion_stale_detection() {
+        let mut data = TerrainData::default();
+        let settings = crate::erosion::ErosionSettings {
+            droplets: 2_000,
+            ..Default::default()
+        };
+        data.bake_erosion(1, 64, 100.0, 12.0, settings);
+        assert!(!data.erosion_stale(1, 64, 100.0, 12.0), "fresh bake is not stale");
+        assert!(data.erosion_stale(2, 64, 100.0, 12.0), "seed change → stale");
+        assert!(data.erosion_stale(1, 128, 100.0, 12.0), "resolution change → stale");
+        // sculpting after the bake also invalidates it
+        let mut sculpt = SculptLayer::new(64);
+        sculpt.brush(BrushMode::Raise, Vec2::ZERO, 10.0, 2.0, 0.5, 100.0, &[], 0.0);
+        data.sculpt = Some(sculpt);
+        assert!(data.erosion_stale(1, 64, 100.0, 12.0), "sculpt change → stale");
+    }
+
+    #[test]
+    fn erosion_survives_serde_bit_exactly() {
+        let mut data = TerrainData::default();
+        data.bake_erosion(
+            1,
+            32,
+            100.0,
+            12.0,
+            crate::erosion::ErosionSettings {
+                droplets: 2_000,
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TerrainData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.erosion, data.erosion);
+        assert_eq!(
+            back.eval_grid(1, 32, 100.0, 12.0),
+            data.eval_grid(1, 32, 100.0, 12.0)
+        );
     }
 
     #[test]

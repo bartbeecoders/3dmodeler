@@ -5,6 +5,7 @@
 //! rendering or physics — those live in `modeler-app`.
 
 pub mod boolean;
+pub mod erosion;
 pub mod library;
 pub mod material;
 pub mod mesh;
