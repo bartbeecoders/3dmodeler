@@ -111,6 +111,8 @@ pub struct UiState {
     scatter_params: modeler_core::terrain::ScatterParams,
     /// Active Properties panel tab (Blender-style icon tabs).
     properties_tab: PropertiesTab,
+    /// Active section of the terrain Data panel (vertical tab strip).
+    terrain_data_tab: TerrainDataTab,
     /// Eyedropper armed on a boolean modifier: (object owning the stack,
     /// modifier index). The next viewport click picks that modifier's tool
     /// object instead of changing the selection; Esc cancels.
@@ -191,6 +193,7 @@ impl UiState {
             scatter_kind: modeler_core::PropKind::Conifer,
             scatter_params: modeler_core::terrain::ScatterParams::default(),
             properties_tab: PropertiesTab::Transform,
+            terrain_data_tab: TerrainDataTab::Shape,
             status_message: None,
             current_file: None,
             saved_version: None,
@@ -2705,6 +2708,7 @@ impl egui_dock::TabViewer for PanelViewer<'_> {
                     self.edit_point,
                     &mut self.state.break_dialog,
                     &mut self.state.properties_tab,
+                    &mut self.state.terrain_data_tab,
                     &mut self.state.pick_boolean_tool,
                     self.sculpt_tool,
                     &mut self.state.scatter_kind,
@@ -3376,6 +3380,51 @@ impl PropertiesTab {
     }
 }
 
+/// Sections of the terrain Data panel, shown as a vertical tab strip —
+/// the flat stack of six feature blocks outgrew one scrolling column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerrainDataTab {
+    Shape,
+    Layers,
+    Erosion,
+    Color,
+    Water,
+    Scatter,
+}
+
+impl TerrainDataTab {
+    const ALL: [Self; 6] = [
+        Self::Shape,
+        Self::Layers,
+        Self::Erosion,
+        Self::Color,
+        Self::Water,
+        Self::Scatter,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shape => "Shape",
+            Self::Layers => "Layers",
+            Self::Erosion => "Erosion",
+            Self::Color => "Color",
+            Self::Water => "Water",
+            Self::Scatter => "Scatter",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Shape => "Size, resolution, seed, shading & sculpt brush",
+            Self::Layers => "The procedural noise-layer stack",
+            Self::Erosion => "Baked hydraulic + thermal erosion",
+            Self::Color => "Biome coloring by height and slope",
+            Self::Water => "Water level, tint, foam & ripple",
+            Self::Scatter => "Scatter rocks and vegetation over the surface",
+        }
+    }
+}
+
 /// Icon-only tab button (Blender properties strip).
 fn prop_tab_button(ui: &mut egui::Ui, tab: PropertiesTab, selected: bool) -> egui::Response {
     let size = egui::vec2(28.0, 26.0);
@@ -3638,6 +3687,7 @@ fn properties(
     edit_point: Option<(ObjectId, Vec3)>,
     break_dialog: &mut Option<(object_ops::BreakKind, i32)>,
     tab: &mut PropertiesTab,
+    terrain_tab: &mut TerrainDataTab,
     pick_boolean_tool: &mut Option<(ObjectId, usize)>,
     sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
     scatter_kind: &mut modeler_core::PropKind,
@@ -3857,110 +3907,157 @@ fn properties(
                     .on_hover_text("Discard all mesh edits and restore the parametric shape")
                     .clicked();
             } else {
-                dirty.primitive |= primitive_params(
-                    ui,
-                    &mut primitive,
-                    !object.floor_outline.is_empty(),
-                    Some((scene, active_id)),
-                );
-                if !primitive.is_gizmo() {
-                    dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
-                }
-
-                if let Primitive::Wall { length, height, .. } = primitive {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Openings (doors & windows)").strong());
-                    let mut cutouts = object.cutouts.clone();
-                    if wall_cutout_rows(ui, &mut cutouts, length, height) {
-                        edited_cutouts = Some(cutouts);
-                    }
-                }
-
                 if matches!(primitive, Primitive::Terrain { .. }) {
-                    ui.add_space(6.0);
-                    let sculpting = sculpt_tool.target() == Some(active_id);
-                    let label = if sculpting { "Sculpting…" } else { "Sculpt terrain" };
-                    if ui
-                        .add_enabled(!sculpting, egui::Button::new(label))
-                        .on_hover_text(
-                            "Paint height with a brush in the viewport: raise, \
-                             lower, smooth, flatten. Esc exits.",
-                        )
-                        .clicked()
-                    {
-                        sculpt_tool.start(active_id);
-                    }
-                    ui.add_space(6.0);
+                    // Terrain grew six feature blocks — a vertical tab strip
+                    // replaces the endless scroll. Shape keeps the shared
+                    // primitive params and the shading toggle.
                     let mut stack = object.terrain.clone().unwrap_or_default();
-                    let (erosion_dirty, erosion_remesh) =
-                        terrain_erosion_ui(ui, &mut stack, &primitive);
-                    ui.add_space(6.0);
-                    let color_dirty = terrain_color_ui(ui, &mut stack);
-                    ui.add_space(6.0);
-                    let (water_dirty, water_remesh) =
-                        terrain_water_ui(ui, &mut stack, &primitive);
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Scatter props").strong());
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("scatter-kind")
-                            .selected_text(scatter_kind.label())
-                            .width(96.0)
-                            .show_ui(ui, |ui| {
-                                for k in modeler_core::PropKind::ALL {
-                                    if ui.selectable_label(*scatter_kind == k, k.label()).clicked() {
-                                        *scatter_kind = k;
-                                    }
+                    // (dirty, remesh) union over whichever section is open
+                    let mut terrain_edit = (false, false);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(56.0);
+                            for t in TerrainDataTab::ALL {
+                                if ui
+                                    .selectable_label(*terrain_tab == t, t.label())
+                                    .on_hover_text(t.tooltip())
+                                    .clicked()
+                                {
+                                    *terrain_tab = t;
                                 }
-                            });
-                        if ui
-                            .button("Scatter")
-                            .on_hover_text(
-                                "Place props over the terrain (grouped under one \
-                                 root; click any prop to select the whole set, \
-                                 X deletes it, Ctrl+Z undoes)",
-                            )
-                            .clicked()
-                        {
-                            scatter_request = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Density");
-                        ui.add(egui::Slider::new(&mut scatter_params.density, 0.05..=1.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Seed");
-                        ui.add(egui::DragValue::new(&mut scatter_params.seed).speed(1));
-                        ui.label("Spacing");
-                        ui.add(
-                            egui::DragValue::new(&mut scatter_params.cell_size)
-                                .speed(0.1)
-                                .range(0.5..=100.0)
-                                .suffix(" m"),
-                        );
-                    });
-                    egui::CollapsingHeader::new("Rules")
-                        .id_salt("scatter-rules")
-                        .show(ui, |ui| {
-                            slider_row(ui, "Max slope", &mut scatter_params.max_slope, 0.05..=3.0);
-                            float_row_ex(ui, "Min height", &mut scatter_params.height_min, 0.1, -1000.0..=1000.0, Some(" m"));
-                            float_row_ex(ui, "Max height", &mut scatter_params.height_max, 0.1, -1000.0..=1000.0, Some(" m"));
-                            slider_row(ui, "Scale min", &mut scatter_params.scale_min, 0.1..=3.0);
-                            slider_row(ui, "Scale max", &mut scatter_params.scale_max, 0.1..=4.0);
-                            slider_row(ui, "Patchiness", &mut scatter_params.patchiness, 0.0..=1.0);
-                            ui.checkbox(&mut scatter_params.spacing, "Keep props apart");
-                            ui.checkbox(
-                                &mut scatter_params.avoid_paint,
-                                "Avoid painted rock/snow/sand",
-                            );
+                            }
                         });
+                        ui.separator();
+                        ui.vertical(|ui| match *terrain_tab {
+                            TerrainDataTab::Shape => {
+                                dirty.primitive |= primitive_params(
+                                    ui,
+                                    &mut primitive,
+                                    !object.floor_outline.is_empty(),
+                                    Some((scene, active_id)),
+                                );
+                                dirty.smooth |=
+                                    ui.checkbox(&mut smooth, "Shade smooth").changed();
+                                ui.add_space(6.0);
+                                let sculpting = sculpt_tool.target() == Some(active_id);
+                                let label =
+                                    if sculpting { "Sculpting…" } else { "Sculpt terrain" };
+                                if ui
+                                    .add_enabled(!sculpting, egui::Button::new(label))
+                                    .on_hover_text(
+                                        "Paint height with a brush in the viewport: raise, \
+                                         lower, smooth, flatten. Esc exits.",
+                                    )
+                                    .clicked()
+                                {
+                                    sculpt_tool.start(active_id);
+                                }
+                            }
+                            TerrainDataTab::Layers => {
+                                let changed = terrain_stack_ui(ui, &mut stack);
+                                terrain_edit.0 |= changed;
+                                terrain_edit.1 |= changed;
+                            }
+                            TerrainDataTab::Erosion => {
+                                let (d, r) = terrain_erosion_ui(ui, &mut stack, &primitive);
+                                terrain_edit.0 |= d;
+                                terrain_edit.1 |= r;
+                            }
+                            TerrainDataTab::Color => {
+                                terrain_edit.0 |= terrain_color_ui(ui, &mut stack);
+                            }
+                            TerrainDataTab::Water => {
+                                let (d, r) = terrain_water_ui(ui, &mut stack, &primitive);
+                                terrain_edit.0 |= d;
+                                terrain_edit.1 |= r;
+                            }
+                            TerrainDataTab::Scatter => {
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("scatter-kind")
+                                        .selected_text(scatter_kind.label())
+                                        .width(96.0)
+                                        .show_ui(ui, |ui| {
+                                            for k in modeler_core::PropKind::ALL {
+                                                if ui
+                                                    .selectable_label(
+                                                        *scatter_kind == k,
+                                                        k.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    *scatter_kind = k;
+                                                }
+                                            }
+                                        });
+                                    if ui
+                                        .button("Scatter")
+                                        .on_hover_text(
+                                            "Place props over the terrain (grouped under \
+                                             one root; click any prop to select the whole \
+                                             set, X deletes it, Ctrl+Z undoes)",
+                                        )
+                                        .clicked()
+                                    {
+                                        scatter_request = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Density");
+                                    ui.add(egui::Slider::new(
+                                        &mut scatter_params.density,
+                                        0.05..=1.0,
+                                    ));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Seed");
+                                    ui.add(egui::DragValue::new(&mut scatter_params.seed).speed(1));
+                                    ui.label("Spacing");
+                                    ui.add(
+                                        egui::DragValue::new(&mut scatter_params.cell_size)
+                                            .speed(0.1)
+                                            .range(0.5..=100.0)
+                                            .suffix(" m"),
+                                    );
+                                });
+                                egui::CollapsingHeader::new("Rules")
+                                    .id_salt("scatter-rules")
+                                    .show(ui, |ui| {
+                                        slider_row(ui, "Max slope", &mut scatter_params.max_slope, 0.05..=3.0);
+                                        float_row_ex(ui, "Min height", &mut scatter_params.height_min, 0.1, -1000.0..=1000.0, Some(" m"));
+                                        float_row_ex(ui, "Max height", &mut scatter_params.height_max, 0.1, -1000.0..=1000.0, Some(" m"));
+                                        slider_row(ui, "Scale min", &mut scatter_params.scale_min, 0.1..=3.0);
+                                        slider_row(ui, "Scale max", &mut scatter_params.scale_max, 0.1..=4.0);
+                                        slider_row(ui, "Patchiness", &mut scatter_params.patchiness, 0.0..=1.0);
+                                        ui.checkbox(&mut scatter_params.spacing, "Keep props apart");
+                                        ui.checkbox(
+                                            &mut scatter_params.avoid_paint,
+                                            "Avoid painted rock/snow/sand",
+                                        );
+                                    });
+                            }
+                        });
+                    });
+                    if terrain_edit.0 {
+                        edited_terrain = Some((stack, terrain_edit.1));
+                    }
+                } else {
+                    dirty.primitive |= primitive_params(
+                        ui,
+                        &mut primitive,
+                        !object.floor_outline.is_empty(),
+                        Some((scene, active_id)),
+                    );
+                    if !primitive.is_gizmo() {
+                        dirty.smooth |= ui.checkbox(&mut smooth, "Shade smooth").changed();
+                    }
 
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Terrain layers").strong());
-                    let stack_changed = terrain_stack_ui(ui, &mut stack);
-                    if erosion_dirty || color_dirty || water_dirty || stack_changed {
-                        edited_terrain =
-                            Some((stack, erosion_remesh || water_remesh || stack_changed));
+                    if let Primitive::Wall { length, height, .. } = primitive {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Openings (doors & windows)").strong());
+                        let mut cutouts = object.cutouts.clone();
+                        if wall_cutout_rows(ui, &mut cutouts, length, height) {
+                            edited_cutouts = Some(cutouts);
+                        }
                     }
                 }
 
