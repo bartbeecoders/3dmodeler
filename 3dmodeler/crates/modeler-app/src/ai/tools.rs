@@ -88,6 +88,7 @@ fn object_properties() -> Value {
         "erosion_strength": {"type": "number", "description": "terrain only: blend of the baked erosion, 0..2 (1 = as simulated)"},
         "erosion_enabled": {"type": "boolean", "description": "terrain only: toggle the baked erosion without discarding it"},
         "clear_erosion": {"type": "boolean", "description": "terrain only: true discards the baked erosion layer"},
+        "terrain_color": {"description": "terrain only: biome coloring by height/slope (grass, rock on steep faces, snow, sand). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (Meadow), false (plain material color), or a full settings object as reported in the terrain stack"},
         "thickness": {"type": "number", "description": "walls only, meters"},
         "radius": {"type": "number", "description": "ropes only: cord radius meters"},
         "segments": {"type": "integer", "description": "ropes only: physics links 2–64"},

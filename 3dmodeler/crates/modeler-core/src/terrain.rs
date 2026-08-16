@@ -456,6 +456,13 @@ pub struct TerrainData {
     /// Non-destructive: clearing it restores the pure procedural surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sculpt: Option<SculptLayer>,
+    /// Procedural biome coloring, baked to an albedo texture by the
+    /// renderer. `None` = plain material color (the pre-phase-4 look).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<TerrainColor>,
+    /// Hand-painted biome patches, blended over the procedural coloring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint: Option<PaintLayer>,
     /// Baked erosion offsets (meters), applied after the sculpt:
     /// `final = stack + sculpt + erosion.delta × strength`. Baked once on
     /// demand (`bake_erosion`), toggleable, and stale-checkable when the
@@ -762,6 +769,420 @@ impl<'de> Deserialize<'de> for ErosionLayer {
     }
 }
 
+// --- biome coloring ------------------------------------------------------
+
+/// The paintable biome channels, indexing into [`TerrainColor`]'s palette.
+pub const PAINT_CHANNELS: [&str; 6] = ["Grass", "Dry grass", "Rock", "Cliff", "Snow", "Sand"];
+
+/// Hand-painted biome override: per-vertex palette slot + blend weight on
+/// its own grid. Baked into the albedo AFTER the procedural rules, so
+/// painted patches sit on top of (and blend into) the automatic coloring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintLayer {
+    /// Grid quads per side (vertices = resolution + 1 per side).
+    pub resolution: u32,
+    /// Palette slot per vertex (index into `PAINT_CHANNELS`).
+    pub slots: Vec<u8>,
+    /// Blend weight per vertex, 0..1.
+    pub weights: Vec<f32>,
+}
+
+impl PaintLayer {
+    pub fn new(resolution: u32) -> Self {
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        Self {
+            resolution: res,
+            slots: vec![0; n * n],
+            weights: vec![0.0; n * n],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.weights.iter().all(|w| *w == 0.0)
+    }
+
+    /// One paint dab: positive `amount` paints `channel` in (and claims the
+    /// vertex's slot), negative erases weight. Same footprint/falloff
+    /// semantics as the sculpt brush.
+    pub fn brush(
+        &mut self,
+        center: Vec2,
+        radius: f32,
+        amount: f32,
+        falloff: f32,
+        size: f32,
+        channel: u8,
+    ) {
+        let res = self.resolution as usize;
+        let n = res + 1;
+        let step = size / res as f32;
+        let radius = radius.max(step * 0.5);
+        let to_idx = |w: f32| ((w / size + 0.5) * res as f32).round() as i32;
+        let x0 = to_idx(center.x - radius).clamp(0, res as i32) as usize;
+        let x1 = to_idx(center.x + radius).clamp(0, res as i32) as usize;
+        let y0 = to_idx(center.y - radius).clamp(0, res as i32) as usize;
+        let y1 = to_idx(center.y + radius).clamp(0, res as i32) as usize;
+        let inner = 1.0 - falloff.clamp(0.05, 1.0);
+        for iy in y0..=y1 {
+            for ix in x0..=x1 {
+                let w = Vec2::new(
+                    (ix as f32 / res as f32 - 0.5) * size,
+                    (iy as f32 / res as f32 - 0.5) * size,
+                );
+                let t = (w - center).length() / radius;
+                if t >= 1.0 {
+                    continue;
+                }
+                let weight = 1.0 - smoothstep((inner, 1.0), t);
+                let idx = iy * n + ix;
+                if amount > 0.0 {
+                    // painting claims the slot; an existing different color
+                    // fades out before the new one fades in
+                    if self.slots[idx] != channel {
+                        let drop = amount * weight;
+                        if self.weights[idx] <= drop {
+                            self.slots[idx] = channel;
+                            self.weights[idx] = drop - self.weights[idx];
+                        } else {
+                            self.weights[idx] -= drop;
+                        }
+                    } else {
+                        self.weights[idx] = (self.weights[idx] + amount * weight).min(1.0);
+                    }
+                } else {
+                    self.weights[idx] = (self.weights[idx] + amount * weight).max(0.0);
+                }
+            }
+        }
+    }
+
+    /// Nearest-vertex slot and bilinear weight at normalized coordinates.
+    fn sample(&self, u: f32, v: f32) -> (u8, f32) {
+        let res = self.resolution as usize;
+        let n = res + 1;
+        let x = ((u.clamp(0.0, 1.0)) * res as f32).round() as usize;
+        let y = ((v.clamp(0.0, 1.0)) * res as f32).round() as usize;
+        let slot = self.slots[y.min(res) * n + x.min(res)];
+        let weight = sample_grid_normalized(&self.weights, res, u, v);
+        (slot, weight.clamp(0.0, 1.0))
+    }
+}
+
+/// Serialized form: slots as base64 bytes, weights as base64 f32 LE.
+#[derive(Serialize, Deserialize)]
+struct PaintLayerRepr {
+    resolution: u32,
+    slots: String,
+    weights: String,
+}
+
+impl Serialize for PaintLayer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut wbytes = Vec::with_capacity(self.weights.len() * 4);
+        for w in &self.weights {
+            wbytes.extend_from_slice(&w.to_le_bytes());
+        }
+        PaintLayerRepr {
+            resolution: self.resolution,
+            slots: base64_encode(&self.slots),
+            weights: base64_encode(&wbytes),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PaintLayer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let repr = PaintLayerRepr::deserialize(d)?;
+        let res = repr.resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        let slots = base64_decode(&repr.slots)
+            .ok_or_else(|| serde::de::Error::custom("bad paint slots base64"))?;
+        let wbytes = base64_decode(&repr.weights)
+            .ok_or_else(|| serde::de::Error::custom("bad paint weights base64"))?;
+        if slots.len() != n * n || wbytes.len() != n * n * 4 {
+            return Err(serde::de::Error::custom("paint data size mismatch"));
+        }
+        let weights = wbytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 })
+            .collect();
+        Ok(Self { resolution: res, slots, weights })
+    }
+}
+
+/// The terrain's procedural coloring: a small rule chain over height and
+/// slope (grass → rock by steepness, snow above the line, sand near the
+/// base, noise mottling), baked to an albedo texture by the renderer.
+/// Colors are sRGB 0..1.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TerrainColor {
+    pub grass: [f32; 3],
+    /// Mottled into the grass by `variation` noise.
+    pub dry_grass: [f32; 3],
+    pub rock: [f32; 3],
+    /// Steepest faces (a darker/greyer rock).
+    pub cliff: [f32; 3],
+    pub snow: [f32; 3],
+    pub sand: [f32; 3],
+    /// Meters above the base plane below which sand takes over.
+    pub sand_height: f32,
+    /// Slope (rise/run) where rock starts winning over vegetation.
+    pub rock_slope: f32,
+    /// Fraction of the terrain height (0..1) where snow begins on flat ground.
+    pub snow_line: f32,
+    /// Slope above which snow cannot stick.
+    pub snow_slope_max: f32,
+    /// Patchiness of the grass mottling, 0..1.
+    pub variation: f32,
+}
+
+impl Default for TerrainColor {
+    /// Temperate meadow-and-rock ("Meadow").
+    fn default() -> Self {
+        Self {
+            grass: [0.29, 0.42, 0.19],
+            dry_grass: [0.48, 0.45, 0.22],
+            rock: [0.42, 0.38, 0.33],
+            cliff: [0.32, 0.30, 0.28],
+            snow: [0.92, 0.93, 0.95],
+            sand: [0.65, 0.58, 0.42],
+            sand_height: 0.6,
+            rock_slope: 0.55,
+            snow_line: 0.75,
+            snow_slope_max: 0.9,
+            variation: 0.5,
+        }
+    }
+}
+
+impl TerrainColor {
+    /// Named looks (UI combo and the `terrain_color` command parameter).
+    pub fn presets() -> Vec<(&'static str, TerrainColor)> {
+        let meadow = TerrainColor::default();
+        vec![
+            ("Meadow", meadow),
+            (
+                "Autumn",
+                TerrainColor {
+                    grass: [0.42, 0.34, 0.14],
+                    dry_grass: [0.55, 0.35, 0.16],
+                    rock: [0.40, 0.35, 0.30],
+                    snow_line: 0.8,
+                    ..meadow
+                },
+            ),
+            (
+                "Desert",
+                TerrainColor {
+                    grass: [0.70, 0.58, 0.38],
+                    dry_grass: [0.62, 0.48, 0.30],
+                    rock: [0.55, 0.38, 0.26],
+                    cliff: [0.45, 0.28, 0.20],
+                    sand: [0.76, 0.65, 0.45],
+                    sand_height: 2.5,
+                    snow_line: 2.0, // never
+                    variation: 0.6,
+                    ..meadow
+                },
+            ),
+            (
+                "Arctic",
+                TerrainColor {
+                    grass: [0.55, 0.58, 0.55],
+                    dry_grass: [0.45, 0.48, 0.46],
+                    rock: [0.35, 0.36, 0.38],
+                    cliff: [0.25, 0.26, 0.29],
+                    sand: [0.5, 0.52, 0.54],
+                    snow_line: 0.25,
+                    snow_slope_max: 1.2,
+                    ..meadow
+                },
+            ),
+            (
+                "Volcanic",
+                TerrainColor {
+                    grass: [0.25, 0.22, 0.20],
+                    dry_grass: [0.35, 0.28, 0.22],
+                    rock: [0.20, 0.18, 0.17],
+                    cliff: [0.12, 0.11, 0.11],
+                    snow: [0.85, 0.83, 0.80], // ash
+                    sand: [0.30, 0.26, 0.22],
+                    snow_line: 2.0, // never
+                    variation: 0.7,
+                    ..meadow
+                },
+            ),
+            (
+                "Alien",
+                TerrainColor {
+                    grass: [0.30, 0.20, 0.42],
+                    dry_grass: [0.45, 0.25, 0.50],
+                    rock: [0.25, 0.28, 0.38],
+                    cliff: [0.16, 0.18, 0.28],
+                    snow: [0.75, 0.95, 0.90],
+                    sand: [0.40, 0.32, 0.50],
+                    variation: 0.65,
+                    ..meadow
+                },
+            ),
+        ]
+    }
+
+    pub fn preset(name: &str) -> Option<TerrainColor> {
+        Self::presets()
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, c)| c)
+    }
+
+    /// Palette entry for a paint channel (see [`PAINT_CHANNELS`]).
+    pub fn entry(&self, slot: u8) -> [f32; 3] {
+        match slot {
+            0 => self.grass,
+            1 => self.dry_grass,
+            2 => self.rock,
+            3 => self.cliff,
+            4 => self.snow,
+            _ => self.sand,
+        }
+    }
+
+    /// Hash of every field, for render-cache stamping.
+    pub fn stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for c in [self.grass, self.dry_grass, self.rock, self.cliff, self.snow, self.sand] {
+            for v in c {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        for v in [
+            self.sand_height,
+            self.rock_slope,
+            self.snow_line,
+            self.snow_slope_max,
+            self.variation,
+        ] {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Evaluate the rule chain at one point. `h` is the height in meters,
+    /// `h01` height / terrain height, `slope` rise/run, `jitter` a noise
+    /// value in [-1, 1] that breaks up the thresholds.
+    fn shade(&self, h: f32, h01: f32, slope: f32, jitter: f32, mottle: f32) -> [f32; 3] {
+        let mix3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+            let t = t.clamp(0.0, 1.0);
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ]
+        };
+        // vegetation with noise mottling
+        let mut color = mix3(
+            self.grass,
+            self.dry_grass,
+            (0.5 + mottle * 1.2 * self.variation).clamp(0.0, 1.0),
+        );
+        // sand band near the base plane
+        let sand_w = 1.0 - smoothstep(
+            (self.sand_height, self.sand_height + 0.8),
+            h + jitter * 0.4,
+        );
+        color = mix3(color, self.sand, sand_w);
+        // rock by steepness, hard cliffs above that
+        let rock_w = smoothstep(
+            (self.rock_slope, self.rock_slope + 0.35),
+            slope + jitter * 0.08,
+        );
+        color = mix3(color, self.rock, rock_w);
+        let cliff_w = smoothstep(
+            (self.rock_slope + 0.55, self.rock_slope + 1.1),
+            slope + jitter * 0.08,
+        );
+        color = mix3(color, self.cliff, cliff_w);
+        // snow above the line, only where it can stick
+        let snow_w = smoothstep(
+            (self.snow_line, self.snow_line + 0.12),
+            h01 + jitter * 0.05,
+        ) * (1.0 - smoothstep((self.snow_slope_max, self.snow_slope_max + 0.4), slope));
+        color = mix3(color, self.snow, snow_w);
+        // micro grain so large faces don't read flat
+        let grain = 1.0 + mottle * 0.06;
+        [
+            (color[0] * grain).clamp(0.0, 1.0),
+            (color[1] * grain).clamp(0.0, 1.0),
+            (color[2] * grain).clamp(0.0, 1.0),
+        ]
+    }
+}
+
+impl TerrainData {
+    /// Bake the biome color rules into an sRGB RGBA8 image covering the
+    /// terrain footprint (texel (0,0) at the -X/-Y corner, matching the
+    /// mesh's 0..1 UVs). Returns `None` when coloring is disabled.
+    pub fn bake_color(
+        &self,
+        seed: u32,
+        resolution: u32,
+        size: f32,
+        height: f32,
+        tex_res: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let color = self.color?;
+        let grid = self.eval_grid(seed, resolution, size, height);
+        let res = resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        let n = res as usize + 1;
+        let tex = tex_res.clamp(64, 4096) as usize;
+        let step = size / res as f32;
+        let h_max = height.max(1e-3);
+
+        let mut out = vec![0u8; tex * tex * 4];
+        for ty in 0..tex {
+            let v = (ty as f32 + 0.5) / tex as f32;
+            for tx in 0..tex {
+                let u = (tx as f32 + 0.5) / tex as f32;
+                let h = sample_grid_normalized(&grid, res as usize, u, v);
+                // slope from the grid around this texel
+                let gx = (u * res as f32) as usize;
+                let gy = (v * res as f32) as usize;
+                let (gx, gy) = (gx.min(res as usize - 1), gy.min(res as usize - 1));
+                let idx = gy * n + gx;
+                let dx = (grid[idx + 1] - grid[idx]) / step;
+                let dy = (grid[idx + n] - grid[idx]) / step;
+                let slope = (dx * dx + dy * dy).sqrt();
+                // two noise fields: threshold jitter and broad mottling
+                let p = Vec2::new((u - 0.5) * size, (v - 0.5) * size);
+                let jitter =
+                    vnoise_d(p / 7.0, seed.wrapping_add(0x0c01)).0;
+                let mottle = fbm(p / 24.0, seed.wrapping_add(0x0c02), 3, 0.5, 2.0, 0.0, 0.0)
+                    - 0.5;
+                let mut rgb = color.shade(h, h / h_max, slope, jitter, mottle);
+                if let Some(paint) = &self.paint {
+                    let (slot, w) = paint.sample(u, v);
+                    if w > 0.0 {
+                        let target = color.entry(slot);
+                        for (c, t) in rgb.iter_mut().zip(target) {
+                            *c += (t - *c) * w;
+                        }
+                    }
+                }
+                let o = (ty * tex + tx) * 4;
+                out[o] = (rgb[0] * 255.0 + 0.5) as u8;
+                out[o + 1] = (rgb[1] * 255.0 + 0.5) as u8;
+                out[o + 2] = (rgb[2] * 255.0 + 0.5) as u8;
+                out[o + 3] = 255;
+            }
+        }
+        Some((tex as u32, tex as u32, out))
+    }
+}
+
 /// Order-and-bit-exact fingerprint of an evaluated grid (stale detection).
 pub fn grid_stamp(grid: &[f32]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -940,6 +1361,8 @@ impl Default for TerrainData {
         Self {
             sculpt: None,
             erosion: None,
+            color: Some(TerrainColor::default()),
+            paint: None,
             cache: Default::default(),
             layers: vec![
                 TerrainLayer::new(LayerKind::DomainWarp { scale: 90.0, strength: 14.0, octaves: 3 }),
@@ -982,7 +1405,7 @@ impl TerrainData {
             ("Hills", TerrainData::default()),
             (
                 "Alpine",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 120.0, strength: 18.0, octaves: 3 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Ridged { scale: 130.0, octaves: 6, gain: 0.52, lacunarity: 2.1, sharpness: 2.0 }, BlendMode::Add, 0.85),
@@ -992,7 +1415,7 @@ impl TerrainData {
             ),
             (
                 "Dunes",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Billow { scale: 120.0, octaves: 3, gain: 0.5, lacunarity: 2.0 }, BlendMode::Add, 0.25),
                         layer(LayerKind::DomainWarp { scale: 60.0, strength: 6.0, octaves: 2 }, BlendMode::Add, 1.0),
@@ -1002,7 +1425,7 @@ impl TerrainData {
             ),
             (
                 "Archipelago",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Constant { value: 1.0 }, BlendMode::Subtract, 0.35),
                         layer(LayerKind::DomainWarp { scale: 100.0, strength: 20.0, octaves: 3 }, BlendMode::Add, 1.0),
@@ -1012,7 +1435,7 @@ impl TerrainData {
             ),
             (
                 "Canyon",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         // high base plateau, stepped strata, then the river
                         // digs deep through all of it
@@ -1025,7 +1448,7 @@ impl TerrainData {
             ),
             (
                 "Volcanic",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Ridged { scale: 80.0, octaves: 5, gain: 0.5, lacunarity: 2.2, sharpness: 2.4 }, BlendMode::Add, 0.6),
                         masked(
@@ -1037,7 +1460,7 @@ impl TerrainData {
             ),
             (
                 "Rolling",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::DomainWarp { scale: 80.0, strength: 10.0, octaves: 2 }, BlendMode::Add, 1.0),
                         layer(LayerKind::Fbm { scale: 60.0, octaves: 5, gain: 0.45, lacunarity: 2.0, erosion: 0.5, warp: 0.0 }, BlendMode::Add, 0.4),
@@ -1046,7 +1469,7 @@ impl TerrainData {
             ),
             (
                 "Craters",
-                TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+                TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
                     layers: vec![
                         layer(LayerKind::Fbm { scale: 70.0, octaves: 4, gain: 0.5, lacunarity: 2.0, erosion: 0.0, warp: 0.0 }, BlendMode::Add, 0.2),
                         layer(LayerKind::Crater { scale: 35.0, density: 0.6, depth: 0.7, rim: 0.3 }, BlendMode::Add, 0.6),
@@ -1466,7 +1889,12 @@ pub fn generate_mesh(data: &TerrainData, size: f32, resolution: u32, height: f32
             let dzdx = (xp - xm) / span(ix.saturating_sub(1), (ix + 1).min(res));
             let dzdy = (yp - ym) / span(iy.saturating_sub(1), (iy + 1).min(res));
             mesh.normals.push(Vec3::new(-dzdx, -dzdy, 1.0).normalize());
-            mesh.uvs.push(Vec2::new(x, y));
+            // 0..1 across the footprint, aligned with the baked color
+            // texture (tiling materials can still repeat via UV scale)
+            mesh.uvs.push(Vec2::new(
+                ix as f32 / res as f32,
+                iy as f32 / res as f32,
+            ));
         }
     }
     mesh.indices.reserve(res * res * 6);
@@ -1551,7 +1979,7 @@ mod tests {
 
     #[test]
     fn empty_stack_is_flat() {
-        let data = TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
+        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
         for v in data.eval_grid(1, 16, 10.0, 5.0) {
             assert_eq!(v, 0.0);
         }
@@ -1565,7 +1993,7 @@ mod tests {
         top_up.blend = BlendMode::Add;
         top_up.amount = 1.0;
         top_up.mask.height = Some(Band { min: 0.75, max: 2.0, falloff: 0.01, invert: false });
-        let data = TerrainData { sculpt: None, erosion: None, cache: Default::default(),
+        let data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(),
             layers: vec![
                 TerrainLayer {
                     amount: 0.5,
@@ -1602,7 +2030,7 @@ mod tests {
 
     #[test]
     fn raise_brush_lifts_the_surface_inside_the_radius_only() {
-        let mut data = TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
+        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
         let mut sculpt = SculptLayer::new(32);
         sculpt.brush(
             BrushMode::Raise,
@@ -1625,7 +2053,7 @@ mod tests {
     #[test]
     fn flatten_brush_pulls_toward_the_target() {
         let mut data =
-            TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
         // constant 0.5 → flat 5 m surface at height 10
         data.layers.push(TerrainLayer {
             amount: 0.5,
@@ -1696,7 +2124,7 @@ mod tests {
     #[test]
     fn shape_stamp_lands_where_placed() {
         let mut data =
-            TerrainData { sculpt: None, erosion: None, cache: Default::default(), layers: Vec::new() };
+            TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
         let mut layer = TerrainLayer::new(LayerKind::Shape {
             shape: ShapeKind::Mountain,
             x: 20.0,
@@ -1799,6 +2227,96 @@ mod tests {
             back.eval_grid(1, 32, 100.0, 12.0),
             data.eval_grid(1, 32, 100.0, 12.0)
         );
+    }
+
+    #[test]
+    fn color_rules_pick_the_expected_biome() {
+        let c = TerrainColor::default();
+        // flat mid-height ground → vegetation (greenish)
+        let veg = c.shade(5.0, 0.4, 0.1, 0.0, 0.0);
+        assert!(veg[1] > veg[0] && veg[1] > veg[2], "flat ground should be grassy: {veg:?}");
+        // steep face → rock/cliff (desaturated)
+        let rock = c.shade(5.0, 0.4, 1.8, 0.0, 0.0);
+        assert!((rock[0] - rock[1]).abs() < 0.08, "steep face should be grey: {rock:?}");
+        // high flat ground → snow (bright)
+        let snow = c.shade(11.0, 0.95, 0.1, 0.0, 0.0);
+        assert!(snow.iter().all(|v| *v > 0.8), "peak should be snowy: {snow:?}");
+        // base plane → sand
+        let sand = c.shade(0.1, 0.01, 0.05, 0.0, 0.0);
+        assert!(sand[0] > sand[2], "base should be sandy: {sand:?}");
+    }
+
+    #[test]
+    fn color_bake_produces_a_full_opaque_image() {
+        let data = TerrainData::default(); // color on by default
+        let (w, h, rgba) = data.bake_color(1, 64, 100.0, 12.0, 128).expect("color on");
+        assert_eq!((w, h), (128, 128));
+        assert_eq!(rgba.len(), 128 * 128 * 4);
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255), "opaque");
+        // not a flat color: biome variation must show up
+        let first = &rgba[0..3];
+        assert!(
+            rgba.chunks_exact(4).any(|p| {
+                (p[0] as i32 - first[0] as i32).abs() > 12
+                    || (p[1] as i32 - first[1] as i32).abs() > 12
+            }),
+            "bake should vary across the terrain"
+        );
+        // disabled = no bake
+        let mut off = data.clone();
+        off.color = None;
+        assert!(off.bake_color(1, 64, 100.0, 12.0, 128).is_none());
+    }
+
+    #[test]
+    fn color_presets_and_stamp() {
+        for (name, c) in TerrainColor::presets() {
+            let json = serde_json::to_string(&c).unwrap();
+            let back: TerrainColor = serde_json::from_str(&json).unwrap();
+            assert_eq!(c, back, "preset {name} serde roundtrip");
+        }
+        let a = TerrainColor::default();
+        let mut b = a;
+        b.snow_line = 0.5;
+        assert_ne!(a.stamp(), b.stamp(), "stamp must follow edits");
+        assert!(TerrainColor::preset("desert").is_some());
+    }
+
+    #[test]
+    fn paint_brush_claims_channel_and_shows_in_the_bake() {
+        let mut data = TerrainData { sculpt: None, erosion: None, color: None, paint: None, cache: Default::default(), layers: Vec::new() };
+        data.color = Some(TerrainColor::default());
+        let mut paint = PaintLayer::new(32);
+        // paint snow (channel 4) into a patch until fully opaque
+        for _ in 0..40 {
+            paint.brush(Vec2::new(20.0, 20.0), 12.0, 0.2, 0.3, 100.0, 4);
+        }
+        assert!(!paint.is_empty());
+        let (slot, w) = paint.sample(0.7, 0.7);
+        assert_eq!(slot, 4);
+        assert!(w > 0.9, "repeated dabs should saturate, got {w}");
+        data.paint = Some(paint.clone());
+        let (_, _, rgba) = data.bake_color(1, 32, 100.0, 10.0, 128).unwrap();
+        // texel inside the patch is snow-bright; far corner is grass-dark
+        let px = |u: f32, v: f32| {
+            let (x, y) = ((u * 127.0) as usize, (v * 127.0) as usize);
+            let o = (y * 128 + x) * 4;
+            [rgba[o], rgba[o + 1], rgba[o + 2]]
+        };
+        let painted = px(0.7, 0.7);
+        let unpainted = px(0.1, 0.1);
+        assert!(painted[0] > 200, "snow patch should be bright: {painted:?}");
+        // the flat zero-height test terrain is sand elsewhere — the point is
+        // that the paint stayed inside its patch
+        assert!(unpainted[0] < 200, "outside the patch is not snow: {unpainted:?}");
+        // erasing brings the weight back down
+        paint.brush(Vec2::new(20.0, 20.0), 12.0, -1.0, 0.3, 100.0, 4);
+        let (_, w) = paint.sample(0.7, 0.7);
+        assert!(w < 0.1, "erase should clear, got {w}");
+        // serde roundtrip
+        let json = serde_json::to_string(&paint).unwrap();
+        let back: PaintLayer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, paint);
     }
 
     #[test]

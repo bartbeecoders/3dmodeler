@@ -13,13 +13,17 @@
 use crate::gfx::egui;
 use crate::gfx::{Event, Key, MouseButton, Viewport};
 use modeler_core::glam::{Vec2, Vec3};
-use modeler_core::terrain::{self, BrushMode, SculptLayer};
+use modeler_core::terrain::{self, BrushMode, PaintLayer, SculptLayer, PAINT_CHANNELS};
 use modeler_core::{ObjectId, Primitive, Scene};
 
 pub struct SculptTool {
     active: bool,
     target: Option<ObjectId>,
     pub mode: BrushMode,
+    /// Paint mode: dabs color a biome channel instead of moving height.
+    pub paint_mode: bool,
+    /// Which palette channel paint dabs write (see `PAINT_CHANNELS`).
+    pub paint_channel: u8,
     /// Brush radius in meters.
     pub radius: f32,
     /// Raise/Lower: meters per second of push. Smooth/Flatten: lerp per second.
@@ -42,6 +46,8 @@ impl SculptTool {
             active: false,
             target: None,
             mode: BrushMode::Raise,
+            paint_mode: false,
+            paint_channel: 0,
             radius: 8.0,
             strength: 0.6,
             falloff: 0.6,
@@ -87,12 +93,23 @@ impl SculptTool {
         if !self.active {
             return None;
         }
-        Some(format!(
-            "Sculpt ({}): drag to {} · radius {} · Ctrl inverts raise/lower   |   Esc/RMB done",
-            self.mode.label(),
-            self.mode.label().to_ascii_lowercase(),
-            unit.format(self.radius),
-        ))
+        Some(if self.paint_mode {
+            let channel = PAINT_CHANNELS
+                .get(self.paint_channel as usize)
+                .copied()
+                .unwrap_or("?");
+            format!(
+                "Paint ({channel}): drag to paint · Ctrl erases · radius {} ·                  colors update on release   |   Esc/RMB done",
+                unit.format(self.radius),
+            )
+        } else {
+            format!(
+                "Sculpt ({}): drag to {} · radius {} · Ctrl inverts raise/lower   |   Esc/RMB done",
+                self.mode.label(),
+                self.mode.label().to_ascii_lowercase(),
+                unit.format(self.radius),
+            )
+        })
     }
 
     /// The effective mode: Ctrl swaps Raise ↔ Lower (Blender habit).
@@ -233,6 +250,31 @@ impl SculptTool {
         };
         let data = object.terrain.get_or_insert_with(Default::default);
 
+        if self.paint_mode {
+            // paint writes biome patches; the albedo re-bakes on release
+            if data.color.is_none() {
+                data.color = Some(Default::default()); // painting implies coloring
+            }
+            let paint_res =
+                resolution.clamp(terrain::MIN_RESOLUTION, terrain::MAX_RESOLUTION);
+            match &mut data.paint {
+                Some(p) if p.resolution != paint_res => *p = PaintLayer::new(paint_res),
+                Some(_) => {}
+                None => data.paint = Some(PaintLayer::new(paint_res)),
+            }
+            let dt = dt.clamp(0.0, 0.1);
+            let amount = self.strength * 5.0 * dt * if self.ctrl_down { -1.0 } else { 1.0 };
+            data.paint.as_mut().expect("ensured above").brush(
+                Vec2::new(hit.x, hit.y),
+                self.radius,
+                amount,
+                self.falloff,
+                size,
+                self.paint_channel.min(PAINT_CHANNELS.len() as u8 - 1),
+            );
+            return; // no geometry change: no revision bumps mid-stroke
+        }
+
         // the sculpt grid follows the terrain's mesh resolution
         let sculpt_res = resolution.clamp(terrain::MIN_RESOLUTION, terrain::MAX_RESOLUTION);
         match &mut data.sculpt {
@@ -297,11 +339,22 @@ impl SculptTool {
         let Some(data) = &object.terrain else { return };
         let grid = data.eval_grid(seed, resolution, size, height);
         let world = scene.world_transform(target);
-        let color = match self.effective_mode() {
-            BrushMode::Lower => aether_math::Vec4::new(0.9, 0.35, 0.2, 0.9),
-            BrushMode::Smooth => aether_math::Vec4::new(0.3, 0.6, 0.95, 0.9),
-            BrushMode::Flatten => aether_math::Vec4::new(0.85, 0.8, 0.25, 0.9),
-            BrushMode::Raise => aether_math::Vec4::new(1.0, 1.0, 1.0, 0.9),
+        let color = if self.paint_mode {
+            // ring in the channel's own palette color
+            let palette = object
+                .terrain
+                .as_ref()
+                .and_then(|t| t.color)
+                .unwrap_or_default()
+                .entry(self.paint_channel);
+            aether_math::Vec4::new(palette[0], palette[1], palette[2], 0.95)
+        } else {
+            match self.effective_mode() {
+                BrushMode::Lower => aether_math::Vec4::new(0.9, 0.35, 0.2, 0.9),
+                BrushMode::Smooth => aether_math::Vec4::new(0.3, 0.6, 0.95, 0.9),
+                BrushMode::Flatten => aether_math::Vec4::new(0.85, 0.8, 0.25, 0.9),
+                BrushMode::Raise => aether_math::Vec4::new(1.0, 1.0, 1.0, 0.9),
+            }
         };
         const SEGMENTS: usize = 48;
         let half = 0.5 * size;
@@ -344,11 +397,47 @@ impl SculptTool {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     for mode in BrushMode::ALL {
-                        if ui.selectable_label(self.mode == mode, mode.label()).clicked() {
+                        let selected = !self.paint_mode && self.mode == mode;
+                        if ui.selectable_label(selected, mode.label()).clicked() {
                             self.mode = mode;
+                            self.paint_mode = false;
                         }
                     }
+                    if ui
+                        .selectable_label(self.paint_mode, "Paint")
+                        .on_hover_text(
+                            "Paint biome patches (grass, rock, snow…) onto the                              coloring — Ctrl erases",
+                        )
+                        .clicked()
+                    {
+                        self.paint_mode = true;
+                    }
                 });
+                if self.paint_mode {
+                    ui.horizontal(|ui| {
+                        ui.label("Channel");
+                        egui::ComboBox::from_id_salt("sculpt-paint-channel")
+                            .selected_text(
+                                PAINT_CHANNELS
+                                    .get(self.paint_channel as usize)
+                                    .copied()
+                                    .unwrap_or("?"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (i, name) in PAINT_CHANNELS.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(
+                                            self.paint_channel == i as u8,
+                                            *name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.paint_channel = i as u8;
+                                    }
+                                }
+                            });
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label("Radius");
                     ui.add(

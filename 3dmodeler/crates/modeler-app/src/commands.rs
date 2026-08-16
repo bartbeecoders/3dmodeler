@@ -202,6 +202,11 @@ fn object_json(scene: &Scene, object: &modeler_core::Object) -> Value {
                 .as_ref()
                 .and_then(|t| t.sculpt.as_ref())
                 .is_some_and(|s| !s.is_empty()),
+            // biome coloring on/off (set with terrain_color)
+            "has_color": object
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.color.is_some()),
             // baked erosion layer (bake with erode, clear with clear_erosion)
             "erosion": object
                 .terrain
@@ -494,7 +499,12 @@ fn apply_object_params(
                         .collect();
                     format!("unknown terrain_preset '{name}' ({})", names.join("|"))
                 })?;
-                object.terrain = Some(preset);
+                // replace only the generator layers — sculpt/erosion/color
+                // survive a preset switch
+                match &mut object.terrain {
+                    Some(data) => data.layers = preset.layers,
+                    None => object.terrain = Some(preset),
+                }
                 object.mesh_revision += 1; // render/physics caches key on it
             } else if let Some(v) = params.get("terrain").filter(|v| !v.is_null()) {
                 let data: modeler_core::TerrainData = serde_json::from_value(v.clone())
@@ -585,6 +595,30 @@ fn apply_object_params(
             }
             if erosion_touched {
                 object.mesh_revision += 1; // render/physics caches key on it
+            }
+            // biome coloring: preset name, full settings object, or on/off.
+            // Never bumps mesh_revision — geometry is untouched, the
+            // renderer re-bakes the albedo on its own.
+            if let Some(v) = params.get("terrain_color").filter(|v| !v.is_null()) {
+                let data = object.terrain.get_or_insert_with(Default::default);
+                if let Some(b) = v.as_bool() {
+                    data.color = b.then(modeler_core::terrain::TerrainColor::default);
+                } else if let Some(name) = v.as_str() {
+                    data.color =
+                        Some(modeler_core::terrain::TerrainColor::preset(name).ok_or_else(
+                            || {
+                                format!(
+                                    "unknown terrain_color preset '{name}' \
+                                     (Meadow|Autumn|Desert|Arctic|Volcanic|Alien)"
+                                )
+                            },
+                        )?);
+                } else {
+                    data.color = Some(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| format!("bad 'terrain_color': {e}"))?,
+                    );
+                }
             }
         }
         if let Some(cutouts) = cutouts {

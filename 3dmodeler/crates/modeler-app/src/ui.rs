@@ -3746,9 +3746,11 @@ fn properties(
                     let (erosion_dirty, erosion_remesh) =
                         terrain_erosion_ui(ui, &mut stack, &primitive);
                     ui.add_space(6.0);
+                    let color_dirty = terrain_color_ui(ui, &mut stack);
+                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Terrain layers").strong());
                     let stack_changed = terrain_stack_ui(ui, &mut stack);
-                    if erosion_dirty || stack_changed {
+                    if erosion_dirty || color_dirty || stack_changed {
                         edited_terrain = Some((stack, erosion_remesh || stack_changed));
                     }
                 }
@@ -4949,6 +4951,66 @@ fn terrain_erosion_ui(
     (changed || dirty, changed)
 }
 
+/// Biome-coloring section of the Data tab. Color edits never remesh — the
+/// renderer re-bakes the albedo texture on its own (debounced) schedule.
+fn terrain_color_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) -> bool {
+    use modeler_core::terrain::TerrainColor;
+
+    let mut changed = false;
+    ui.label(egui::RichText::new("Biome color").strong());
+    let mut on = stack.color.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut on, "Enabled")
+            .on_hover_text(
+                "Paint the terrain by height and slope: grass, rock on steep \
+                 faces, snow above the line, sand near the base",
+            )
+            .changed()
+        {
+            stack.color = on.then(TerrainColor::default);
+            changed = true;
+        }
+        if stack.color.is_some() {
+            egui::ComboBox::from_id_salt("terrain-color-preset")
+                .selected_text("Preset…")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (name, preset) in TerrainColor::presets() {
+                        if ui.button(name).clicked() {
+                            stack.color = Some(preset);
+                            changed = true;
+                        }
+                    }
+                });
+        }
+    });
+    if let Some(color) = &mut stack.color {
+        egui::CollapsingHeader::new("Colors & rules")
+            .id_salt("terrain-color-settings")
+            .show(ui, |ui| {
+                let mut swatch = |ui: &mut egui::Ui, label: &str, c: &mut [f32; 3]| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.color_edit_button_rgb(c).changed();
+                        ui.label(label);
+                    });
+                };
+                swatch(ui, "Grass", &mut color.grass);
+                swatch(ui, "Dry grass", &mut color.dry_grass);
+                swatch(ui, "Rock", &mut color.rock);
+                swatch(ui, "Cliff", &mut color.cliff);
+                swatch(ui, "Snow", &mut color.snow);
+                swatch(ui, "Sand", &mut color.sand);
+                changed |= float_row_ex(ui, "Sand up to", &mut color.sand_height, 0.05, 0.0..=50.0, Some(" m"));
+                changed |= slider_row(ui, "Rock slope", &mut color.rock_slope, 0.1..=2.0);
+                changed |= slider_row(ui, "Snow line", &mut color.snow_line, 0.0..=2.0);
+                changed |= slider_row(ui, "Snow max slope", &mut color.snow_slope_max, 0.1..=2.0);
+                changed |= slider_row(ui, "Variation", &mut color.variation, 0.0..=1.0);
+            });
+    }
+    changed
+}
+
 /// Editor for a terrain's noise-layer stack (Data tab). Mutates `stack` in
 /// place; the caller writes it back to the object and bumps `mesh_revision`.
 fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) -> bool {
@@ -4964,7 +5026,9 @@ fn terrain_stack_ui(ui: &mut egui::Ui, stack: &mut modeler_core::TerrainData) ->
             .show_ui(ui, |ui| {
                 for (name, data) in TerrainData::presets() {
                     if ui.button(name).clicked() {
-                        *stack = data;
+                        // replace only the generator — hand sculpting, baked
+                        // erosion and coloring survive a preset switch
+                        stack.layers = data.layers;
                         changed = true;
                     }
                 }

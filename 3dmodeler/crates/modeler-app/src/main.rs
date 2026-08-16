@@ -51,6 +51,7 @@ mod theme;
 mod ui;
 mod undo;
 mod terrain_sculpt;
+mod texture_bridge;
 mod wall_tool;
 mod wire_render;
 
@@ -147,6 +148,7 @@ pub fn main() {
     let mut wall_tool = wall_tool::WallTool::new();
     let mut roof_tool = roof_tool::RoofTool::new();
     let mut sculpt_tool = terrain_sculpt::SculptTool::new();
+    let mut texture_bridge = texture_bridge::TextureBridge::new();
     let mut edit_mode = edit_mode::EditMode::new();
     let mut ref_render = ref_image::RefImageRender::new();
     let mut calibrate = ref_image::CalibrateTool::new();
@@ -1227,7 +1229,16 @@ pub fn main() {
         }
 
         let gpu = viewport.renderer().gpu.clone();
-        scene_render.sync(&gpu, &scene, &sel, &overlaps, shade_mode, xray);
+        scene_render.sync(
+            &gpu,
+            viewport.renderer_mut(),
+            &mut texture_bridge,
+            &scene,
+            &sel,
+            &overlaps,
+            shade_mode,
+            xray,
+        );
         lights.sync(&mut scene_render.scene, &scene, shade_mode);
         gfx::viewport::sync_exposure(viewport.renderer_mut(), lights.scene_active());
 

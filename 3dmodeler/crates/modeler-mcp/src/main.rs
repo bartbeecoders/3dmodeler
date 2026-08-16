@@ -116,6 +116,7 @@ fn tool_definitions() -> Value {
                     "erosion_strength": {"type": "number", "description": "Terrain only: blend of the baked erosion, 0..2 (1 = as simulated)"},
                     "erosion_enabled": {"type": "boolean", "description": "Terrain only: toggle the baked erosion without discarding it"},
                     "clear_erosion": {"type": "boolean", "description": "Terrain only: true discards the baked erosion layer"},
+                    "terrain_color": {"description": "Terrain only: biome coloring by height/slope (grass, rock on steep faces, snow above the line, sand near the base). A preset name (Meadow|Autumn|Desert|Arctic|Volcanic|Alien), true (default Meadow), false (plain material color), or a full settings object"},
                     "width": {"type": "number", "description": "Cloth only: width in meters (default 2)"},
                     "thickness": {"type": "number", "description": "Wall only: thickness in meters (default 0.2)"},
                     "radius": {"type": "number", "description": "Rope only: cord radius in meters (default 0.03)"},
