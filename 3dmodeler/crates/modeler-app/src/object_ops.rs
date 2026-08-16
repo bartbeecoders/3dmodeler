@@ -1,11 +1,11 @@
 //! Object-level operations: delete via X (with Blender's confirm popup) or
 //! the Delete key (immediate).
 
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, Viewport};
 use crate::selection::Selection;
 use modeler_core::glam::{Vec2, Vec3};
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
-use three_d::egui;
-use three_d::{Event, Key, Viewport};
 
 pub struct DeleteTool {
     confirm_open: bool,

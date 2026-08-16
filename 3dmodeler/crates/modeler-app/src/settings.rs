@@ -6,10 +6,10 @@
 //! recent-files list, web in localStorage. `#[serde(default)]` keeps old
 //! settings files loadable when new fields are added.
 
+use crate::gfx::egui;
 use crate::theme::{self, Theme};
 use modeler_ai::{ModelInfo, ProviderConfig, ProviderKind};
 use serde::{Deserialize, Serialize};
-use three_d::egui;
 
 /// One AI provider's persisted state: credentials/endpoint, the chosen
 /// model, and the last fetched model catalog (so prices and the picker work

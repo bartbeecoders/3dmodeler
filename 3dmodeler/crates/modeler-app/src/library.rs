@@ -7,12 +7,12 @@
 //! point (main.rs resolves the drop ray), and Object ▸ Save Selection to
 //! Library… captures the current selection as a new asset.
 
+use crate::gfx::egui;
 use crate::preview;
 use crate::selection::Selection;
 use modeler_core::glam::Vec3;
 use modeler_core::{library, Library, Scene};
 use std::collections::HashMap;
-use three_d::egui;
 
 // --- persistence -------------------------------------------------------------
 

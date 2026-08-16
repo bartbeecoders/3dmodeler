@@ -3,17 +3,27 @@
 //!
 //! The document model (`modeler_core::ReferenceImage`) stores the image
 //! bytes base64-embedded, so this module only handles the app concerns:
-//! decoding to a GPU texture, drawing an alpha-blended quad on the chosen
-//! axis plane, the async file picker (same pattern as io.rs — a blocking
-//! dialog inside the render loop would freeze winit), and calibration.
+//! decoding to a texture, drawing an alpha-blended quad on the chosen axis
+//! plane, the async file picker (same pattern as io.rs — a blocking dialog
+//! inside the render loop would freeze winit), and calibration.
+//!
+//! The textures live in the engine's overlay pass, which owns the upload and
+//! builds the mip chain: a reference is routinely zoomed out to frame the
+//! model, and a mipless blueprint minified to a tenth of its size is a field of
+//! aliasing that reads as a broken import.
 
+// Everything the pass that draws would read is unused until it exists —
+// see the "not yet drawing" note above. Comes off with that pass.
+#![allow(dead_code)]
+
+use crate::gfx::*;
+use aether_render::passes::overlay::OverlayImageHandle;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use modeler_core::glam;
 use modeler_core::{MarkerKind, ReferenceImage, Scene};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use three_d::*;
 
 // ---------------------------------------------------------------- import --
 
@@ -235,36 +245,34 @@ pub fn make_reference(name: String, bytes: &[u8]) -> Result<ReferenceImage, Stri
 
 // ------------------------------------------------------------- rendering --
 
+/// The unit quad every reference image is drawn on: XY plane, centred, with
+/// image-style UVs (v = 0 at the top, because images count rows downwards).
+pub const QUAD_POSITIONS: [[f32; 3]; 4] =
+    [[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0]];
+pub const QUAD_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+pub const QUAD_INDICES: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
 struct Cached {
     data_len: usize,
-    gm: Gm<Mesh, ColorMaterial>,
+    handle: OverlayImageHandle,
 }
 
-/// GPU cache for reference-image quads. Texture uploads happen only when the
-/// image bytes change; placement and opacity are updated in place each frame.
+/// One reference image, ready to draw.
+pub struct RefQuad {
+    pub handle: OverlayImageHandle,
+    /// The quad's four world-space corners, in [`QUAD_POSITIONS`] order.
+    pub corners: [aether_math::Vec3; 4],
+    /// 0..=1, straight from the document.
+    pub opacity: f32,
+}
+
+/// Decoded-image cache for reference-image quads. An image is decoded only
+/// when its bytes change; placement and opacity are read fresh each frame.
 pub struct RefImageRender {
     cache: HashMap<u64, Cached>,
     order: Vec<u64>,
-}
-
-/// Unit quad in the XY plane, centered, with image-style UVs (v=0 at top).
-fn quad_mesh() -> CpuMesh {
-    CpuMesh {
-        positions: Positions::F32(vec![
-            vec3(-0.5, -0.5, 0.0),
-            vec3(0.5, -0.5, 0.0),
-            vec3(0.5, 0.5, 0.0),
-            vec3(-0.5, 0.5, 0.0),
-        ]),
-        uvs: Some(vec![
-            vec2(0.0, 1.0),
-            vec2(1.0, 1.0),
-            vec2(1.0, 0.0),
-            vec2(0.0, 0.0),
-        ]),
-        indices: Indices::U32(vec![0, 1, 2, 0, 2, 3]),
-        ..Default::default()
-    }
+    /// Placement and opacity as of the last sync, per image id.
+    placement: HashMap<u64, (Mat4, f32)>,
 }
 
 /// Pixel dimensions of an embedded image (header parse only, no full
@@ -283,12 +291,7 @@ fn decode_texture(data_base64: &str) -> Option<CpuTexture> {
     let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (width, height) = rgba.dimensions();
     let data: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
-    Some(CpuTexture {
-        data: TextureData::RgbaU8(data),
-        width,
-        height,
-        ..Default::default()
-    })
+    Some(CpuTexture { data: TextureData::RgbaU8(data), width, height })
 }
 
 fn placement(image: &ReferenceImage) -> Mat4 {
@@ -305,14 +308,17 @@ fn placement(image: &ReferenceImage) -> Mat4 {
 
 impl RefImageRender {
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            order: Vec::new(),
-        }
+        Self { cache: HashMap::new(), order: Vec::new(), placement: HashMap::new() }
     }
 
-    pub fn sync(&mut self, scene: &Scene, context: &Context) {
+    pub fn sync(
+        &mut self,
+        scene: &Scene,
+        gpu: &aether_render::Gpu,
+        overlay: &mut aether_render::passes::overlay::OverlayPass,
+    ) {
         self.order.clear();
+        self.placement.clear();
         for image in scene.reference_images() {
             if !image.visible {
                 continue;
@@ -322,39 +328,74 @@ impl RefImageRender {
                 None => true,
             };
             if rebuild {
-                let Some(cpu_texture) = decode_texture(&image.data_base64) else {
+                let Some(texture) = decode_texture(&image.data_base64) else {
                     continue; // undecodable bytes: skip rendering, keep the entry
                 };
-                let material = ColorMaterial {
-                    color: Srgba::WHITE,
-                    texture: Some(Texture2DRef::from_cpu_texture(context, &cpu_texture)),
-                    is_transparent: true,
-                    render_states: RenderStates {
-                        cull: Cull::None,
-                        blend: Blend::TRANSPARENCY,
-                        ..Default::default()
-                    },
-                };
-                self.cache.insert(
-                    image.id,
-                    Cached {
-                        data_len: image.data_base64.len(),
-                        gm: Gm::new(Mesh::new(context, &quad_mesh()), material),
-                    },
-                );
+                let TextureData::RgbaU8(pixels) = &texture.data;
+                let bytes: &[u8] = bytemuck::cast_slice(pixels);
+                let data_len = image.data_base64.len();
+                match self.cache.get_mut(&image.id) {
+                    // Re-cropping a reference is the same picture to the user,
+                    // so the handle is kept and its pixels replaced.
+                    Some(cached) => {
+                        overlay.update_image(
+                            gpu,
+                            cached.handle,
+                            texture.width,
+                            texture.height,
+                            bytes,
+                        );
+                        cached.data_len = data_len;
+                    }
+                    None => {
+                        let Some(handle) =
+                            overlay.add_image(gpu, texture.width, texture.height, bytes)
+                        else {
+                            continue;
+                        };
+                        self.cache.insert(image.id, Cached { data_len, handle });
+                    }
+                }
             }
-            let cached = self.cache.get_mut(&image.id).unwrap();
-            cached.gm.set_transformation(placement(image));
-            cached.gm.material.color.a = (image.opacity.clamp(0.0, 1.0) * 255.0) as u8;
+            self.placement
+                .insert(image.id, (placement(image), image.opacity.clamp(0.0, 1.0)));
             self.order.push(image.id);
         }
         let alive: std::collections::HashSet<u64> =
             scene.reference_images().iter().map(|i| i.id).collect();
-        self.cache.retain(|id, _| alive.contains(id));
+        // Freeing the texture as well as forgetting the entry: the overlay owns
+        // the upload, and a deleted reference would otherwise keep its pixels
+        // resident for the rest of the session.
+        self.cache.retain(|id, cached| {
+            let keep = alive.contains(id);
+            if !keep {
+                overlay.remove_image(cached.handle);
+            }
+            keep
+        });
     }
 
-    pub fn models(&self) -> impl Iterator<Item = &Gm<Mesh, ColorMaterial>> {
-        self.order.iter().filter_map(|id| self.cache.get(id).map(|c| &c.gm))
+    /// The visible images in draw order — back to front, as the document
+    /// lists them, because they blend over one another.
+    pub fn quads(&self) -> impl Iterator<Item = RefQuad> + '_ {
+        self.order.iter().filter_map(|id| {
+            let cached = self.cache.get(id)?;
+            let &(placement, opacity) = self.placement.get(id)?;
+            let corner = |p: [f32; 3]| {
+                let v = placement * vec4(p[0], p[1], p[2], 1.0);
+                aether_math::Vec3::new(v.x, v.y, v.z)
+            };
+            Some(RefQuad {
+                handle: cached.handle,
+                corners: [
+                    corner(QUAD_POSITIONS[0]),
+                    corner(QUAD_POSITIONS[1]),
+                    corner(QUAD_POSITIONS[2]),
+                    corner(QUAD_POSITIONS[3]),
+                ],
+                opacity,
+            })
+        })
     }
 }
 
@@ -826,8 +867,8 @@ mod tests {
         img.aspect = 0.5;
         let m = placement(&img);
         // u column scaled by width, v column by height
-        assert!((m.x.x - 2.0).abs() < 1e-6);
-        assert!((m.y.y - 1.0).abs() < 1e-6);
+        assert!((m.x_axis.x - 2.0).abs() < 1e-6);
+        assert!((m.y_axis.y - 1.0).abs() < 1e-6);
     }
 
     #[test]

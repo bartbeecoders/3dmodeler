@@ -15,12 +15,12 @@
 //! across a flat face would melt back into one group and be unselectable.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::mesh_edit;
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
 use modeler_core::{Material, MeshData, ObjectId, Scene, Transform};
-use three_d::{Event, Key, MouseButton, Viewport};
 
 const VERTEX_PICK_PX: f32 = 14.0;
 const EDGE_PICK_PX: f32 = 10.0;
@@ -263,10 +263,6 @@ pub struct EditMode {
     grab: Option<Grab>,
     tool: Option<ModalTool>,
     last_mouse: (f32, f32),
-}
-
-fn gv(v: three_d::Vec3) -> Vec3 {
-    Vec3::new(v.x, v.y, v.z)
 }
 
 fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
@@ -804,7 +800,7 @@ impl EditMode {
         let world = scene.world_transform(object.id);
         let to_screen = |p: Vec3| -> (f32, f32) {
             let w = local_to_world(&world, p);
-            camera.world_to_screen(viewport, three_d::vec3(w.x, w.y, w.z))
+            camera.world_to_screen(viewport, w)
         };
 
         self.selected = match self.mode {
@@ -834,7 +830,6 @@ impl EditMode {
             SelectMode::Face => {
                 // ray-cast the object's triangles in world space
                 let (origin, direction) = camera.pick_ray(viewport, x, y);
-                let (origin, direction) = (gv(origin), gv(direction));
                 let mut best: Option<(f32, usize)> = None;
                 for (ti, t) in topo.tris.iter().enumerate() {
                     let a = local_to_world(&world, topo.verts[t[0]]);
@@ -930,13 +925,11 @@ impl EditMode {
             Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
             None => String::new(),
         };
-        let pivot_cg = three_d::vec3(grab.pivot_world.x, grab.pivot_world.y, grab.pivot_world.z);
 
         let targets: Vec<(usize, Vec3)> = match grab.kind {
             TransformKind::Move => {
                 let (right, up, _) = camera.screen_basis();
-                let (right, up) = (gv(right), gv(up));
-                let wpp = camera.world_per_pixel_at(viewport, pivot_cg);
+                let wpp = camera.world_per_pixel_at(viewport, grab.pivot_world);
                 let dx = grab.cur_mouse.0 - grab.start_mouse.0;
                 let dy = grab.cur_mouse.1 - grab.start_mouse.1;
                 let mut delta = right * (dx * wpp) + up * (dy * wpp);
@@ -962,14 +955,14 @@ impl EditMode {
                 grab.originals.iter().map(|&(w, p)| (w, p + local_delta)).collect()
             }
             TransformKind::Rotate => {
-                let pivot_screen = camera.world_to_screen(viewport, pivot_cg);
+                let pivot_screen = camera.world_to_screen(viewport, grab.pivot_world);
                 let a0 = (grab.start_mouse.1 - pivot_screen.1)
                     .atan2(grab.start_mouse.0 - pivot_screen.0);
                 let a1 = (grab.cur_mouse.1 - pivot_screen.1)
                     .atan2(grab.cur_mouse.0 - pivot_screen.0);
                 // rotation axis: view axis (toward the viewer) or a world axis
                 let (_, _, forward) = camera.screen_basis();
-                let view_axis = -gv(forward);
+                let view_axis = -forward;
                 let (axis, sign) = match grab.constraint {
                     None => (view_axis, 1.0),
                     Some(i) => {
@@ -988,7 +981,7 @@ impl EditMode {
                 rotate_positions(&world, &grab.originals, grab.pivot_world, rotation)
             }
             TransformKind::Scale => {
-                let pivot_screen = camera.world_to_screen(viewport, pivot_cg);
+                let pivot_screen = camera.world_to_screen(viewport, grab.pivot_world);
                 let d0 = ((grab.start_mouse.0 - pivot_screen.0).powi(2)
                     + (grab.start_mouse.1 - pivot_screen.1).powi(2))
                 .sqrt()
@@ -1070,12 +1063,11 @@ impl EditMode {
         // edge's screen position widens / narrows the bevel (Blender-style)
         let world = scene.world_transform(object.id);
         let mid = local_to_world(&world, 0.5 * (base_topo.verts[a] + base_topo.verts[b]));
-        let mid_cg = three_d::vec3(mid.x, mid.y, mid.z);
-        let mid_screen = camera.world_to_screen(viewport, mid_cg);
+        let mid_screen = camera.world_to_screen(viewport, mid);
         let start_dist = ((self.last_mouse.0 - mid_screen.0).powi(2)
             + (self.last_mouse.1 - mid_screen.1).powi(2))
         .sqrt();
-        let world_per_px = camera.world_per_pixel_at(viewport, mid_cg);
+        let world_per_px = camera.world_per_pixel_at(viewport, mid);
         let mut tool = ModalTool {
             kind,
             element: Element::Edge(a, b),
@@ -1123,21 +1115,19 @@ impl EditMode {
 
         let world = scene.world_transform(object.id);
         let c_world = local_to_world(&world, centroid);
-        let c_cg = three_d::vec3(c_world.x, c_world.y, c_world.z);
-        let c_screen = camera.world_to_screen(viewport, c_cg);
+        let c_screen = camera.world_to_screen(viewport, c_world);
         // extrude: mouse motion projected on the normal's screen direction
         // sets the signed amount, in local units per pixel so a scaled
         // object still tracks the cursor. A camera-facing normal has no
         // screen direction — fall back to "up = out".
         let n_world = local_to_world(&world, centroid + normal) - c_world;
         let tip = c_world + n_world;
-        let tip_screen =
-            camera.world_to_screen(viewport, three_d::vec3(tip.x, tip.y, tip.z));
+        let tip_screen = camera.world_to_screen(viewport, tip);
         let d = (tip_screen.0 - c_screen.0, tip_screen.1 - c_screen.1);
         let len = (d.0 * d.0 + d.1 * d.1).sqrt();
         let drag_dir = if len > 1e-3 { (d.0 / len, d.1 / len) } else { (0.0, 1.0) };
         let world_per_px =
-            camera.world_per_pixel_at(viewport, c_cg) / n_world.length().max(1e-6);
+            camera.world_per_pixel_at(viewport, c_world) / n_world.length().max(1e-6);
         // inset: the cursor's distance to the face center scrubs the
         // thickness — dragging toward the center insets further
         let start_dist = ((self.last_mouse.0 - c_screen.0).powi(2)
@@ -1800,7 +1790,7 @@ mod tests {
         edit.enter(id, &scene);
         edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
 
-        let ctrl = three_d::Modifiers { ctrl: true, ..Default::default() };
+        let ctrl = crate::gfx::Modifiers { ctrl: true, ..Default::default() };
         let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
             edit.handle_events(
                 &mut events, &camera, viewport, scene, &selection,
@@ -1815,7 +1805,7 @@ mod tests {
             Event::KeyPress { kind: Key::R, modifiers: ctrl, handled: false },
             Event::MouseWheel {
                 delta: (0.0, 24.0),
-                position: three_d::PhysicalPoint { x: 0.0, y: 0.0 },
+                position: crate::gfx::PhysicalPoint { x: 0.0, y: 0.0 },
                 modifiers: Default::default(),
                 handled: false,
             },
@@ -1914,7 +1904,7 @@ mod tests {
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "walls + top preview");
 
         // LMB press must NOT settle it (a held-button drag continues) ...
-        let at = three_d::PhysicalPoint { x: edit.last_mouse.0, y: edit.last_mouse.1 };
+        let at = crate::gfx::PhysicalPoint { x: edit.last_mouse.0, y: edit.last_mouse.1 };
         run(&mut edit, &mut scene, vec![Event::MousePress {
             button: MouseButton::Left,
             position: at,

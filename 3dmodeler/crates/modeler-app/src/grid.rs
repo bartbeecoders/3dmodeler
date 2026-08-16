@@ -1,166 +1,58 @@
 //! Reference grid on the XY ground plane (Z up, Blender convention).
 //!
-//! Built from thin quads so it needs no custom shader. A shader-based
-//! infinite grid with distance fade is a polish item for later.
+//! The lines themselves come from the engine's overlay pass, which draws them
+//! after tonemapping and against the scene's depth buffer: a grid line is a
+//! fact about the tool rather than about the light in the room, so it is not
+//! exposed or graded, but a line behind a wall is still behind the wall.
+//!
+//! What is left here is the part that is this app's rather than the engine's:
+//! which plane, how far, and the axis colours Blender users expect.
 
-use three_d::*;
+use aether_render::passes::overlay::{GridPlane, OverlayDraws};
 
+use crate::gfx::*;
+
+/// How far the grid reaches from the origin, in metres.
 const EXTENT: f32 = 50.0;
-const MAJOR_EVERY: i32 = 10;
+/// Every tenth line is a major one.
+const MAJOR_EVERY: u32 = 10;
 
 const X_AXIS_COLOR: Srgba = Srgba::new(174, 66, 55, 255); // Blender-ish red
 const Y_AXIS_COLOR: Srgba = Srgba::new(96, 148, 58, 255); // Blender-ish green
 const Z_AXIS_COLOR: Srgba = Srgba::new(58, 98, 170, 255); // Blender-ish blue
-const AXIS_HALF_WIDTH: f32 = 0.022;
 
-struct GridBuilder {
-    positions: Vec<Vec3>,
-    colors: Vec<Srgba>,
-    indices: Vec<u32>,
+fn linear(color: Srgba) -> aether_math::Vec4 {
+    let v = color.to_linear();
+    aether_math::Vec4::new(v.x, v.y, v.z, v.w)
 }
 
-impl GridBuilder {
-    fn quad(&mut self, corners: [Vec3; 4], color: Srgba) {
-        let base = self.positions.len() as u32;
-        self.positions.extend_from_slice(&corners);
-        self.colors.extend_from_slice(&[color; 4]);
-        self.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-
-    /// Line parallel to the X axis at the given y.
-    fn line_x(&mut self, y: f32, half_width: f32, color: Srgba) {
-        self.quad(
-            [
-                vec3(-EXTENT, y - half_width, 0.0),
-                vec3(EXTENT, y - half_width, 0.0),
-                vec3(EXTENT, y + half_width, 0.0),
-                vec3(-EXTENT, y + half_width, 0.0),
-            ],
-            color,
-        );
-    }
-
-    /// Line parallel to the Y axis at the given x.
-    fn line_y(&mut self, x: f32, half_width: f32, color: Srgba) {
-        self.quad(
-            [
-                vec3(x - half_width, -EXTENT, 0.0),
-                vec3(x + half_width, -EXTENT, 0.0),
-                vec3(x + half_width, EXTENT, 0.0),
-                vec3(x - half_width, EXTENT, 0.0),
-            ],
-            color,
-        );
-    }
-}
-
-pub fn build_grid(
-    context: &Context,
-    spacing: f32,
-    minor: [u8; 3],
-    major: [u8; 3],
-) -> Gm<Mesh, ColorMaterial> {
+/// Draws the ground grid and the two ground axes.
+pub fn draw(draws: &mut OverlayDraws, spacing: f32, minor: [u8; 3], major: [u8; 3]) {
     let spacing = spacing.clamp(0.05, 10.0);
-    let minor = Srgba::new(minor[0], minor[1], minor[2], 255);
-    let major = Srgba::new(major[0], major[1], major[2], 255);
-    let mut builder = GridBuilder {
-        positions: Vec::new(),
-        colors: Vec::new(),
-        indices: Vec::new(),
-    };
-
-    let count = (EXTENT / spacing) as i32;
-    for i in -count..=count {
-        if i == 0 {
-            continue; // axis lines drawn separately
-        }
-        let offset = i as f32 * spacing;
-        let (half_width, color) = if i % MAJOR_EVERY == 0 {
-            (0.014, major)
-        } else {
-            (0.010, minor)
-        };
-        builder.line_x(offset, half_width, color);
-        builder.line_y(offset, half_width, color);
-    }
-    builder.line_x(0.0, AXIS_HALF_WIDTH, X_AXIS_COLOR); // X axis
-    builder.line_y(0.0, AXIS_HALF_WIDTH, Y_AXIS_COLOR); // Y axis
-
-    let cpu_mesh = CpuMesh {
-        positions: Positions::F32(builder.positions),
-        colors: Some(builder.colors),
-        indices: Indices::U32(builder.indices),
-        ..Default::default()
-    };
-
-    Gm::new(Mesh::new(context, &cpu_mesh), ColorMaterial::default())
+    draws.grid(
+        GridPlane::Xy,
+        EXTENT,
+        spacing,
+        linear(Srgba::new(minor[0], minor[1], minor[2], 255)),
+        linear(Srgba::new(major[0], major[1], major[2], 255)),
+        MAJOR_EVERY,
+    );
+    // `grid` skips the centre lines so the axes can go there instead.
+    axis(draws, aether_math::Vec3::X, X_AXIS_COLOR);
+    axis(draws, aether_math::Vec3::Y, Y_AXIS_COLOR);
 }
 
-/// Zero axis lines for side-on orthographic views (front/back, left/right),
-/// where the floor grid is edge-on and invisible: the ground-level axis of
-/// the faced plane plus the vertical Z axis, as thin quads in that plane.
-pub fn build_zero_lines(
-    context: &Context,
-    plane: crate::camera::VerticalPlane,
-) -> Gm<Mesh, ColorMaterial> {
-    let mut builder = GridBuilder {
-        positions: Vec::new(),
-        colors: Vec::new(),
-        indices: Vec::new(),
+/// The zero axes for a side-on orthographic view, where the floor grid is
+/// edge-on and shows nothing: the ground axis of the faced plane, plus Z.
+pub fn draw_zero_lines(draws: &mut OverlayDraws, plane: crate::camera::VerticalPlane) {
+    let ground = match plane {
+        crate::camera::VerticalPlane::Xz => (aether_math::Vec3::X, X_AXIS_COLOR),
+        crate::camera::VerticalPlane::Yz => (aether_math::Vec3::Y, Y_AXIS_COLOR),
     };
-    let hw = AXIS_HALF_WIDTH;
-    match plane {
-        crate::camera::VerticalPlane::Xz => {
-            // X axis (red) + Z axis (blue) in the y = 0 plane
-            builder.quad(
-                [
-                    vec3(-EXTENT, 0.0, -hw),
-                    vec3(EXTENT, 0.0, -hw),
-                    vec3(EXTENT, 0.0, hw),
-                    vec3(-EXTENT, 0.0, hw),
-                ],
-                X_AXIS_COLOR,
-            );
-            builder.quad(
-                [
-                    vec3(-hw, 0.0, -EXTENT),
-                    vec3(hw, 0.0, -EXTENT),
-                    vec3(hw, 0.0, EXTENT),
-                    vec3(-hw, 0.0, EXTENT),
-                ],
-                Z_AXIS_COLOR,
-            );
-        }
-        crate::camera::VerticalPlane::Yz => {
-            // Y axis (green) + Z axis (blue) in the x = 0 plane
-            builder.quad(
-                [
-                    vec3(0.0, -EXTENT, -hw),
-                    vec3(0.0, EXTENT, -hw),
-                    vec3(0.0, EXTENT, hw),
-                    vec3(0.0, -EXTENT, hw),
-                ],
-                Y_AXIS_COLOR,
-            );
-            builder.quad(
-                [
-                    vec3(0.0, -hw, -EXTENT),
-                    vec3(0.0, hw, -EXTENT),
-                    vec3(0.0, hw, EXTENT),
-                    vec3(0.0, -hw, EXTENT),
-                ],
-                Z_AXIS_COLOR,
-            );
-        }
-    }
+    axis(draws, ground.0, ground.1);
+    axis(draws, aether_math::Vec3::Z, Z_AXIS_COLOR);
+}
 
-    let cpu_mesh = CpuMesh {
-        positions: Positions::F32(builder.positions),
-        colors: Some(builder.colors),
-        indices: Indices::U32(builder.indices),
-        ..Default::default()
-    };
-
-    Gm::new(Mesh::new(context, &cpu_mesh), ColorMaterial::default())
+fn axis(draws: &mut OverlayDraws, direction: aether_math::Vec3, color: Srgba) {
+    draws.line(direction * -EXTENT, direction * EXTENT, linear(color));
 }

@@ -7,7 +7,7 @@
 //! committing are the caller's job — see add_menu.rs (Shift+A add wheel)
 //! and context_menu.rs (right-click object wheel) for the event pattern.
 
-use three_d::egui;
+use crate::gfx::egui;
 
 pub const RADIUS: f32 = 96.0;
 pub const HUB_RADIUS: f32 = 22.0;

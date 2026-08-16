@@ -2,11 +2,11 @@
 //! with a price-grouped model picker, the conversation log with expandable
 //! error details and per-interaction costs, and the message input.
 
+use crate::gfx::egui;
 use super::{cost_summary, ChatSession, Entry};
 use crate::settings::Settings;
 use crate::theme;
 use modeler_ai::{format_usd, ModelInfo, ProviderKind};
-use three_d::egui;
 
 pub struct ChatPanel {
     pub open: bool,

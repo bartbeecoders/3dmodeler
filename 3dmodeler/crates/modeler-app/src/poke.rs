@@ -9,10 +9,10 @@
 //! selection.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::{Event, MouseButton, Viewport};
 use crate::physics::{PhysicsMirror, SimState};
 use modeler_core::glam::Vec3;
-use three_d::egui;
-use three_d::{Event, MouseButton, Viewport};
 
 /// Velocity change at the hit point (m/s): MIN at a tap, MAX at 100%.
 const MIN_SPEED: f32 = 2.0;

@@ -8,12 +8,12 @@
 //! - Esc cancels an in-progress drag.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::Vec3;
 use modeler_core::{ClothAnchor, ObjectId, Primitive, Scene, Transform};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton, Viewport};
 
 const HANDLE_RADIUS: f32 = 7.0;
 const PICK_RADIUS: f32 = 14.0;
@@ -114,7 +114,7 @@ impl ClothHandles {
                     let mut best: Option<(f32, ObjectId, usize)> = None;
                     for (id, idx, handle, _, _) in Self::anchors(scene, selection) {
                         let Some((sx, sy)) =
-                            camera.project(viewport, three_d::vec3(handle.x, handle.y, handle.z))
+                            camera.project(viewport, handle)
                         else {
                             continue;
                         };
@@ -234,7 +234,7 @@ impl ClothHandles {
             .with_clip_rect(clip);
         let pointer = ctx.pointer_hover_pos();
         let project = |p: Vec3| -> Option<egui::Pos2> {
-            let (x, y) = camera.project(viewport, three_d::vec3(p.x, p.y, p.z))?;
+            let (x, y) = camera.project(viewport, p)?;
             Some(egui::Pos2::new(
                 x / device_pixel_ratio,
                 (viewport.height as f32 - y) / device_pixel_ratio,

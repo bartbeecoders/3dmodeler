@@ -25,8 +25,7 @@ mod force_handles;
 mod rope_handles;
 mod cloth_handles;
 mod edit_mode;
-#[cfg(not(target_arch = "wasm32"))]
-mod gl_window;
+mod gfx;
 mod grid;
 mod library;
 mod pbr_library;
@@ -54,11 +53,11 @@ mod undo;
 mod wall_tool;
 mod wire_render;
 
+use crate::gfx::*;
 use camera::BlenderCamera;
 use modeler_core::glam;
 use modeler_core::Scene;
 use selection::Selection;
-use three_d::*;
 
 fn info(msg: &str) {
     #[cfg(target_arch = "wasm32")]
@@ -77,6 +76,14 @@ pub extern "C" fn js_log(ptr: *const u8, len: usize) {
 
 fn cg(v: glam::Vec3) -> Vec3 {
     vec3(v.x, v.y, v.z)
+}
+
+/// The renderer's readback, as the screenshot encoders want it.
+///
+/// `read_output` hands back tightly packed bytes; everything that encodes a
+/// screenshot takes pixels.
+fn rgba_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
+    bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], 255]).collect()
 }
 
 /// Bounding sphere of the current selection (center, radius).
@@ -105,61 +112,6 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
     clipboard::init();
-
-    // Native: own the winit window and event loop instead of using
-    // three_d::Window::render_loop — three-d does not forward OS file-drop
-    // events, and the reference setup dialog accepts drops from the file
-    // manager. The loop below replicates render_loop's behavior exactly,
-    // plus WindowEvent::DroppedFile.
-    #[cfg(not(target_arch = "wasm32"))]
-    let (event_loop, winit_window, gl, vsync) = {
-        let event_loop = winit::event_loop::EventLoop::new();
-        let winit_window = winit::window::WindowBuilder::new()
-            .with_title("3D Modeler")
-            .with_min_inner_size(winit::dpi::LogicalSize::new(2.0, 2.0))
-            .with_maximized(true)
-            .build(&event_loop)
-            .unwrap();
-        winit_window.focus_window();
-        // gl_window tolerates missing swap-control (VirtualBox, remote
-        // desktops); if even the default config fails, retry without MSAA
-        // for bare-bones GL drivers before giving up.
-        let gl = gl_window::GlWindow::new(&winit_window, SurfaceSettings::default())
-            .or_else(|e| {
-                println!("default GL config failed ({e}) — retrying without MSAA");
-                gl_window::GlWindow::new(
-                    &winit_window,
-                    SurfaceSettings { multisamples: 0, ..Default::default() },
-                )
-            })
-            .unwrap_or_else(|e| {
-                // a real dialog: VM users double-click the exe and would
-                // never see a console panic
-                let message = format!(
-                    "The 3D modeler could not start:\n{e}.\n\n\
-                     In a virtual machine (VirtualBox, VMware):\n\
-                     • enable 3D acceleration in the VM display settings\n\
-                     • install the guest additions / VMware tools\n\n\
-                     Alternative (software rendering): download Mesa for Windows\n\
-                     (github.com/pal1000/mesa-dist-win, llvmpipe) and put its\n\
-                     opengl32.dll next to modeler-app.exe."
-                );
-                eprintln!("{message}");
-                rfd::MessageDialog::new()
-                    .set_level(rfd::MessageLevel::Error)
-                    .set_title("3D Modeler — cannot start")
-                    .set_description(&message)
-                    .show();
-                std::process::exit(1);
-            });
-        let vsync = gl.vsync;
-        if !vsync {
-            println!("vsync unavailable (VM or remote desktop?) — limiting to ~60 fps");
-        }
-        (event_loop, winit_window, gl, vsync)
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    let context: Context = (*gl).clone();
 
     #[cfg(target_arch = "wasm32")]
     let window = Window::new(WindowSettings {
@@ -204,8 +156,7 @@ pub fn main() {
     let mut library_saved_revision = library.revision();
     let mut snap_to_grid = false;
     let mut snap_to_vertex = false;
-    let mut shade_mode = scene_render::ShadeMode::Shaded;
-    let mut lighting_mode = scene_render::LightingMode::Studio;
+    let mut shade_mode = scene_render::ShadeMode::MaterialPreview;
     let mut xray = false;
     // F12 toggles live camera preview (native: separate OS window; wasm: egui).
     let mut camera_live = false;
@@ -221,35 +172,28 @@ pub fn main() {
     // don't thrash the live preview's.
     #[cfg(not(target_arch = "wasm32"))]
     let mut mcp_camera_rt: Option<camera_render::CameraRenderTarget> = None;
-    let mut wire_render = wire_render::WireRender::new(&context);
-    let mut grid_built =
-        (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
+    let mut wire_render = wire_render::WireRender::new();
     #[cfg(not(target_arch = "wasm32"))]
     let mut control = control::ControlServer::start();
     let mut chat = ai::ChatSession::new();
 
     info("box3d physics mirror created");
 
-    // zero axis lines for side-on ortho views (front/back, left/right),
-    // where the floor grid is edge-on and shows nothing
-    let zero_lines_xz = grid::build_zero_lines(&context, camera::VerticalPlane::Xz);
-    let zero_lines_yz = grid::build_zero_lines(&context, camera::VerticalPlane::Yz);
-    let mut grid = grid::build_grid(
-        &context,
-        settings.grid_spacing,
-        settings.grid_minor_color,
-        settings.grid_major_color,
-    );
-
     // studio rig + scene lights, switched by the lighting mode
-    let mut lights = scene_render::SceneLights::new(&context);
+    let mut lights = scene_render::SceneLights::new();
 
-    let mut gui = three_d::GUI::new(&context);
     let mut egui_kb_last_frame = false;
 
-    // `mut` is used by the native loop below; render_loop takes it by value
-    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-    let mut on_frame = move |mut frame_input: FrameInput| -> FrameOutput {
+    // The interface and the drawing surface are passed in rather than captured:
+    // both are created after the window exists, which on winit 0.30 is inside
+    // the event loop, while everything above is ready before it starts.
+    //
+    // Moved into the loop, which owns it and calls it once per frame.
+    let on_frame = move |mut frame_input: FrameInput,
+                         gui: &mut Gui,
+                         viewport: &mut Viewport3d,
+                         paint: &mut FramePaint|
+     -> FrameOutput {
         edit_mode.sync(&mut scene);
         // claim Tab for edit mode BEFORE egui grabs it for widget-focus
         // traversal; when a text field had focus last frame, egui keeps it.
@@ -319,7 +263,6 @@ pub fn main() {
                     &mut snap_to_grid,
                     &mut snap_to_vertex,
                     &mut shade_mode,
-                    &mut lighting_mode,
                     &mut xray,
                     &modal_status,
                     fps,
@@ -464,18 +407,6 @@ pub fn main() {
             },
         );
 
-        // rebuild the grid when its settings change; persist settings edits
-        let grid_wanted =
-            (settings.grid_spacing, settings.grid_minor_color, settings.grid_major_color);
-        if grid_built != grid_wanted {
-            grid = grid::build_grid(
-                &context,
-                settings.grid_spacing,
-                settings.grid_minor_color,
-                settings.grid_major_color,
-            );
-            grid_built = grid_wanted;
-        }
         if settings != saved_settings {
             settings.save();
             saved_settings = settings.clone();
@@ -1034,7 +965,6 @@ pub fn main() {
                 &mut physics,
                 &mut library,
                 &mut shade_mode,
-                &mut lighting_mode,
                 &mut camera,
             );
         }
@@ -1048,7 +978,6 @@ pub fn main() {
                 physics: &mut physics,
                 library: &mut library,
                 shade_mode: &mut shade_mode,
-                lighting_mode: &mut lighting_mode,
             },
         );
 
@@ -1263,9 +1192,10 @@ pub fn main() {
             }
         }
 
-        scene_render.sync(&scene, &sel, &overlaps, &context, shade_mode, xray);
-        lights.sync(&context, &scene, &scene_render, shade_mode, lighting_mode);
-        ref_render.sync(&scene, &context);
+        let gpu = viewport.renderer().gpu.clone();
+        scene_render.sync(&gpu, &scene, &sel, &overlaps, shade_mode, xray);
+        lights.sync(&mut scene_render.scene, &scene, shade_mode);
+        gfx::viewport::sync_exposure(viewport.renderer_mut(), lights.scene_active());
 
         // Live camera view: re-render every frame while active so the
         // preview tracks camera/scene changes. Closing the OS window (✕),
@@ -1284,16 +1214,16 @@ pub fn main() {
                 sel.active(),
             ) {
                 Some(cam_id) => {
-                    let bg = settings.theme.viewport_clear();
                     let (live_w, live_h) = (
                         camera_render::LIVE_WIDTH,
                         camera_render::LIVE_HEIGHT,
                     );
                     let rt = camera_rt.get_or_insert_with(|| {
-                        camera_render::CameraRenderTarget::new(&context, live_w, live_h)
+                        camera_render::CameraRenderTarget::new(&gpu, live_w, live_h)
                     });
-                    rt.ensure_size(&context, live_w, live_h);
-                    match rt.render(&scene, cam_id, &scene_render, &lights, bg) {
+                    rt.ensure_size(live_w, live_h);
+                    rt.sync_exposure(lights.scene_active());
+                    match rt.render(&scene, cam_id, &mut scene_render) {
                         Ok((w, h, rgba)) => {
                             let name = scene
                                 .object(cam_id)
@@ -1347,40 +1277,66 @@ pub fn main() {
         }
 
         let cam = camera.camera(frame_input.viewport);
+        scene_render.scene.camera = gfx::viewport::aether_camera(&cam);
 
-        let mut render_objects: Vec<&dyn Object> = scene_render.models().collect();
-        render_objects.extend(scene_render.outlines());
-        render_objects.push(&grid);
-        match camera.vertical_axis_plane() {
-            Some(camera::VerticalPlane::Xz) => render_objects.push(&zero_lines_xz),
-            Some(camera::VerticalPlane::Yz) => render_objects.push(&zero_lines_yz),
-            None => {}
-        }
-        // reference images last: they blend over the grid and the meshes
-        render_objects.extend(ref_render.models().map(|m| m as &dyn Object));
+        // -- editor chrome ----------------------------------------------------
+        //
+        // Rebuilt every frame: the overlay's draw list is not retained, which is
+        // what lets the grid follow a settings change and the wireframe follow a
+        // drag without either of them owning a cache.
+        {
+            let overlay = viewport.renderer_mut().overlay_mut();
+            overlay.draws.clear();
+            ref_render.sync(&scene, &gpu, overlay);
 
-        let bg = settings.theme.viewport_clear();
-        frame_input
-            .screen()
-            .clear(ClearState::color_and_depth(bg[0], bg[1], bg[2], 1.0, 1.0))
-            .render(&cam, render_objects, &lights.active())
-            .write(|| {
-                if shade_mode == scene_render::ShadeMode::Wireframe {
-                    wire_render.render(frame_input.viewport, &cam);
+            grid::draw(
+                &mut overlay.draws,
+                settings.grid_spacing,
+                settings.grid_minor_color,
+                settings.grid_major_color,
+            );
+            if let Some(plane) = camera.vertical_axis_plane() {
+                grid::draw_zero_lines(&mut overlay.draws, plane);
+            }
+
+            if shade_mode == scene_render::ShadeMode::Wireframe {
+                let (positions, ranges) = wire_render.lines();
+                for (tier, &(first, count)) in ranges.iter().enumerate() {
+                    let c = wire_render::WireRender::tier_color(tier);
+                    let color = aether_math::Vec4::new(c[0], c[1], c[2], c[3]);
+                    for pair in positions[first as usize..(first + count) as usize].chunks_exact(2)
+                    {
+                        overlay.draws.line(pair[0], pair[1], color);
+                    }
                 }
-                gui.render()
-            })
-            .unwrap();
+            }
+
+            // Reference images last: they blend over the grid and the meshes.
+            for quad in ref_render.quads() {
+                overlay.draws.image(
+                    quad.handle,
+                    quad.corners,
+                    aether_math::Vec4::new(1.0, 1.0, 1.0, quad.opacity),
+                );
+            }
+
+            overlay.set_selection(scene_render.selection());
+            let outline = scene_render::SceneRender::outline_color(&scene, &sel, &overlaps);
+            let c = outline.to_linear();
+            overlay.outline.color = aether_math::Vec4::new(c.x, c.y, c.z, 1.0);
+        }
+
+        viewport.render(&scene_render.scene, frame_input.elapsed_time as f32 * 0.001);
+
+        // The scene fills the window; the interface goes over it.
+        viewport.blit(paint.encoder, paint.view);
+        gui.render(paint.device, paint.queue, paint.encoder, paint.view);
 
         // the AI assistant's screenshot tool sees the frame just rendered
         if chat.wants_screenshot() {
-            let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
-            chat.deliver_screenshot(
-                &pixels,
-                frame_input.viewport.width,
-                frame_input.viewport.height,
-                &settings,
-            );
+            let (w, h) = (frame_input.viewport.width, frame_input.viewport.height);
+            let pixels = rgba_pixels(&viewport.read_output());
+            chat.deliver_screenshot(&pixels, w, h, &settings);
         }
 
         // deliver any pending image requests from the control API: viewport
@@ -1425,12 +1381,12 @@ pub fn main() {
                     match camera_id {
                         Err(e) => serde_json::json!({"ok": false, "error": e}),
                         Ok(camera_id) => {
-                            let bg = settings.theme.viewport_clear();
                             let rt = mcp_camera_rt.get_or_insert_with(|| {
-                                camera_render::CameraRenderTarget::new(&context, width, height)
+                                camera_render::CameraRenderTarget::new(&gpu, width, height)
                             });
-                            rt.ensure_size(&context, width, height);
-                            match rt.render(&scene, camera_id, &scene_render, &lights, bg) {
+                            rt.ensure_size(width, height);
+                            rt.sync_exposure(lights.scene_active());
+                            match rt.render(&scene, camera_id, &mut scene_render) {
                                 Err(e) => serde_json::json!({"ok": false, "error": e}),
                                 Ok((w, h, rgba)) => match commands::encode_png_rgba(rgba, w, h) {
                                     Err(e) => serde_json::json!({"ok": false, "error": e}),
@@ -1451,7 +1407,7 @@ pub fn main() {
                 } else {
                     viewport_shot
                         .get_or_insert_with(|| {
-                            let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
+                            let pixels = rgba_pixels(&viewport.read_output());
                             let (w, h) =
                                 (frame_input.viewport.width, frame_input.viewport.height);
                             match commands::encode_screenshot(&pixels, w, h) {
@@ -1477,63 +1433,193 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     window.render_loop(on_frame);
 
-    // native main loop: three_d::Window::render_loop plus OS file drops
+    // native main loop: winit 0.30's application handler, plus OS file drops.
+    //
+    // The app owns the loop rather than using a render_loop helper because the
+    // reference-setup dialog accepts files dropped from the file manager, and
+    // that event has to reach the app.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use winit::event::{Event as WinitEvent, WindowEvent};
-        use winit::event_loop::ControlFlow;
+        let event_loop = winit::event_loop::EventLoop::new().expect("an event loop");
+        let mut app = NativeApp::new(on_frame);
+        event_loop.run_app(&mut app).expect("the event loop ran");
+    }
+}
 
-        let mut frame_input_generator = FrameInputGenerator::from_winit_window(&winit_window);
-        // without swap-control the GPU never blocks us — pace the loop by hand
-        let frame_budget = std::time::Duration::from_micros(16_600);
-        let mut last_frame = std::time::Instant::now();
-        event_loop.run(move |event, _, control_flow| match event {
-            WinitEvent::MainEventsCleared => winit_window.request_redraw(),
-            WinitEvent::RedrawRequested(_) => {
-                let frame_input = frame_input_generator.generate(&gl);
-                let frame_output = on_frame(frame_input);
-                if frame_output.exit {
-                    *control_flow = ControlFlow::Exit;
-                } else {
-                    if frame_output.swap_buffers {
-                        gl.swap_buffers().unwrap();
-                    }
-                    if frame_output.wait_next_event {
-                        *control_flow = ControlFlow::Wait;
-                    } else {
-                        *control_flow = ControlFlow::Poll;
-                        winit_window.request_redraw();
-                    }
-                }
-                if !vsync {
-                    let elapsed = last_frame.elapsed();
-                    if elapsed < frame_budget {
-                        std::thread::sleep(frame_budget - elapsed);
-                    }
-                    last_frame = std::time::Instant::now();
-                }
+/// The window, its surface and the interface — everything that cannot exist
+/// until winit has handed over a window.
+#[cfg(not(target_arch = "wasm32"))]
+struct Running {
+    window: std::sync::Arc<winit::window::Window>,
+    gfx: GfxWindow,
+    gui: Gui,
+    viewport: Viewport3d,
+    input: FrameInputGenerator,
+}
+
+/// The native event loop, as winit 0.30 wants it: a handler rather than a
+/// closure, because a window may only be created once the platform says so.
+#[cfg(not(target_arch = "wasm32"))]
+struct NativeApp<F> {
+    on_frame: F,
+    running: Option<Running>,
+    /// Without vsync the GPU never blocks us — the loop paces itself.
+    frame_budget: std::time::Duration,
+    last_frame: std::time::Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<F> NativeApp<F>
+where
+    F: FnMut(FrameInput, &mut Gui, &mut Viewport3d, &mut FramePaint) -> FrameOutput,
+{
+    fn new(on_frame: F) -> Self {
+        Self {
+            on_frame,
+            running: None,
+            frame_budget: std::time::Duration::from_micros(16_600),
+            last_frame: std::time::Instant::now(),
+        }
+    }
+
+    /// Draws one frame, or skips it when the swapchain is momentarily gone.
+    fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Some(running) = self.running.as_mut() else { return };
+
+        let frame_input = running.input.generate();
+        let Some(surface_texture) = running.gfx.acquire() else { return };
+        let view = surface_texture.texture.create_view(&Default::default());
+        let mut encoder = running
+            .gfx
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+
+        let frame_output = {
+            let mut paint = FramePaint {
+                device: running.gfx.device(),
+                queue: running.gfx.queue(),
+                encoder: &mut encoder,
+                view: &view,
+            };
+            (self.on_frame)(frame_input, &mut running.gui, &mut running.viewport, &mut paint)
+        };
+        running.gfx.queue().submit([encoder.finish()]);
+
+        if frame_output.exit {
+            event_loop.exit();
+            return;
+        }
+        if frame_output.swap_buffers {
+            surface_texture.present();
+        }
+        if frame_output.wait_next_event {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            running.window.request_redraw();
+        }
+
+        if !running.gfx.vsync {
+            let elapsed = self.last_frame.elapsed();
+            if elapsed < self.frame_budget {
+                std::thread::sleep(self.frame_budget - elapsed);
             }
-            WinitEvent::WindowEvent { ref event, .. } => {
-                frame_input_generator.handle_winit_window_event(event);
-                match event {
-                    WindowEvent::Resized(physical_size) => gl.resize(*physical_size),
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        gl.resize(**new_inner_size)
-                    }
-                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                    WindowEvent::DroppedFile(path) => {
-                        // .blend drops import as scene objects; everything
-                        // else goes to the reference-image setup as before
-                        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("blend")) {
-                            blend::import_path(path.clone());
-                        } else {
-                            ref_image::push_setup_file(path);
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            _ => (),
+            self.last_frame = std::time::Instant::now();
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<F> winit::application::ApplicationHandler for NativeApp<F>
+where
+    F: FnMut(FrameInput, &mut Gui, &mut Viewport3d, &mut FramePaint) -> FrameOutput,
+{
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Fired again when a suspended app comes back. The window it already
+        // has is still good, so this is only ever a first-run initialisation.
+        if self.running.is_some() {
+            return;
+        }
+        let attributes = winit::window::Window::default_attributes()
+            .with_title("3D Modeler")
+            .with_min_inner_size(winit::dpi::LogicalSize::new(2.0, 2.0))
+            .with_maximized(true);
+        let window = std::sync::Arc::new(
+            event_loop.create_window(attributes).expect("a window"),
+        );
+        window.focus_window();
+
+        let gfx = GfxWindow::new(window.clone()).unwrap_or_else(|e| {
+            // A real dialog: this is where a machine with no usable GPU stops,
+            // and someone who double-clicked the executable would never see a
+            // console panic.
+            let message = format!(
+                "The 3D modeler could not start:\n{e}.\n\n\
+                 The renderer needs Vulkan, Direct3D 12 or Metal.\n\n\
+                 In a virtual machine (VirtualBox, VMware):\n\
+                 • enable 3D acceleration in the VM display settings\n\
+                 • install the guest additions / VMware tools\n\n\
+                 Alternative (software rendering): install Mesa's lavapipe,\n\
+                 a software Vulkan driver."
+            );
+            eprintln!("{message}");
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("3D Modeler — cannot start")
+                .set_description(&message)
+                .show();
+            std::process::exit(1);
         });
+        if !gfx.vsync {
+            println!("vsync unavailable (VM or remote desktop?) — limiting to ~60 fps");
+        }
+
+        let gui = Gui::new(gfx.device(), gfx.format());
+        let size = window.inner_size();
+        let viewport =
+            Viewport3d::new(gfx.gpu().clone(), size.width, size.height, gfx.format());
+        let input = FrameInputGenerator::from_winit_window(&window);
+        self.running = Some(Running { window, gfx, gui, viewport, input });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        use winit::event::WindowEvent;
+
+        if let Some(running) = self.running.as_mut() {
+            running.input.handle_winit_window_event(&event);
+        }
+        match event {
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            WindowEvent::Resized(size) => {
+                if let Some(running) = self.running.as_mut() {
+                    running.gfx.resize(size);
+                    // The renderer's targets are its own; the swapchain resizing
+                    // does not carry them along.
+                    running.viewport.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::DroppedFile(path) => {
+                // .blend drops import as scene objects; everything else goes
+                // to the reference-image setup as before
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("blend")) {
+                    blend::import_path(path);
+                } else {
+                    ref_image::push_setup_file(&path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(running) = self.running.as_ref() {
+            running.window.request_redraw();
+        }
     }
 }

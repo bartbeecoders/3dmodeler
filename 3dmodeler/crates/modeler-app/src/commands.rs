@@ -1051,41 +1051,38 @@ fn preview_for_library(
     }
 }
 
-/// Switch the viewport shading / lighting mode. Fields are optional; the
-/// response reports the resulting view. (The view state lives in the render
-/// loop, so callers pass the two mode refs in.)
-pub fn set_view(
-    command: &Value,
-    shade_mode: &mut crate::scene_render::ShadeMode,
-    lighting_mode: &mut crate::scene_render::LightingMode,
-) -> Value {
-    use crate::scene_render::{LightingMode, ShadeMode};
+/// Switch the viewport shading mode. Fields are optional; the response
+/// reports the resulting view. (The view state lives in the render loop, so
+/// callers pass the mode ref in.)
+pub fn set_view(command: &Value, shade_mode: &mut crate::scene_render::ShadeMode) -> Value {
+    use crate::scene_render::ShadeMode;
     if let Some(s) = command.get("shading").and_then(Value::as_str) {
         *shade_mode = match s.to_ascii_lowercase().as_str() {
             "wireframe" => ShadeMode::Wireframe,
             "solid" => ShadeMode::Solid,
-            "shaded" => ShadeMode::Shaded,
+            // "shaded" is what this mode was called before Rendered split off.
+            "material" | "material_preview" | "shaded" => ShadeMode::MaterialPreview,
+            "rendered" => ShadeMode::Rendered,
             other => {
                 return json!({"ok": false,
-                    "error": format!("unknown shading '{other}' (wireframe|solid|shaded)")});
+                    "error": format!(
+                        "unknown shading '{other}' (wireframe|solid|material|rendered)")});
             }
         };
     }
+    // The retired lighting toggle, kept for old callers: "studio" and "scene"
+    // are exactly what Material Preview and Rendered now mean.
     if let Some(s) = command.get("lighting").and_then(Value::as_str) {
-        *lighting_mode = match s.to_ascii_lowercase().as_str() {
-            "studio" => LightingMode::Studio,
-            "scene" | "scene_lights" => LightingMode::Scene,
+        *shade_mode = match s.to_ascii_lowercase().as_str() {
+            "studio" => ShadeMode::MaterialPreview,
+            "scene" | "scene_lights" => ShadeMode::Rendered,
             other => {
                 return json!({"ok": false,
                     "error": format!("unknown lighting '{other}' (studio|scene)")});
             }
         };
     }
-    json!({
-        "ok": true,
-        "shading": format!("{shade_mode:?}").to_ascii_lowercase(),
-        "lighting": format!("{lighting_mode:?}").to_ascii_lowercase(),
-    })
+    json!({"ok": true, "shading": shade_mode.name()})
 }
 
 /// Apply the optional viewport-camera arguments of a `screenshot` command
@@ -1125,7 +1122,7 @@ pub fn apply_view_args(
             }
         };
         if let Some((center, radius)) = bounds {
-            camera.frame(three_d::vec3(center.x, center.y, center.z), radius);
+            camera.frame(center, radius);
         }
     }
     None
@@ -1932,6 +1929,7 @@ fn execute_inner(
 /// the browser build has no control server, and the AI screenshot path
 /// downscales first — see `ai::encode_downscaled`.)
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(dead_code)] // waiting on the frame readback — see main.rs
 pub fn encode_screenshot(pixels: &[[u8; 4]], width: u32, height: u32) -> Result<String, String> {
     let mut rgba: Vec<u8> = Vec::with_capacity(pixels.len() * 4);
     for row in 0..height as usize {

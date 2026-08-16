@@ -6,10 +6,10 @@
 //! like the modal operators); height and thickness come from the settings
 //! (per-wall overrides live in the sidebar and the right-click menu).
 
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::selection::Selection;
 use modeler_core::glam::{Quat, Vec3};
 use modeler_core::{ObjectId, Primitive, Scene, Transform};
-use three_d::{Event, Key, MouseButton, Viewport};
 
 const MIN_SEGMENT: f32 = 0.05; // meters; shorter clicks end the tool
 

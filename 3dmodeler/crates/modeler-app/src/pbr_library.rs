@@ -15,13 +15,14 @@
 //! | [3D Textures](https://3dtextures.me) | Free | none | Listed for discovery |
 //! | [FreePBR](https://freepbr.com) | Free | none | Listed for discovery |
 
+use crate::gfx::egui;
+use crate::gfx::{CpuTexture, TextureData};
 use crate::net::{self, BytesTask, HttpTask};
 use crate::selection::Selection;
 use modeler_core::{Material, MaterialTextures, Scene};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use three_d::egui;
 
 const USER_AGENT: &str = "box3d-modeler/0.2 (PBR library; https://github.com)";
 
@@ -1474,71 +1475,51 @@ impl PbrLibraryPanel {
     }
 }
 
-/// Decode a cached map into a three-d `CpuTexture`.
-pub fn cpu_texture_from_key(key: &str) -> Option<three_d::CpuTexture> {
-    use three_d::{CpuTexture, TextureData};
+/// Decode a cached map into a [`CpuTexture`].
+///
+/// Unused until the renderer uploads material textures again.
+#[allow(dead_code)]
+pub fn cpu_texture_from_key(key: &str) -> Option<CpuTexture> {
     let bytes = load_texture_bytes(key)?;
     let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (width, height) = rgba.dimensions();
     let data: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
-    Some(CpuTexture {
-        data: TextureData::RgbaU8(data),
-        width,
-        height,
-        ..Default::default()
-    })
+    Some(CpuTexture { data: TextureData::RgbaU8(data), width, height })
+}
+
+/// One greyscale map's pixels, if it can be packed alongside a `w` x `h` one.
+///
+/// A map of a different size cannot be packed channel-wise; it is dropped
+/// rather than resampled, and its channel falls back to a constant.
+/// [`CpuTexture::pixels`] also rejects one whose data does not fill its stated
+/// size — a truncated download — which would otherwise index out of bounds.
+fn channel(texture: Option<&CpuTexture>, w: u32, h: u32) -> Option<&[[u8; 4]]> {
+    texture.filter(|t| t.width == w && t.height == h).and_then(|t| t.pixels())
 }
 
 /// Pack separate roughness / metallic / AO greyscale maps into glTF ORM
 /// (R=occlusion, G=roughness, B=metallic).
+///
+/// Unused until the renderer uploads material textures again.
+#[allow(dead_code)]
 pub fn pack_orm(
-    occlusion: Option<&three_d::CpuTexture>,
-    roughness: Option<&three_d::CpuTexture>,
-    metallic: Option<&three_d::CpuTexture>,
-) -> Option<three_d::CpuTexture> {
-    use three_d::{CpuTexture, TextureData};
-    let (w, h, rough_px) = match roughness {
-        Some(t) => {
-            let TextureData::RgbaU8(px) = &t.data else {
-                return None;
-            };
-            (t.width, t.height, px.clone())
-        }
-        None => return None,
-    };
-    let occ_px = occlusion.and_then(|t| {
-        if t.width == w && t.height == h {
-            if let TextureData::RgbaU8(px) = &t.data {
-                Some(px.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    });
-    let met_px = metallic.and_then(|t| {
-        if t.width == w && t.height == h {
-            if let TextureData::RgbaU8(px) = &t.data {
-                Some(px.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    });
+    occlusion: Option<&CpuTexture>,
+    roughness: Option<&CpuTexture>,
+    metallic: Option<&CpuTexture>,
+) -> Option<CpuTexture> {
+    // Roughness sets the size: it is the one channel with no sensible
+    // default, so a pack without it is not a pack.
+    let roughness = roughness?;
+    let rough_px = roughness.pixels()?;
+    let (w, h) = (roughness.width, roughness.height);
+    let occ_px = channel(occlusion, w, h);
+    let met_px = channel(metallic, w, h);
     let mut out = Vec::with_capacity(rough_px.len());
     for i in 0..rough_px.len() {
-        let o = occ_px.as_ref().map(|p| p[i][0]).unwrap_or(255);
+        let o = occ_px.map(|p| p[i][0]).unwrap_or(255);
         let r = rough_px[i][0];
-        let m = met_px.as_ref().map(|p| p[i][0]).unwrap_or(0);
+        let m = met_px.map(|p| p[i][0]).unwrap_or(0);
         out.push([o, r, m, 255]);
     }
-    Some(CpuTexture {
-        data: TextureData::RgbaU8(out),
-        width: w,
-        height: h,
-        ..Default::default()
-    })
+    Some(CpuTexture { data: TextureData::RgbaU8(out), width: w, height: h })
 }

@@ -3,7 +3,7 @@
 //! Coordinate convention is Blender's: right-handed, Z up, ground plane XY.
 //! Front view (numpad 1) looks from -Y toward +Y.
 
-use three_d::*;
+use crate::gfx::*;
 
 pub const FOV_DEG: f32 = 45.0;
 const ORBIT_SENSITIVITY: f32 = 0.008; // radians per logical pixel
@@ -150,10 +150,9 @@ impl BlenderCamera {
         let near = (0.002 * self.distance).max(0.01);
         let far = 100.0 * self.distance.max(1.0) + 100.0;
         if self.ortho {
-            // three-d scales the ortho height by the camera-target distance
-            // internally, so pass height per unit distance. This matches the
-            // perspective framing at the pivot exactly.
-            let height = 2.0 * (0.5 * FOV_DEG.to_radians()).tan();
+            // The height that frames, at the pivot, exactly what perspective
+            // frames there — so toggling projection holds the subject still.
+            let height = 2.0 * self.distance * (0.5 * FOV_DEG.to_radians()).tan();
             Camera::new_orthographic(viewport, position, self.pivot, up, height, near, far)
         } else {
             Camera::new_perspective(viewport, position, self.pivot, up, degrees(FOV_DEG), near, far)

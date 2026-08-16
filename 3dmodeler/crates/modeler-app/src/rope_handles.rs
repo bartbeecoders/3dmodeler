@@ -10,12 +10,12 @@
 //! Esc cancels an in-progress drag and restores the pre-drag state.
 
 use crate::camera::BlenderCamera;
+use crate::gfx::egui;
+use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::{Quat, Vec3};
 use modeler_core::{ObjectId, Primitive, RopeEnd, Scene, Transform};
-use three_d::egui;
-use three_d::{Event, Key, MouseButton, Viewport};
 
 const HANDLE_RADIUS: f32 = 7.0;
 const PICK_RADIUS: f32 = 14.0;
@@ -112,7 +112,7 @@ impl RopeHandles {
                     for (id, start, end) in Self::ropes(scene, selection) {
                         for (which, tip) in [(Which::Start, start), (Which::End, end)] {
                             let Some((sx, sy)) =
-                                camera.project(viewport, three_d::vec3(tip.x, tip.y, tip.z))
+                                camera.project(viewport, tip)
                             else {
                                 continue;
                             };
@@ -258,7 +258,7 @@ impl RopeHandles {
             .with_clip_rect(clip);
         let pointer = ctx.pointer_hover_pos();
         let project = |p: Vec3| -> Option<egui::Pos2> {
-            let (x, y) = camera.project(viewport, three_d::vec3(p.x, p.y, p.z))?;
+            let (x, y) = camera.project(viewport, p)?;
             Some(egui::Pos2::new(
                 x / device_pixel_ratio,
                 (viewport.height as f32 - y) / device_pixel_ratio,

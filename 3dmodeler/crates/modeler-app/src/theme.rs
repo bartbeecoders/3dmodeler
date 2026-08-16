@@ -8,8 +8,8 @@
 //! only have a `Ui` at hand (outliner drag highlight, section headers) can
 //! read it back without threading `Settings` through every call.
 
+use crate::gfx::egui;
 use serde::{Deserialize, Serialize};
-use three_d::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Theme {
@@ -41,6 +41,11 @@ pub struct Palette {
     pub warn: egui::Color32,
     pub err: egui::Color32,
     /// Viewport clear color, linear-ish RGB as passed to `ClearState`.
+    /// The 3D view's background.
+    ///
+    /// Read by the theme editor only: the viewport itself is lit by the
+    /// renderer's environment now, and its background is the sky that lights
+    /// the scene rather than a flat fill.
     pub viewport: [f32; 3],
 }
 
@@ -156,9 +161,6 @@ impl Theme {
         ctx.set_visuals_of(egui_theme, visuals);
     }
 
-    pub fn viewport_clear(self) -> [f32; 3] {
-        self.palette().viewport
-    }
 }
 
 /// Accent-colored sidebar section header ("Outliner", "Library", …).
