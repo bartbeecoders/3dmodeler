@@ -17,6 +17,7 @@
 use crate::camera::BlenderCamera;
 use crate::gfx::{Event, Key, MouseButton, Viewport};
 use crate::mesh_edit;
+use crate::modal::Constraint;
 use crate::selection::Selection;
 use crate::settings::Unit;
 use modeler_core::glam::Vec3;
@@ -201,8 +202,9 @@ struct Grab {
     originals: Vec<(usize, Vec3)>,
     start_mouse: (f32, f32),
     cur_mouse: (f32, f32),
-    /// None = screen plane / view axis / uniform, Some(axis) = world axis.
-    constraint: Option<usize>,
+    /// Axis restriction, same three states as the object-mode operator:
+    /// free, one world axis (X/Y/Z), or a plane lock (Shift+axis).
+    constraint: Constraint,
     /// World-space pivot at grab start: element centroid (move uses it for
     /// world-per-pixel scaling; rotate/scale transform around it).
     pivot_world: Vec3,
@@ -215,6 +217,10 @@ enum ToolKind {
     Bevel { width: f32, limit: f32, segments: usize },
     Extrude { amount: f32 },
     Inset { amount: f32, limit: f32 },
+    /// Bridge between the two selected elements. `thickness` is only used by
+    /// the vertex case (half the strut's width); `max_thickness` is 0 for
+    /// the edge / face cases, which have nothing to drag.
+    Bridge { segments: usize, thickness: f32, max_thickness: f32 },
 }
 
 /// Modal topology-tool session: loop cut / bevel on a selected edge (Ctrl+R
@@ -226,6 +232,8 @@ struct ModalTool {
     kind: ToolKind,
     /// The element the tool started from, in `base_topo` ids.
     element: Element,
+    /// Bridge only: the second selected element it spans to.
+    element2: Option<Element>,
     base_mesh: MeshData,
     base_topo: Topology,
     /// The object had no edited mesh before the tool (pristine primitive) —
@@ -250,10 +258,23 @@ struct ModalTool {
     reselect: Option<Vec3>,
 }
 
+impl ModalTool {
+    /// The elements the tool started from — restored as the selection when
+    /// it is cancelled.
+    fn elements(&self) -> Vec<Element> {
+        let mut all = vec![self.element];
+        all.extend(self.element2);
+        all
+    }
+}
+
 pub struct EditMode {
     active: Option<ObjectId>,
     pub mode: SelectMode,
-    selected: Option<Element>,
+    /// Selected elements in click order (Shift+click extends). The last one
+    /// is the active element — what P/A, G/R/S and the face tools act on;
+    /// bridge needs exactly two.
+    selected: Vec<Element>,
     topo: Option<Topology>,
     topo_revision: u64,
     /// Scene instance we entered on: a replaced document (File ▸ New,
@@ -263,6 +284,11 @@ pub struct EditMode {
     grab: Option<Grab>,
     tool: Option<ModalTool>,
     last_mouse: (f32, f32),
+    /// Toolbar / context-menu Bridge click, consumed by `handle_events`
+    /// (which owns the camera and viewport the drag mapping needs).
+    bridge_requested: bool,
+    /// One-shot message for the status bar — why a bridge was refused.
+    notice: Option<String>,
 }
 
 fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
@@ -271,6 +297,18 @@ fn local_to_world(t: &Transform, p: Vec3) -> Vec3 {
 
 fn world_to_local(t: &Transform, w: Vec3) -> Vec3 {
     t.inverse_transform_point(w)
+}
+
+/// The bridge input a running tool holds, in its `base_topo` ids.
+fn bridge_parts_of(tool: &ModalTool) -> Option<mesh_edit::BridgeParts> {
+    match (tool.element, tool.element2?) {
+        (Element::Vertex(a), Element::Vertex(b)) => Some(mesh_edit::BridgeParts::Verts(a, b)),
+        (Element::Edge(a0, a1), Element::Edge(b0, b1)) => {
+            Some(mesh_edit::BridgeParts::Edges((a0, a1), (b0, b1)))
+        }
+        (Element::Face(a), Element::Face(b)) => Some(mesh_edit::BridgeParts::Faces(a, b)),
+        _ => None,
+    }
 }
 
 /// Centroid and outward unit normal of a welded face group (local space).
@@ -325,13 +363,15 @@ impl EditMode {
         Self {
             active: None,
             mode: SelectMode::Face,
-            selected: None,
+            selected: Vec::new(),
             topo: None,
             topo_revision: 0,
             scene_instance: 0,
             grab: None,
             tool: None,
             last_mouse: (0.0, 0.0),
+            bridge_requested: false,
+            notice: None,
         }
     }
 
@@ -350,12 +390,55 @@ impl EditMode {
         self.active
     }
 
+    /// Exactly two elements of the same kind are selected, so Bridge has
+    /// something to do. Enables the toolbar button and the menu entry —
+    /// whether the topology supports it is only known once it runs.
+    pub fn can_bridge(&self) -> bool {
+        self.bridge_parts().is_some() && self.grab.is_none() && self.tool.is_none()
+    }
+
+    /// Toolbar / context menu asked for a bridge; `handle_events` runs it.
+    pub fn request_bridge(&mut self) {
+        self.bridge_requested = true;
+    }
+
+    /// One-shot status message (a refused bridge explains itself here).
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+
+    /// The selection as bridge input: two elements of the same kind.
+    fn bridge_parts(&self) -> Option<mesh_edit::BridgeParts> {
+        let [a, b] = self.selected[..] else { return None };
+        match (a, b) {
+            (Element::Vertex(x), Element::Vertex(y)) => {
+                Some(mesh_edit::BridgeParts::Verts(x, y))
+            }
+            (Element::Edge(x0, x1), Element::Edge(y0, y1)) => {
+                Some(mesh_edit::BridgeParts::Edges((x0, x1), (y0, y1)))
+            }
+            (Element::Face(x), Element::Face(y)) => Some(mesh_edit::BridgeParts::Faces(x, y)),
+            _ => None,
+        }
+    }
+
+    /// The active element: the last one clicked.
+    fn active_element(&self) -> Option<Element> {
+        self.selected.last().copied()
+    }
+
     /// Local-space point of the current element selection: the vertex
     /// position, the edge midpoint, or the face centroid. Local mesh space
     /// is exactly the space pivot/anchor points live in.
     pub fn selected_point(&self) -> Option<Vec3> {
+        self.point_of(self.active_element()?)
+    }
+
+    /// Local-space point of one element: vertex position, edge midpoint or
+    /// face centroid.
+    fn point_of(&self, element: Element) -> Option<Vec3> {
         let topo = self.topo.as_ref()?;
-        Some(match self.selected? {
+        Some(match element {
             Element::Vertex(v) => *topo.verts.get(v)?,
             Element::Edge(a, b) => 0.5 * (*topo.verts.get(a)? + *topo.verts.get(b)?),
             Element::Face(f) => {
@@ -368,7 +451,7 @@ impl EditMode {
 
     /// The selected face's index, when the current selection is a face.
     pub fn selected_face(&self) -> Option<usize> {
-        match self.selected? {
+        match self.active_element()? {
             Element::Face(f) => Some(f),
             _ => None,
         }
@@ -385,7 +468,7 @@ impl EditMode {
         material: Material,
     ) -> bool {
         let Some(id) = self.active else { return false };
-        let face = match self.selected {
+        let face = match self.active_element() {
             Some(Element::Face(f)) => f,
             _ => return false,
         };
@@ -413,6 +496,8 @@ impl EditMode {
 
     /// Right-click pick for the context menu: select the element under the
     /// cursor and return (object, local point, element kind label).
+    /// Right-clicking something already selected leaves the selection alone
+    /// (like object mode) — the menu's Bridge entry needs both elements.
     pub fn context_pick(
         &mut self,
         scene: &Scene,
@@ -422,9 +507,12 @@ impl EditMode {
         y: f32,
     ) -> Option<(ObjectId, Vec3, &'static str)> {
         let id = self.active?;
-        self.pick(scene, camera, viewport, x, y);
-        let point = self.selected_point()?;
-        let label = match self.selected? {
+        let hit = self.pick_element(scene, camera, viewport, x, y)?;
+        if !self.selected.contains(&hit) {
+            self.selected = vec![hit];
+        }
+        let point = self.point_of(hit)?;
+        let label = match hit {
             Element::Vertex(_) => "Vertex",
             Element::Edge(..) => "Edge",
             Element::Face(_) => "Face",
@@ -451,9 +539,10 @@ impl EditMode {
             (Some(grab), _) => grab.status.clone(),
             (None, Some(tool)) => tool.status.clone(),
             (None, None) => format!(
-                "EDIT MODE ({}) · click select · G/R/S transform · E extrude · I inset · \
-                 Ctrl+R loop cut · Ctrl+B bevel · P/A pivot/anchor · \
-                 1/2/3 vertex/edge/face · Tab exit",
+                "EDIT MODE ({}) · click select · Shift+click add · G/R/S transform · \
+                 E extrude · I inset · Ctrl+R loop cut · Ctrl+B bevel · \
+                 F bridge (2 selected) · P/A pivot/anchor · 1/2/3 vertex/edge/face · \
+                 Tab exit",
                 self.mode.label()
             ),
         })
@@ -466,13 +555,13 @@ impl EditMode {
         }
         self.cancel_tool(scene);
         self.active = None;
-        self.selected = None;
+        self.selected.clear();
         self.topo = None;
     }
 
     fn enter(&mut self, id: ObjectId, scene: &Scene) {
         self.active = Some(id);
-        self.selected = None;
+        self.selected.clear();
         self.grab = None;
         self.tool = None;
         self.scene_instance = scene.instance();
@@ -501,10 +590,11 @@ impl EditMode {
             Some(object) => {
                 if object.mesh_revision != self.topo_revision || self.topo.is_none() {
                     if self.grab.is_none() && self.tool.is_none() {
-                        let sel = self.selected;
+                        let sel = std::mem::take(&mut self.selected);
                         self.rebuild_topology(scene);
-                        // keep the selection if it still exists
-                        self.selected = sel.filter(|e| self.element_exists(*e));
+                        // keep the elements that still exist
+                        self.selected =
+                            sel.into_iter().filter(|e| self.element_exists(*e)).collect();
                     }
                 }
             }
@@ -548,7 +638,7 @@ impl EditMode {
 
         let mut confirm = false;
         let mut cancel = false;
-        let mut click: Option<(f32, f32)> = None;
+        let mut click: Option<(f32, f32, bool)> = None;
 
         for event in events.iter_mut() {
             match event {
@@ -565,7 +655,7 @@ impl EditMode {
                 // pointer_over_ui uses this frame's egui state — the `handled`
                 // flag alone lags a frame, so a click that lands on a UI
                 // panel could also confirm a running grab/tool here
-                Event::MousePress { button, position, handled, .. }
+                Event::MousePress { button, position, modifiers, handled }
                     if !*handled && !pointer_over_ui && *button != MouseButton::Middle =>
                 {
                     self.last_mouse = (position.x, position.y);
@@ -580,7 +670,7 @@ impl EditMode {
                             MouseButton::Middle => {}
                         }
                     } else if *button == MouseButton::Left {
-                        click = Some((position.x, position.y));
+                        click = Some((position.x, position.y, modifiers.shift));
                     }
                     *handled = true;
                 }
@@ -649,6 +739,13 @@ impl EditMode {
                                 }
                                 true
                             }
+                            // F: bridge the two selected elements
+                            "f" | "F" => {
+                                if self.grab.is_none() {
+                                    self.start_bridge(scene, camera, viewport, unit);
+                                }
+                                true
+                            }
                             other => self.text_input(other, scene),
                         };
                     if consumed {
@@ -665,8 +762,12 @@ impl EditMode {
             }
             self.cancel_tool(scene);
         }
-        if let Some((x, y)) = click {
-            self.pick(scene, camera, viewport, x, y);
+        if let Some((x, y, extend)) = click {
+            self.pick(scene, camera, viewport, x, y, extend);
+        }
+        // Bridge asked for from the toolbar or the context wheel
+        if std::mem::take(&mut self.bridge_requested) {
+            self.start_bridge(scene, camera, viewport, unit);
         }
         self.apply_grab(scene, camera, viewport, unit);
         self.drag_tool(scene, unit);
@@ -687,7 +788,8 @@ impl EditMode {
                     // preview mesh stays; the old element ids no longer
                     // apply — face tools re-pick the result face so E / I
                     // chain, edge tools clear the selection
-                    self.selected = tool.reselect.and_then(|p| self.face_near(p));
+                    self.selected =
+                        tool.reselect.and_then(|p| self.face_near(p)).into_iter().collect();
                 }
             }
         }
@@ -775,23 +877,22 @@ impl EditMode {
     pub fn set_mode(&mut self, mode: SelectMode) {
         if self.mode != mode {
             self.mode = mode;
-            self.selected = None;
+            self.selected.clear();
         }
     }
 
     fn grab_constraint(&mut self, text: &str) {
         let Some(grab) = &mut self.grab else { return };
-        let axis = match text.to_ascii_lowercase().as_str() {
-            "x" => Some(0),
-            "y" => Some(1),
-            "z" => Some(2),
-            _ => return,
-        };
-        grab.constraint = if grab.constraint == axis { None } else { axis };
+        if let Some(next) = grab.constraint.typed(text) {
+            grab.constraint = next;
+        }
     }
 
     // --- picking -----------------------------------------------------------
 
+    /// Click select. `extend` (Shift held) toggles the element in and out of
+    /// the selection instead of replacing it — that is how the two elements
+    /// a bridge spans get selected.
     fn pick(
         &mut self,
         scene: &Scene,
@@ -799,16 +900,42 @@ impl EditMode {
         viewport: Viewport,
         x: f32,
         y: f32,
+        extend: bool,
     ) {
-        let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
-        let Some(topo) = &self.topo else { return };
+        let hit = self.pick_element(scene, camera, viewport, x, y);
+        match (extend, hit) {
+            (false, Some(element)) => self.selected = vec![element],
+            (false, None) => self.selected.clear(),
+            (true, Some(element)) => match self.selected.iter().position(|&e| e == element) {
+                Some(at) => {
+                    self.selected.remove(at);
+                }
+                None => self.selected.push(element),
+            },
+            // Shift+click on nothing keeps the selection: a missed click must
+            // not throw away a half-built bridge pair
+            (true, None) => {}
+        }
+    }
+
+    /// The element under the cursor, in the current select mode.
+    fn pick_element(
+        &self,
+        scene: &Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        x: f32,
+        y: f32,
+    ) -> Option<Element> {
+        let object = self.active.and_then(|id| scene.object(id))?;
+        let topo = self.topo.as_ref()?;
         let world = scene.world_transform(object.id);
         let to_screen = |p: Vec3| -> (f32, f32) {
             let w = local_to_world(&world, p);
             camera.world_to_screen(viewport, w)
         };
 
-        self.selected = match self.mode {
+        match self.mode {
             SelectMode::Vertex => {
                 let mut best: Option<(f32, usize)> = None;
                 for (i, &v) in topo.verts.iter().enumerate() {
@@ -848,29 +975,36 @@ impl EditMode {
                 }
                 best.map(|(_, ti)| {
                     Element::Face(
-                        self.topo
-                            .as_ref()
-                            .unwrap()
-                            .faces
+                        topo.faces
                             .iter()
                             .position(|f| f.tris.contains(&ti))
                             .unwrap_or(0),
                     )
                 })
             }
-        };
+        }
     }
 
     // --- grab (move) --------------------------------------------------------
 
+    /// Every welded vertex the selection covers, deduplicated — a transform
+    /// moves all of them, so a two-element selection drags as one piece.
     fn affected_verts(&self) -> Vec<usize> {
         let Some(topo) = &self.topo else { return Vec::new() };
-        match self.selected {
-            Some(Element::Vertex(v)) => vec![v],
-            Some(Element::Edge(a, b)) => vec![a, b],
-            Some(Element::Face(f)) => topo.faces.get(f).map(|g| g.verts.clone()).unwrap_or_default(),
-            None => Vec::new(),
-        }
+        let mut verts: Vec<usize> = self
+            .selected
+            .iter()
+            .flat_map(|element| match *element {
+                Element::Vertex(v) => vec![v],
+                Element::Edge(a, b) => vec![a, b],
+                Element::Face(f) => {
+                    topo.faces.get(f).map(|g| g.verts.clone()).unwrap_or_default()
+                }
+            })
+            .collect();
+        verts.sort_unstable();
+        verts.dedup();
+        verts
     }
 
     fn start_transform(&mut self, kind: TransformKind, scene: &mut Scene) {
@@ -903,7 +1037,7 @@ impl EditMode {
             originals: affected.iter().map(|&v| (v, topo.verts[v])).collect(),
             start_mouse: self.last_mouse,
             cur_mouse: self.last_mouse,
-            constraint: None,
+            constraint: Constraint::Free,
             pivot_world: local_to_world(&world, centroid),
             status: String::new(),
         });
@@ -917,19 +1051,17 @@ impl EditMode {
         unit: Unit,
     ) {
         let Some(id) = self.active else { return };
+        let element = match self.selected.as_slice() {
+            [Element::Vertex(_)] => "vertex",
+            [Element::Edge(..)] => "edge",
+            [Element::Face(_)] => "face",
+            [] => "?",
+            _ => "selection",
+        };
         let Some(grab) = &mut self.grab else { return };
 
         let world = scene.world_transform(id);
-        let element = match self.selected {
-            Some(Element::Vertex(_)) => "vertex",
-            Some(Element::Edge(..)) => "edge",
-            Some(Element::Face(_)) => "face",
-            None => "?",
-        };
-        let constraint_tag = match grab.constraint {
-            Some(a) => format!("  along {}", ["X", "Y", "Z"][a]),
-            None => String::new(),
-        };
+        let constraint_tag = grab.constraint.tag();
 
         let targets: Vec<(usize, Vec3)> = match grab.kind {
             TransformKind::Move => {
@@ -937,11 +1069,7 @@ impl EditMode {
                 let wpp = camera.world_per_pixel_at(viewport, grab.pivot_world);
                 let dx = grab.cur_mouse.0 - grab.start_mouse.0;
                 let dy = grab.cur_mouse.1 - grab.start_mouse.1;
-                let mut delta = right * (dx * wpp) + up * (dy * wpp);
-                if let Some(axis) = grab.constraint {
-                    let a = [Vec3::X, Vec3::Y, Vec3::Z][axis];
-                    delta = a * delta.dot(a);
-                }
+                let delta = grab.constraint.restrict(right * (dx * wpp) + up * (dy * wpp));
 
                 let shown = delta * unit.per_meter();
                 grab.status = format!(
@@ -969,9 +1097,10 @@ impl EditMode {
                 let (_, _, forward) = camera.screen_basis();
                 let view_axis = -forward;
                 let (axis, sign) = match grab.constraint {
-                    None => (view_axis, 1.0),
-                    Some(i) => {
-                        let axis = [Vec3::X, Vec3::Y, Vec3::Z][i];
+                    Constraint::Free => (view_axis, 1.0),
+                    // a plane lock names the same axis to spin around
+                    Constraint::Axis(i) | Constraint::Plane(i) => {
+                        let axis = crate::modal::axis_vec(i);
                         (axis, if axis.dot(view_axis) >= 0.0 { 1.0 } else { -1.0 })
                     }
                 };
@@ -995,14 +1124,7 @@ impl EditMode {
                     + (grab.cur_mouse.1 - pivot_screen.1).powi(2))
                 .sqrt();
                 let factor = d1 / d0;
-                let factors = match grab.constraint {
-                    None => Vec3::splat(factor),
-                    Some(i) => {
-                        let mut f = Vec3::ONE;
-                        f[i] = factor;
-                        f
-                    }
-                };
+                let factors = grab.constraint.scale_factors(factor);
                 grab.status = format!(
                     "Scale {element}: {factor:.3}{constraint_tag}   |   \
                      LMB/Enter confirm · RMB/Esc cancel",
@@ -1051,7 +1173,7 @@ impl EditMode {
         viewport: Viewport,
         unit: Unit,
     ) {
-        let Some(Element::Edge(a, b)) = self.selected else { return };
+        let Some(Element::Edge(a, b)) = self.active_element() else { return };
         let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
         let was_pristine = object.edited_mesh.is_none();
         let base_mesh = object.render_mesh();
@@ -1076,6 +1198,7 @@ impl EditMode {
         let mut tool = ModalTool {
             kind,
             element: Element::Edge(a, b),
+            element2: None,
             base_mesh,
             base_topo,
             was_pristine,
@@ -1089,7 +1212,7 @@ impl EditMode {
             reselect: None,
         };
         if self.apply_tool(&mut tool, scene, unit) {
-            self.selected = None;
+            self.selected.clear();
             self.tool = Some(tool);
         }
     }
@@ -1105,7 +1228,7 @@ impl EditMode {
         viewport: Viewport,
         unit: Unit,
     ) {
-        let Some(Element::Face(face)) = self.selected else { return };
+        let Some(Element::Face(face)) = self.active_element() else { return };
         let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
         let was_pristine = object.edited_mesh.is_none();
         let base_mesh = object.render_mesh();
@@ -1142,6 +1265,7 @@ impl EditMode {
         let mut tool = ModalTool {
             kind,
             element: Element::Face(face),
+            element2: None,
             base_mesh,
             base_topo,
             was_pristine,
@@ -1155,8 +1279,86 @@ impl EditMode {
             reselect: None,
         };
         if self.apply_tool(&mut tool, scene, unit) {
-            self.selected = None;
+            self.selected.clear();
             self.tool = Some(tool);
+        }
+    }
+
+    /// F / the toolbar Bridge button / the context wheel: connect the two
+    /// selected elements. Modal like the other topology tools — the wheel
+    /// scrubs the number of bands, a vertex strut's thickness follows the
+    /// cursor, LMB/Enter keeps it and RMB/Esc puts the mesh back.
+    fn start_bridge(
+        &mut self,
+        scene: &mut Scene,
+        camera: &BlenderCamera,
+        viewport: Viewport,
+        unit: Unit,
+    ) {
+        if self.grab.is_some() || self.tool.is_some() {
+            return;
+        }
+        let [first, second] = self.selected[..] else {
+            self.notice =
+                Some("bridge needs two elements — Shift+click a second one".to_string());
+            return;
+        };
+        let Some(parts) = self.bridge_parts() else {
+            self.notice = Some(
+                "bridge needs two elements of the SAME kind (2 vertices, 2 edges or 2 faces)"
+                    .to_string(),
+            );
+            return;
+        };
+        let Some(object) = self.active.and_then(|id| scene.object(id)) else { return };
+        let was_pristine = object.edited_mesh.is_none();
+        let base_mesh = object.render_mesh();
+        let base_topo = build_topology(&base_mesh);
+        let (thickness, max_thickness) =
+            mesh_edit::bridge_thickness(&base_topo, parts).unwrap_or((0.0, 0.0));
+
+        // drag reference: the midpoint between the two elements on screen —
+        // moving away from it thickens a vertex strut
+        let world = scene.world_transform(object.id);
+        let Some(near) = self.point_of(first) else { return };
+        let Some(far) = self.point_of(second) else { return };
+        let mid_world = local_to_world(&world, 0.5 * (near + far));
+        let mid_screen = camera.world_to_screen(viewport, mid_world);
+        let start_dist = ((self.last_mouse.0 - mid_screen.0).powi(2)
+            + (self.last_mouse.1 - mid_screen.1).powi(2))
+        .sqrt();
+
+        let mut tool = ModalTool {
+            kind: ToolKind::Bridge { segments: 1, thickness, max_thickness },
+            element: first,
+            element2: Some(second),
+            base_mesh,
+            base_topo,
+            was_pristine,
+            highlight: Vec::new(),
+            status: String::new(),
+            mid_screen,
+            start_dist,
+            start_width: thickness,
+            world_per_px: camera.world_per_pixel_at(viewport, mid_world),
+            drag_dir: (0.0, 0.0),
+            reselect: None,
+        };
+        if self.apply_tool(&mut tool, scene, unit) {
+            self.selected.clear();
+            self.tool = Some(tool);
+        } else {
+            self.notice = Some(match parts {
+                mesh_edit::BridgeParts::Faces(..) =>
+                    "can't bridge these faces — they need the same number of corners, a simple \
+                     outline (no holes) and no shared corner",
+                mesh_edit::BridgeParts::Edges(..) =>
+                    "can't bridge these edges — they meet at a vertex, or they lie on one \
+                     line so the quad would have no area",
+                mesh_edit::BridgeParts::Verts(..) =>
+                    "can't bridge these vertices — they sit on the same spot",
+            }
+            .to_string());
         }
     }
 
@@ -1175,6 +1377,17 @@ impl EditMode {
             }
             (ToolKind::Inset { amount, .. }, Element::Face(f)) => {
                 mesh_edit::inset_face(&tool.base_mesh, &tool.base_topo, f, amount)
+            }
+            (ToolKind::Bridge { segments, thickness, .. }, _) => {
+                bridge_parts_of(tool).and_then(|parts| {
+                    mesh_edit::bridge(
+                        &tool.base_mesh,
+                        &tool.base_topo,
+                        parts,
+                        segments,
+                        thickness,
+                    )
+                })
             }
             _ => None,
         };
@@ -1236,6 +1449,26 @@ impl EditMode {
                 unit.suffix(),
                 p = unit.decimals(),
             ),
+            ToolKind::Bridge { segments, thickness, max_thickness } => {
+                let what = bridge_parts_of(tool).map_or("elements", |p| p.kind());
+                // only a vertex strut has a girth to show and to drag
+                let girth = if max_thickness > 0.0 {
+                    format!(
+                        " · {:.p$} {} thick",
+                        2.0 * thickness * unit.per_meter(),
+                        unit.suffix(),
+                        p = unit.decimals(),
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Bridge {what}: {segments} segment{}{girth}   |   wheel segments{} · \
+                     LMB/Enter confirm · RMB/Esc cancel",
+                    if segments == 1 { "" } else { "s" },
+                    if max_thickness > 0.0 { " · move thickness" } else { "" },
+                )
+            }
         };
         true
     }
@@ -1251,6 +1484,9 @@ impl EditMode {
             }
             ToolKind::Bevel { segments, .. } => {
                 *segments = (*segments as i32 + notches).clamp(1, 16) as usize;
+            }
+            ToolKind::Bridge { segments, .. } => {
+                *segments = (*segments as i32 + notches).clamp(1, 32) as usize;
             }
             ToolKind::Extrude { .. } | ToolKind::Inset { .. } => {}
         }
@@ -1292,6 +1528,15 @@ impl EditMode {
                 *amount = new;
                 changed
             }
+            // only a vertex strut has a thickness to drag (max 0 otherwise)
+            ToolKind::Bridge { thickness, max_thickness, .. } if *max_thickness > 0.0 => {
+                let new = (tool.start_width + (dist - tool.start_dist) * tool.world_per_px)
+                    .clamp(*max_thickness / 24.0, *max_thickness);
+                let changed = (new - *thickness).abs() > 1e-6;
+                *thickness = new;
+                changed
+            }
+            ToolKind::Bridge { .. } => false,
         };
         if changed {
             self.apply_tool(&mut tool, scene, unit);
@@ -1303,12 +1548,13 @@ impl EditMode {
     fn cancel_tool(&mut self, scene: &mut Scene) {
         let Some(tool) = self.tool.take() else { return };
         let Some(id) = self.active else { return };
+        let elements = tool.elements();
         if let Some(object) = scene.object_mut(id) {
             object.edited_mesh = (!tool.was_pristine).then_some(tool.base_mesh);
             object.mesh_revision += 1;
         }
         self.rebuild_topology(scene);
-        self.selected = self.element_exists(tool.element).then_some(tool.element);
+        self.selected = elements.into_iter().filter(|e| self.element_exists(*e)).collect();
     }
 
     // --- overlay data --------------------------------------------------------
@@ -1326,7 +1572,7 @@ impl EditMode {
             SelectMode::Vertex => topo.verts.iter().enumerate().map(|(i, _)| vert(i)).collect(),
             _ => Vec::new(),
         };
-        let selected = self.selected.map(|element| match element {
+        let selected: Vec<SelectedShape> = self.selected.iter().map(|&element| match element {
             Element::Vertex(v) => SelectedShape::Point(vert(v)),
             Element::Edge(a, b) => SelectedShape::Line(vert(a), vert(b)),
             Element::Face(f) => {
@@ -1343,7 +1589,7 @@ impl EditMode {
                     outline: group.outline.iter().map(|&(a, b)| (vert(a), vert(b))).collect(),
                 }
             }
-        });
+        }).collect();
         let to_world = |p: Vec3| local_to_world(&world, p);
         let highlight = self
             .tool
@@ -1360,7 +1606,9 @@ impl EditMode {
 pub struct EditOverlay {
     pub edges: Vec<(Vec3, Vec3)>,
     pub verts: Vec<Vec3>,
-    pub selected: Option<SelectedShape>,
+    /// Every selected element (Shift+click adds a second one, which is what
+    /// Bridge spans).
+    pub selected: Vec<SelectedShape>,
     /// Pending loop-cut / bevel geometry, shown in the preview color.
     pub highlight: Vec<(Vec3, Vec3)>,
 }
@@ -1431,7 +1679,7 @@ mod tests {
 
         let face = 0;
         let face_tris = edit.topo.as_ref().unwrap().faces[face].tris.clone();
-        edit.selected = Some(Element::Face(face));
+        edit.selected = vec![Element::Face(face)];
         assert!(edit.apply_material_to_selected_face(&mut scene, red));
 
         // the primitive was baked and exactly the face's triangles assigned
@@ -1444,7 +1692,7 @@ mod tests {
 
         // topology revision adopted: the next sync keeps the selection
         edit.sync(&mut scene);
-        assert_eq!(edit.selected, Some(Element::Face(face)), "selection survives");
+        assert_eq!(edit.selected, vec![Element::Face(face)], "selection survives");
     }
 
     #[test]
@@ -1582,7 +1830,7 @@ mod tests {
         edit.rebuild_topology(&scene);
 
         // single vertex: R and S refuse to start, G works
-        edit.selected = Some(Element::Vertex(0));
+        edit.selected = vec![Element::Vertex(0)];
         assert!(edit.text_input("r", &mut scene));
         assert!(edit.grab.is_none());
         assert!(edit.text_input("s", &mut scene));
@@ -1590,7 +1838,7 @@ mod tests {
 
         // an edge starts a rotate (and bakes the primitive into a mesh)
         let (a, b) = edit.topo.as_ref().unwrap().edges[0];
-        edit.selected = Some(Element::Edge(a, b));
+        edit.selected = vec![Element::Edge(a, b)];
         assert!(edit.text_input("r", &mut scene));
         assert!(edit.grab.is_some());
         assert_eq!(edit.grab.as_ref().unwrap().kind, TransformKind::Rotate);
@@ -1598,7 +1846,7 @@ mod tests {
         edit.grab = None;
 
         // a face starts a scale
-        edit.selected = Some(Element::Face(0));
+        edit.selected = vec![Element::Face(0)];
         assert!(edit.text_input("s", &mut scene));
         assert_eq!(edit.grab.as_ref().unwrap().kind, TransformKind::Scale);
     }
@@ -1620,7 +1868,7 @@ mod tests {
             .iter()
             .position(|v| (*v - Vec3::ONE).length() < 1e-4)
             .expect("corner");
-        edit.selected = Some(Element::Vertex(corner));
+        edit.selected = vec![Element::Vertex(corner)];
         assert_eq!(edit.selected_point(), Some(Vec3::ONE));
 
         // P / A set the object's pivot / anchor (typed-character path)
@@ -1635,7 +1883,7 @@ mod tests {
             let topo = edit.topo.as_ref().unwrap();
             0.5 * (topo.verts[a] + topo.verts[b])
         };
-        edit.selected = Some(Element::Edge(a, b));
+        edit.selected = vec![Element::Edge(a, b)];
         assert_eq!(edit.selected_point(), Some(expect));
 
         let expect = {
@@ -1644,13 +1892,13 @@ mod tests {
             group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
                 / group.verts.len() as f32
         };
-        edit.selected = Some(Element::Face(0));
+        edit.selected = vec![Element::Face(0)];
         assert_eq!(edit.selected_point(), Some(expect));
         assert!(edit.text_input("P", &mut scene));
         assert!((scene.object(id).unwrap().pivot - expect).length() < 1e-6);
 
         // no selection -> no point, P is still consumed but changes nothing
-        edit.selected = None;
+        edit.selected.clear();
         assert_eq!(edit.selected_point(), None);
         let before = scene.object(id).unwrap().pivot;
         assert!(edit.text_input("p", &mut scene));
@@ -1678,7 +1926,7 @@ mod tests {
         let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
-        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+        edit.selected = vec![Element::Edge(top_edge(&edit).0, top_edge(&edit).1)];
 
         let camera = BlenderCamera::new();
         let viewport = Viewport::new_at_origo(800, 600);
@@ -1702,7 +1950,7 @@ mod tests {
         assert!(edit.tool.is_none());
         assert!(scene.object(id).unwrap().edited_mesh.is_none(), "bake undone");
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
-        assert_eq!(edit.selected, Some(element));
+        assert_eq!(edit.selected, vec![element]);
     }
 
     #[test]
@@ -1711,14 +1959,14 @@ mod tests {
         let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
-        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+        edit.selected = vec![Element::Edge(top_edge(&edit).0, top_edge(&edit).1)];
         let camera = BlenderCamera::new();
         let viewport = Viewport::new_at_origo(800, 600);
         edit.start_edge_tool(false, &mut scene, &camera, viewport, Unit::Meters);
 
         // confirm (as handle_events does): the preview mesh simply stays
         assert!(edit.tool.take().is_some());
-        edit.selected = None;
+        edit.selected.clear();
         let object = scene.object(id).unwrap();
         assert!(object.edited_mesh.is_some());
         assert_eq!(object.edited_mesh.as_ref().unwrap().seams.len(), 4);
@@ -1737,7 +1985,7 @@ mod tests {
         let viewport = Viewport::new_at_origo(800, 600);
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
-        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+        edit.selected = vec![Element::Edge(top_edge(&edit).0, top_edge(&edit).1)];
 
         edit.start_edge_tool(true, &mut scene, &camera, viewport, Unit::Meters);
         assert!(edit.tool.is_some(), "bevel must start on a cube edge");
@@ -1826,7 +2074,7 @@ mod tests {
         let selection = Selection::default();
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
-        edit.selected = Some(Element::Edge(top_edge(&edit).0, top_edge(&edit).1));
+        edit.selected = vec![Element::Edge(top_edge(&edit).0, top_edge(&edit).1)];
 
         let ctrl = crate::gfx::Modifiers { ctrl: true, ..Default::default() };
         let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
@@ -1877,7 +2125,7 @@ mod tests {
                 })
                 .expect("uncut top edge along Y")
         };
-        edit.selected = Some(Element::Edge(edge.0, edge.1));
+        edit.selected = vec![Element::Edge(edge.0, edge.1)];
         let before = scene.object(id).unwrap().edited_mesh.clone();
         run(&mut edit, &mut scene, vec![
             Event::KeyPress { kind: Key::B, modifiers: ctrl, handled: false },
@@ -1912,7 +2160,7 @@ mod tests {
         let selection = Selection::default();
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
-        edit.selected = Some(Element::Face(top_face_of(&edit)));
+        edit.selected = vec![Element::Face(top_face_of(&edit))];
 
         let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
             edit.handle_events(
@@ -1962,7 +2210,7 @@ mod tests {
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10, "extrusion kept");
 
         // the moved face is re-selected, sitting at z = 1 + amount
-        let Some(Element::Face(f)) = edit.selected else { panic!("face re-selected") };
+        let [Element::Face(f)] = edit.selected[..] else { panic!("face re-selected") };
         let topo = edit.topo.as_ref().unwrap();
         assert!(topo.faces[f]
             .verts
@@ -1980,7 +2228,7 @@ mod tests {
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
         let top = top_face_of(&edit);
-        edit.selected = Some(Element::Face(top));
+        edit.selected = vec![Element::Face(top)];
 
         let run = |edit: &mut EditMode, scene: &mut Scene, mut events: Vec<Event>| {
             edit.handle_events(
@@ -2021,7 +2269,7 @@ mod tests {
         assert!(edit.tool.is_none());
         assert!(scene.object(id).unwrap().edited_mesh.is_none(), "bake undone");
         assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 6);
-        assert_eq!(edit.selected, Some(Element::Face(top)));
+        assert_eq!(edit.selected, vec![Element::Face(top)]);
     }
 
     #[test]
@@ -2034,7 +2282,7 @@ mod tests {
         edit.enter(id, &scene);
 
         let (a, b) = edit.topo.as_ref().unwrap().edges[0];
-        edit.selected = Some(Element::Edge(a, b));
+        edit.selected = vec![Element::Edge(a, b)];
         edit.start_face_tool(false, &mut scene, &camera, viewport, Unit::Meters);
         assert!(edit.tool.is_none());
         edit.start_face_tool(true, &mut scene, &camera, viewport, Unit::Meters);
@@ -2055,7 +2303,7 @@ mod tests {
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
         let top = top_face_of(&edit);
-        edit.selected = Some(Element::Face(top));
+        edit.selected = vec![Element::Face(top)];
 
         let mut events = vec![Event::Text("e".to_string())];
         edit.handle_events(
@@ -2074,7 +2322,7 @@ mod tests {
         );
         assert!(edit.tool.is_none());
         assert!(scene.object(id).unwrap().edited_mesh.is_none(), "no bake for a no-op");
-        assert_eq!(edit.selected, Some(Element::Face(top)), "face stays selected");
+        assert_eq!(edit.selected, vec![Element::Face(top)], "face stays selected");
     }
 
     #[test]
@@ -2086,7 +2334,7 @@ mod tests {
         let mut edit = EditMode::new();
         edit.enter(id, &scene);
 
-        edit.selected = Some(Element::Vertex(0));
+        edit.selected = vec![Element::Vertex(0)];
         edit.start_edge_tool(false, &mut scene, &camera, viewport, Unit::Meters);
         assert!(edit.tool.is_none());
         edit.start_edge_tool(true, &mut scene, &camera, viewport, Unit::Meters);
@@ -2114,5 +2362,260 @@ mod tests {
         let topo = build_topology(&mesh);
         assert!(topo.faces.len() > 8);
         assert!(!topo.edges.is_empty());
+    }
+    /// One object mesh holding two disjoint cube shells, 1 m apart along Z:
+    /// the lower spans z -1..1, the upper z 2..4. Bridging needs two pieces
+    /// that don't already touch.
+    fn two_shell_object(scene: &mut Scene) -> ObjectId {
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let one = Primitive::Cube { size: 2.0 }.generate(false);
+        let mut mesh = one.clone();
+        let base = mesh.positions.len() as u32;
+        mesh.positions
+            .extend(one.positions.iter().map(|p| *p + Vec3::new(0.0, 0.0, 3.0)));
+        let shifted: Vec<u32> = one.indices.iter().map(|i| i + base).collect();
+        mesh.indices.extend(shifted);
+        mesh.recompute_normals();
+        scene.object_mut(id).unwrap().edited_mesh = Some(mesh);
+        id
+    }
+
+    /// The face group of the edited mesh whose corners all sit at `z`.
+    fn face_at(edit: &EditMode, z: f32) -> usize {
+        let topo = edit.topo.as_ref().unwrap();
+        topo.faces
+            .iter()
+            .position(|f| f.verts.iter().all(|&v| (topo.verts[v].z - z).abs() < 1e-4))
+            .unwrap_or_else(|| panic!("no face at z = {z}"))
+    }
+
+    #[test]
+    fn shift_click_builds_a_two_element_selection() {
+        let mut scene = Scene::new();
+        let id = two_shell_object(&mut scene);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        let (near, far) = (Element::Face(face_at(&edit, 1.0)), Element::Face(face_at(&edit, 2.0)));
+        edit.selected = vec![near];
+        assert!(!edit.can_bridge(), "one element is not a bridge");
+
+        edit.selected.push(far);
+        assert!(edit.can_bridge());
+        // the active element stays the last one clicked
+        assert_eq!(edit.active_element(), Some(far));
+
+        // mixing kinds is refused, and says so
+        edit.selected = vec![near, Element::Vertex(0)];
+        assert!(!edit.can_bridge());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        edit.start_bridge(&mut scene, &camera, viewport, Unit::Meters);
+        assert!(edit.tool.is_none());
+        assert!(edit.take_notice().unwrap().contains("SAME kind"));
+    }
+
+    #[test]
+    fn f_bridges_two_faces_scrubs_segments_and_cancels() {
+        let mut scene = Scene::new();
+        let id = two_shell_object(&mut scene);
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        let near = Element::Face(face_at(&edit, 1.0));
+        let far = Element::Face(face_at(&edit, 2.0));
+        edit.selected = vec![near, far];
+        let before = scene.object(id).unwrap().edited_mesh.clone();
+
+        let mut events = vec![Event::Text("f".to_string())];
+        edit.handle_events(
+            &mut events, &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert!(edit.tool.is_some(), "F must start the bridge");
+        assert!(events[0] == Event::Text(String::new()), "F is consumed");
+        assert!(edit.status_line().unwrap().starts_with("Bridge faces: 1 segment"));
+        // the two faces are gone, four tube walls in their place
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10 + 4);
+
+        // wheel: 3 segments -> 3 bands of 4 walls; way down clamps at 1
+        edit.adjust_tool(2, &mut scene, Unit::Meters);
+        assert!(edit.status_line().unwrap().contains("3 segments"));
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), 10 + 12);
+        edit.adjust_tool(-9, &mut scene, Unit::Meters);
+        assert!(edit.status_line().unwrap().contains("1 segment"));
+
+        // Esc restores the mesh AND both selected faces
+        edit.cancel_tool(&mut scene);
+        assert!(edit.tool.is_none());
+        assert_eq!(scene.object(id).unwrap().edited_mesh, before, "escape reverts");
+        assert_eq!(edit.selected, vec![near, far]);
+    }
+
+    /// Shift+axis is a PLANE lock in edit mode, exactly as in object mode:
+    /// Shift+Z moves in XY and leaves Z alone (the plain z key does the
+    /// opposite). Regression: edit mode used to treat both as "along Z".
+    #[test]
+    fn shift_axis_locks_a_plane_while_moving_a_face() {
+        let mut scene = Scene::new();
+        let id = scene.add_object(Primitive::Cube { size: 2.0 }, Transform::default());
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        let face = top_face_of(&edit);
+
+        // centroid of the moved face, so the delta is easy to read off
+        let centroid = |edit: &EditMode| {
+            let topo = edit.topo.as_ref().unwrap();
+            let group = &topo.faces[face];
+            group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>() / group.verts.len() as f32
+        };
+        let drag = |edit: &mut EditMode, scene: &mut Scene, axis_key: &str| -> Vec3 {
+            edit.selected = vec![Element::Face(face)];
+            edit.last_mouse = (400.0, 300.0);
+            let before = centroid(edit);
+            edit.start_transform(TransformKind::Move, scene);
+            assert!(edit.text_input(axis_key, scene), "{axis_key} is consumed");
+            edit.grab.as_mut().unwrap().cur_mouse = (520.0, 380.0);
+            edit.apply_grab(scene, &camera, viewport, Unit::Meters);
+            let moved = centroid(edit) - before;
+            let status = edit.status_line().unwrap();
+            edit.grab = None; // confirm, as handle_events does
+            assert!(status.contains(if axis_key == "Z" { "locking Z" } else { "along Z" }));
+            moved
+        };
+
+        // Shift+Z: slides in the XY plane, Z untouched
+        let plane = drag(&mut edit, &mut scene, "Z");
+        assert!(plane.z.abs() < 1e-5, "Z must not move, got {plane:?}");
+        assert!(plane.truncate().length() > 1e-3, "XY must move, got {plane:?}");
+
+        // plain z: the opposite — only Z moves
+        let axis = drag(&mut edit, &mut scene, "z");
+        assert!(axis.truncate().length() < 1e-5, "XY must not move, got {axis:?}");
+        assert!(axis.z.abs() > 1e-3, "Z must move, got {axis:?}");
+    }
+
+    /// Shift+click through the real event path: the second click must ADD
+    /// to the selection, not replace it.
+    #[test]
+    fn shift_click_through_handle_events_keeps_both_faces() {
+        let mut scene = Scene::new();
+        let id = two_shell_object(&mut scene);
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+
+        // screen positions of the two faces we want, from their centroids
+        let world = scene.world_transform(id);
+        let at = |edit: &EditMode, z: f32| {
+            let f = face_at(edit, z);
+            let topo = edit.topo.as_ref().unwrap();
+            let c = topo.faces[f].verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+                / topo.faces[f].verts.len() as f32;
+            camera.world_to_screen(viewport, local_to_world(&world, c))
+        };
+        let (near, far) = (at(&edit, 1.0), at(&edit, 2.0));
+
+        let press = |pos: (f32, f32), shift: bool| Event::MousePress {
+            button: MouseButton::Left,
+            position: crate::gfx::PhysicalPoint { x: pos.0, y: pos.1 },
+            modifiers: crate::gfx::Modifiers { shift, ..Default::default() },
+            handled: false,
+        };
+        let mut run = |edit: &mut EditMode, scene: &mut Scene, event: Event| {
+            edit.handle_events(
+                &mut [event], &camera, viewport, scene, &selection,
+                false, false, false, true, Unit::Meters,
+            );
+        };
+
+        run(&mut edit, &mut scene, press(near, false));
+        assert_eq!(edit.selected.len(), 1, "plain click selects one");
+        run(&mut edit, &mut scene, press(far, true));
+        assert_eq!(edit.selected.len(), 2, "Shift+click ADDS the second");
+        assert!(edit.can_bridge());
+
+        // Shift+clicking it again takes it back out
+        run(&mut edit, &mut scene, press(far, true));
+        assert_eq!(edit.selected.len(), 1);
+        // and a plain click replaces the selection
+        run(&mut edit, &mut scene, press(far, false));
+        assert_eq!(edit.selected.len(), 1);
+    }
+
+    /// The toolbar button and the context wheel only flag a request; the
+    /// next `handle_events` (which owns the camera/viewport) runs it.
+    #[test]
+    fn a_requested_bridge_runs_on_the_next_frame() {
+        let mut scene = Scene::new();
+        let id = two_shell_object(&mut scene);
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let selection = Selection::default();
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.selected =
+            vec![Element::Face(face_at(&edit, 1.0)), Element::Face(face_at(&edit, 2.0))];
+
+        edit.request_bridge();
+        assert!(edit.tool.is_none(), "nothing happens until the frame runs");
+        edit.handle_events(
+            &mut [], &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert!(edit.tool.is_some(), "the request started the tool");
+        // and the flag is one-shot: it must not re-fire on the next frame
+        edit.cancel_tool(&mut scene);
+        edit.handle_events(
+            &mut [], &camera, viewport, &mut scene, &selection,
+            false, false, false, true, Unit::Meters,
+        );
+        assert!(edit.tool.is_none());
+    }
+
+    #[test]
+    fn a_confirmed_vertex_bridge_leaves_a_strut_on_the_object() {
+        let mut scene = Scene::new();
+        let id = two_shell_object(&mut scene);
+        let camera = BlenderCamera::new();
+        let viewport = Viewport::new_at_origo(800, 600);
+        let mut edit = EditMode::new();
+        edit.enter(id, &scene);
+        edit.set_mode(SelectMode::Vertex);
+
+        let corner = |edit: &EditMode, target: Vec3| {
+            let topo = edit.topo.as_ref().unwrap();
+            Element::Vertex(
+                topo.verts
+                    .iter()
+                    .position(|v| (*v - target).length() < 1e-4)
+                    .expect("corner"),
+            )
+        };
+        edit.selected = vec![
+            corner(&edit, Vec3::new(1.0, 1.0, 1.0)),
+            corner(&edit, Vec3::new(1.0, 1.0, 2.0)),
+        ];
+        let faces_before = edit.topo.as_ref().unwrap().faces.len();
+
+        edit.start_bridge(&mut scene, &camera, viewport, Unit::Meters);
+        let tool = edit.tool.as_ref().expect("strut");
+        assert!(matches!(tool.kind, ToolKind::Bridge { max_thickness, .. } if max_thickness > 0.0));
+        assert!(edit.status_line().unwrap().contains("thick"), "girth is shown");
+        // 4 walls + 2 caps, and nothing was removed
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), faces_before + 6);
+
+        // confirm (as handle_events does): the preview mesh simply stays
+        edit.tool = None;
+        edit.selected.clear();
+        edit.sync(&mut scene);
+        assert_eq!(edit.topo.as_ref().unwrap().faces.len(), faces_before + 6);
     }
 }

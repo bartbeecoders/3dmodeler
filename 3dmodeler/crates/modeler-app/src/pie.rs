@@ -45,6 +45,8 @@ pub enum PieIcon {
     Bricks,
     /// Cluster of spheres (break-into-balls).
     Balls,
+    /// Bridge: two posts joined by a deck.
+    Bridge,
     /// Material color (palette chip).
     MaterialColor,
     /// Roughness (matte ↔ gloss arcs).
@@ -396,6 +398,13 @@ pub fn draw_icon(
             painter.add(brick(p(-0.45, 0.62), 0.0));
             painter.add(brick(p(-0.45, -0.05), 0.0));
             painter.add(brick(p(0.62, 0.4), -0.55));
+        }
+        // Bridge: two posts with a deck spanning them
+        PieIcon::Bridge => {
+            painter.line_segment([p(-0.8, -0.7), p(-0.8, 0.8)], stroke);
+            painter.line_segment([p(0.8, -0.7), p(0.8, 0.8)], stroke);
+            painter.line_segment([p(-0.9, -0.7), p(0.9, -0.7)], stroke);
+            painter.line_segment([p(-0.9, 0.1), p(0.9, 0.1)], stroke);
         }
         // Balls: three packed circles
         PieIcon::Balls => {

@@ -197,7 +197,7 @@ pub fn draw_modal_guides(
 }
 
 /// Edit-mode visuals: the object's wireframe (sharp edges), its vertices in
-/// vertex mode, and the selected element highlighted in orange.
+/// vertex mode, and the selected elements highlighted in orange.
 pub fn draw_edit_mode(
     ctx: &egui::Context,
     camera: &BlenderCamera,
@@ -232,42 +232,45 @@ pub fn draw_edit_mode(
             painter.circle_filled(p, 2.5, VERT);
         }
     }
-    match &overlay.selected {
-        Some(SelectedShape::Point(v)) => {
-            if let Some(p) = project(*v) {
-                painter.circle_filled(p, 5.0, SELECTED);
+    // every selected element — Shift+click adds a second one, which is what
+    // Bridge spans
+    for shape in &overlay.selected {
+        match shape {
+            SelectedShape::Point(v) => {
+                if let Some(p) = project(*v) {
+                    painter.circle_filled(p, 5.0, SELECTED);
+                }
             }
-        }
-        Some(SelectedShape::Line(a, b)) => {
-            if let (Some(a), Some(b)) = (project(*a), project(*b)) {
-                painter.line_segment([a, b], egui::Stroke::new(3.0, SELECTED));
-                painter.circle_filled(a, 3.5, SELECTED);
-                painter.circle_filled(b, 3.5, SELECTED);
+            SelectedShape::Line(a, b) => {
+                if let (Some(a), Some(b)) = (project(*a), project(*b)) {
+                    painter.line_segment([a, b], egui::Stroke::new(3.0, SELECTED));
+                    painter.circle_filled(a, 3.5, SELECTED);
+                    painter.circle_filled(b, 3.5, SELECTED);
+                }
             }
-        }
-        Some(SelectedShape::Polygon { tris, outline }) => {
-            let fill = egui::Color32::from_rgba_premultiplied(120, 80, 30, 90);
-            let mut mesh = egui::Mesh::default();
-            for tri in tris {
-                let (Some(a), Some(b), Some(c)) =
-                    (project(tri[0]), project(tri[1]), project(tri[2]))
-                else {
-                    continue;
-                };
-                let base = mesh.vertices.len() as u32;
-                mesh.colored_vertex(a, fill);
-                mesh.colored_vertex(b, fill);
-                mesh.colored_vertex(c, fill);
-                mesh.add_triangle(base, base + 1, base + 2);
-            }
-            painter.add(egui::Shape::mesh(mesh));
-            for &(a, b) in outline {
-                if let (Some(a), Some(b)) = (project(a), project(b)) {
-                    painter.line_segment([a, b], egui::Stroke::new(2.0, SELECTED));
+            SelectedShape::Polygon { tris, outline } => {
+                let fill = egui::Color32::from_rgba_premultiplied(120, 80, 30, 90);
+                let mut mesh = egui::Mesh::default();
+                for tri in tris {
+                    let (Some(a), Some(b), Some(c)) =
+                        (project(tri[0]), project(tri[1]), project(tri[2]))
+                    else {
+                        continue;
+                    };
+                    let base = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(a, fill);
+                    mesh.colored_vertex(b, fill);
+                    mesh.colored_vertex(c, fill);
+                    mesh.add_triangle(base, base + 1, base + 2);
+                }
+                painter.add(egui::Shape::mesh(mesh));
+                for &(a, b) in outline {
+                    if let (Some(a), Some(b)) = (project(a), project(b)) {
+                        painter.line_segment([a, b], egui::Stroke::new(2.0, SELECTED));
+                    }
                 }
             }
         }
-        None => {}
     }
 }
 

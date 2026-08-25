@@ -7,7 +7,9 @@
 //! On walls the west/northwest slots become "add door / window here" (their
 //! dimensions and materials are edited in the sidebar). Edit mode:
 //! right-clicking a vertex/edge/face offers "set as pivot / anchor" (same
-//! as the P/A keys).
+//! as the P/A keys), plus "Bridge" when a second element of the same kind
+//! is Shift+click-selected. Right-clicking something already selected keeps
+//! the selection, so the pair survives opening the menu.
 //!
 //! The object wheel is multi-level:
 //! - **Break** → Bricks / Balls (shatter into dynamic particles)
@@ -79,7 +81,10 @@ enum WheelKind {
     },
     BreakSub,
     MaterialSub,
-    Element,
+    Element {
+        /// Slot index of "Bridge", when two elements are selected.
+        bridge_slot: Option<usize>,
+    },
 }
 
 pub struct ContextMenu {
@@ -192,7 +197,10 @@ impl ContextMenu {
     }
 
     /// Draw the wheel or material popup; returns a status-bar message when
-    /// an action ran.
+    /// an action ran. `bridge_ready` says whether edit mode has two elements
+    /// of the same kind selected (the Bridge slot's condition); picking it
+    /// sets `bridge_request`, which the caller hands to `EditMode`.
+    #[allow(clippy::too_many_arguments)]
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -201,6 +209,8 @@ impl ContextMenu {
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
         break_dialog: &mut Option<(BreakKind, i32)>,
+        bridge_ready: bool,
+        bridge_request: &mut bool,
     ) -> Option<String> {
         // Material property popup (pie already dismissed).
         if self.material_edit.is_some() {
@@ -302,11 +312,17 @@ impl ContextMenu {
                 )
             }
             (_, Target::Element { label, .. }) => {
-                let slots = vec![
+                let mut slots = vec![
                     PieSlot::new("Pivot  (P)", PieIcon::Glyph("⌖")), // N
                     PieSlot::new("Anchor  (A)", PieIcon::Anchor),    // S
                 ];
-                (WheelKind::Element, slots, label.to_string())
+                // Bridge only appears with a second element selected — it is
+                // the whole selection it acts on, not the clicked element.
+                let bridge_slot = bridge_ready.then(|| {
+                    slots.push(PieSlot::new("Bridge  (F)", PieIcon::Bridge));
+                    slots.len() - 1
+                });
+                (WheelKind::Element { bridge_slot }, slots, label.to_string())
             }
         };
 
@@ -371,6 +387,7 @@ impl ContextMenu {
                     modal,
                     library_panel,
                     break_dialog,
+                    bridge_request,
                 );
                 self.close();
             } else {
@@ -536,6 +553,7 @@ impl ContextMenu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &mut self,
         slot: usize,
@@ -546,6 +564,7 @@ impl ContextMenu {
         modal: &mut ModalTransform,
         library_panel: &mut LibraryPanel,
         break_dialog: &mut Option<(BreakKind, i32)>,
+        bridge_request: &mut bool,
     ) -> Option<String> {
         match (kind, target) {
             (WheelKind::BreakSub, Target::Object { .. }) => {
@@ -673,8 +692,12 @@ impl ContextMenu {
                     _ => None,
                 }
             }
-            (WheelKind::Element, Target::Element { id, point, label }) => {
+            (WheelKind::Element { bridge_slot }, Target::Element { id, point, label }) => {
                 let what = label.to_lowercase();
+                if bridge_slot == Some(slot) {
+                    *bridge_request = true;
+                    return None; // the status comes from the modal tool
+                }
                 if slot == 0 {
                     if let Some(object) = scene.object_mut(id) {
                         object.pivot = point;

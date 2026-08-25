@@ -250,6 +250,38 @@ pub fn catalog() -> Vec<ToolSpec> {
             &["op", "target", "tools"],
         ),
         tool(
+            "join_objects",
+            "Merge objects into one mesh (Blender's Ctrl+J): the other objects' geometry is folded into the target and they are removed. Plain concatenation, not a boolean — pieces that don't touch stay separate shells inside one mesh. This is the step that makes bridge_mesh usable across what were two objects, since a bridge spans two elements of ONE mesh.",
+            json!({
+                "target": object_ref("keeps its name and transform, receives the geometry"),
+                "objects": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "objects folded into the target (consumed)"}
+            }),
+            &["target", "objects"],
+        ),
+        tool(
+            "get_mesh_elements",
+            "List an object's mesh elements (welded edit-mode topology): vertices, edges or faces with their index and their point in OBJECT-LOCAL space. Use it to find the two elements bridge_mesh should span; faces also report their corner count, which has to match for a face bridge.",
+            json!({
+                "object": object_ref("mesh to inspect"),
+                "kind": {"type": "string", "enum": ["vertex", "edge", "face"], "description": "which elements to list (default face)"},
+                "limit": {"type": "integer", "description": "maximum elements returned, 1-5000 (default 200); 'count' always reports the true total"}
+            }),
+            &["object"],
+        ),
+        tool(
+            "bridge_mesh",
+            "Bridge two elements of ONE object's mesh (Blender's bridge). Two faces: both are removed and a tube of quads joins their outlines (same corner count required) — inset two opposite faces and bridge them to bore a tunnel, or bridge two separate shells to connect them. Two edges: a quad spans them. Two vertices: a solid square strut. 'a' and 'b' are element indices from get_mesh_elements, or [x, y, z] points in object-local space (the nearest element of that kind wins). To connect two SEPARATE objects, boolean_objects union them first, then bridge.",
+            json!({
+                "object": object_ref("mesh to edit"),
+                "kind": {"type": "string", "enum": ["vertex", "edge", "face"], "description": "what a and b refer to"},
+                "a": {"type": ["integer", "array"], "description": "first element: index, or [x, y, z] in object-local space"},
+                "b": {"type": ["integer", "array"], "description": "second element: index, or [x, y, z] in object-local space"},
+                "segments": {"type": "integer", "description": "bands along the span, 1-32 (default 1)"},
+                "thickness": {"type": "number", "description": "vertex bridge only: strut width in meters (default 12% of the span)"}
+            }),
+            &["object", "kind", "a", "b"],
+        ),
+        tool(
             "add_modifier",
             "Add a non-destructive modifier (live viewport preview; bake with apply_modifiers). subdivision smooths (levels 1-4); boolean combines with a tool object that stays movable (hidden) while previewing.",
             json!({
@@ -560,7 +592,8 @@ mod tests {
             "get_scene", "new_scene", "add_object", "update_object", "delete_object",
             "set_parent", "attach_object", "group_objects", "ungroup_object", "add_floor",
             "add_roof", "scatter_props", "break_into_bricks", "break_into_balls",
-            "boolean_objects", "add_modifier",
+            "boolean_objects", "join_objects", "get_mesh_elements", "bridge_mesh",
+            "add_modifier",
             "update_modifier", "remove_modifier", "apply_modifiers", "add_measurement",
             "simulate", "set_view",
             "screenshot",

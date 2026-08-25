@@ -1,5 +1,6 @@
 //! Topology-editing operators for edit mode: loop cut (Ctrl+R), edge bevel
-//! (Ctrl+B), face extrude (E) and face inset (I).
+//! (Ctrl+B), face extrude (E), face inset (I) and bridge (F) between two
+//! selected elements.
 //!
 //! All take the welded `Topology` view plus the underlying triangle mesh
 //! and return a rebuilt mesh, leaving the inputs untouched — the modal tools
@@ -503,10 +504,13 @@ pub fn bevel_edge(
     Some(out)
 }
 
-/// Copy of the mesh without one welded face group's triangles (normals
-/// left empty — callers run `compact`, which recomputes them).
-fn strip_face(mesh: &MeshData, topo: &Topology, face: usize) -> MeshData {
-    let skip: HashSet<usize> = topo.faces[face].tris.iter().copied().collect();
+/// Copy of the mesh without the given welded face groups' triangles (normals
+/// left empty — callers run `compact`, which recomputes them). An empty list
+/// just clones the triangles, which is what the operators that only ADD
+/// geometry want.
+fn strip_faces(mesh: &MeshData, topo: &Topology, faces: &[usize]) -> MeshData {
+    let skip: HashSet<usize> =
+        faces.iter().flat_map(|&f| topo.faces[f].tris.iter().copied()).collect();
     let mut out = MeshData {
         positions: mesh.positions.clone(),
         normals: Vec::new(),
@@ -545,7 +549,7 @@ pub fn extrude_face(
     }
     let offset = normal * amount;
 
-    let mut out = strip_face(mesh, topo, face);
+    let mut out = strip_faces(mesh, topo, &[face]);
     // the moved face, same CCW orientation
     let top: Vec<Vec3> = lp.iter().map(|&v| topo.verts[v] + offset).collect();
     emit_polygon(&mut out, &top)?;
@@ -615,7 +619,7 @@ pub fn inset_face(
         })
         .collect();
 
-    let mut out = strip_face(mesh, topo, face);
+    let mut out = strip_faces(mesh, topo, &[face]);
     emit_polygon(&mut out, &inner)?;
     for i in 0..n {
         let j = (i + 1) % n;
@@ -624,6 +628,242 @@ pub fn inset_face(
         out.seams.push((base + 2, base + 3)); // inner rim
         out.seams.push((base + 3, base)); // corner spoke
     }
+    compact(&mut out);
+    Some(out)
+}
+
+// --- bridge -----------------------------------------------------------------
+
+/// The two elements a bridge spans. Both must be the same kind and belong
+/// to the same mesh.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BridgeParts {
+    /// Two welded vertices, joined by a solid square-section strut. A
+    /// triangle mesh has no wire edges, so the plain edge Blender would make
+    /// here is realized as the thinnest thing that still renders: a beam
+    /// whose ends sit on the two vertices.
+    Verts(usize, usize),
+    /// Two welded edges, spanned by a quad ribbon.
+    Edges((usize, usize), (usize, usize)),
+    /// Two welded face groups with the same corner count: both faces are
+    /// removed and a tube of quads connects their outlines.
+    Faces(usize, usize),
+}
+
+impl BridgeParts {
+    /// Word for the element kind, for status lines.
+    pub fn kind(self) -> &'static str {
+        match self {
+            BridgeParts::Verts(..) => "vertices",
+            BridgeParts::Edges(..) => "edges",
+            BridgeParts::Faces(..) => "faces",
+        }
+    }
+}
+
+/// Starting and maximum strut thickness for a vertex bridge, scaled to the
+/// gap being spanned. None for the edge / face cases — they have no
+/// thickness parameter.
+pub fn bridge_thickness(topo: &Topology, parts: BridgeParts) -> Option<(f32, f32)> {
+    let BridgeParts::Verts(a, b) = parts else { return None };
+    let (a, b) = (topo.verts.get(a)?, topo.verts.get(b)?);
+    let span = (*b - *a).length();
+    (span > 1e-4).then(|| (0.06 * span, 0.4 * span))
+}
+
+/// Connect two elements of the same mesh with new geometry, `segments`
+/// bands deep along the span. `thickness` is only read for the vertex case.
+/// None when the two parts can't be bridged (they touch, the faces have
+/// different corner counts, an outline isn't a simple loop, …).
+pub fn bridge(
+    mesh: &MeshData,
+    topo: &Topology,
+    parts: BridgeParts,
+    segments: usize,
+    thickness: f32,
+) -> Option<MeshData> {
+    let segments = segments.max(1);
+    match parts {
+        BridgeParts::Verts(a, b) => bridge_verts(mesh, topo, a, b, segments, thickness),
+        BridgeParts::Edges(a, b) => bridge_edges(mesh, topo, a, b, segments),
+        BridgeParts::Faces(a, b) => bridge_faces(mesh, topo, a, b, segments),
+    }
+}
+
+/// Emit the quad ribbon between two equally sized rings of points, cut into
+/// `segments` bands along the span. `a[i]` is joined to `b[i]`; the walls
+/// come out facing outward when `a` is the near face's loop (CCW seen from
+/// outside that face) and `b` runs the same way around the span — which for
+/// a face bridge means the far face's loop reversed, since the two loops
+/// wind oppositely around the tube. `closed` wraps the last point back to
+/// the first (rings); open ribbons (two edges) leave it out.
+fn emit_ribbon(
+    out: &mut MeshData,
+    a: &[Vec3],
+    b: &[Vec3],
+    segments: usize,
+    closed: bool,
+    double_sided: bool,
+) -> Option<()> {
+    let n = a.len();
+    if n < 2 || b.len() != n {
+        return None;
+    }
+    let bands = if closed { n } else { n - 1 };
+    for k in 0..segments {
+        let t0 = k as f32 / segments as f32;
+        let t1 = (k + 1) as f32 / segments as f32;
+        for i in 0..bands {
+            let j = (i + 1) % n;
+            let quad = [
+                a[i].lerp(b[i], t0),
+                a[j].lerp(b[j], t0),
+                a[j].lerp(b[j], t1),
+                a[i].lerp(b[i], t1),
+            ];
+            let base = out.positions.len() as u32;
+            emit_polygon(out, &quad)?;
+            // both rim edges are user cuts: a band flush with its neighbor
+            // (or with the surface the bridge lands on) would otherwise weld
+            // back into one face group and stop being selectable
+            out.seams.push((base, base + 1));
+            out.seams.push((base + 2, base + 3));
+            if double_sided {
+                let mut flip = quad;
+                flip.reverse();
+                emit_polygon(out, &flip)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Rotate `b` to the offset that pairs it with `a` at the least total
+/// corner travel — without it the tube between two faces comes out twisted.
+fn best_alignment(a: &[Vec3], b: &[Vec3]) -> Option<Vec<Vec3>> {
+    let n = a.len();
+    let cost = |k: usize| -> f32 {
+        (0..n).map(|i| a[i].distance_squared(b[(i + k) % n])).sum()
+    };
+    let k = (0..n).min_by(|&x, &y| cost(x).total_cmp(&cost(y)))?;
+    Some((0..n).map(|i| b[(i + k) % n]).collect())
+}
+
+/// Bridge two face groups: both faces go away and a tube of quads joins
+/// their outlines. Needs two simple loops with the same corner count that
+/// don't already touch.
+fn bridge_faces(
+    mesh: &MeshData,
+    topo: &Topology,
+    f: usize,
+    g: usize,
+    segments: usize,
+) -> Option<MeshData> {
+    if f == g {
+        return None;
+    }
+    let near = face_loop(topo, f)?;
+    let far = face_loop(topo, g)?;
+    if near.len() != far.len() {
+        return None;
+    }
+    if near.iter().any(|v| far.contains(v)) {
+        return None; // the faces share corners — nothing to span
+    }
+    let a: Vec<Vec3> = near.iter().map(|&v| topo.verts[v]).collect();
+    // Both loops run CCW seen from outside their own face, so they wind
+    // oppositely around the tube axis: reverse the far one before pairing.
+    let reversed: Vec<Vec3> = far.iter().rev().map(|&v| topo.verts[v]).collect();
+    let b = best_alignment(&a, &reversed)?;
+
+    let mut out = strip_faces(mesh, topo, &[f, g]);
+    emit_ribbon(&mut out, &a, &b, segments, true, false)?;
+    compact(&mut out);
+    Some(out)
+}
+
+/// Bridge two edges: one quad ribbon spanning them. The quad is a lone flap
+/// with no inside, so it is emitted with both windings — otherwise back-face
+/// culling would make it vanish from one side. None when the edges meet at a
+/// vertex, or when all four corners are collinear (two edges on one line
+/// span nothing).
+fn bridge_edges(
+    mesh: &MeshData,
+    topo: &Topology,
+    e1: (usize, usize),
+    e2: (usize, usize),
+    segments: usize,
+) -> Option<MeshData> {
+    let mut ids = vec![e1.0, e1.1, e2.0, e2.1];
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != 4 {
+        return None; // the edges meet at a vertex
+    }
+    let pa = *topo.verts.get(e1.0)?;
+    let pb = *topo.verts.get(e1.1)?;
+    let pc = *topo.verts.get(e2.0)?;
+    let pd = *topo.verts.get(e2.1)?;
+    // pair the ends that are closest, so the quad doesn't cross itself
+    let (pc, pd) = if pa.distance(pc) + pb.distance(pd) <= pa.distance(pd) + pb.distance(pc) {
+        (pc, pd)
+    } else {
+        (pd, pc)
+    };
+    // two edges on the same line leave a quad with no area — nothing to see
+    // and nothing emit_polygon can triangulate
+    if polygon_area_vector(&[0, 1, 2, 3], |i| [pa, pb, pd, pc][i]).length() < 1e-6 {
+        return None;
+    }
+
+    let mut out = strip_faces(mesh, topo, &[]);
+    emit_ribbon(&mut out, &[pa, pb], &[pc, pd], segments, false, true)?;
+    compact(&mut out);
+    Some(out)
+}
+
+/// Bridge two vertices: a closed square-section strut from one to the other,
+/// capped at both ends so the mesh stays solid.
+fn bridge_verts(
+    mesh: &MeshData,
+    topo: &Topology,
+    v: usize,
+    w: usize,
+    segments: usize,
+    thickness: f32,
+) -> Option<MeshData> {
+    if v == w {
+        return None;
+    }
+    let p0 = *topo.verts.get(v)?;
+    let p1 = *topo.verts.get(w)?;
+    let axis = (p1 - p0).normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        return None; // the two vertices are coincident
+    }
+    let r = thickness.max(1e-4);
+    // cross-section basis, perpendicular to the strut
+    let seed = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let u = (seed - axis * seed.dot(axis)).normalize_or_zero();
+    let s = axis.cross(u);
+    // Corner order is CCW seen from +axis, matching what `emit_ribbon` wants
+    // of its near loop; the caps then take it reversed / as-is.
+    let ring = |center: Vec3| -> Vec<Vec3> {
+        [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]
+            .iter()
+            .map(|&(x, y)| center + (u * x + s * y) * r)
+            .collect()
+    };
+    let near = ring(p0);
+    let far = ring(p1);
+
+    let mut out = strip_faces(mesh, topo, &[]);
+    emit_ribbon(&mut out, &near, &far, segments, true, false)?;
+    // the near cap looks back along -axis, so its loop runs the other way
+    let mut near_cap = near;
+    near_cap.reverse();
+    emit_polygon(&mut out, &near_cap)?;
+    emit_polygon(&mut out, &far)?;
     compact(&mut out);
     Some(out)
 }
@@ -818,6 +1058,30 @@ mod tests {
         (mesh, topo)
     }
 
+    /// Two size-2 cubes in one mesh, `gap` apart along Z: the lower spans
+    /// z -1..1, the upper z (1+gap)..(3+gap). Two disjoint shells is what a
+    /// bridge is for.
+    fn two_cubes(gap: f32) -> (MeshData, Topology) {
+        let one = Primitive::Cube { size: 2.0 }.generate(false);
+        let mut mesh = one.clone();
+        let offset = Vec3::new(0.0, 0.0, 2.0 + gap);
+        let base = mesh.positions.len() as u32;
+        mesh.positions.extend(one.positions.iter().map(|p| *p + offset));
+        let shifted: Vec<u32> = one.indices.iter().map(|i| i + base).collect();
+        mesh.indices.extend(shifted);
+        mesh.recompute_normals();
+        let topo = build_topology(&mesh);
+        (mesh, topo)
+    }
+
+    /// The welded face group whose corners all sit at `z`.
+    fn face_at_z(topo: &Topology, z: f32) -> usize {
+        topo.faces
+            .iter()
+            .position(|f| f.verts.iter().all(|&v| (topo.verts[v].z - z).abs() < 1e-4))
+            .unwrap_or_else(|| panic!("no face at z = {z}"))
+    }
+
     /// A welded edge parallel to `axis_dir`, e.g. a top edge of the cube.
     fn find_edge(topo: &Topology, predicate: impl Fn(Vec3, Vec3) -> bool) -> (usize, usize) {
         *topo
@@ -852,6 +1116,178 @@ mod tests {
                 a.dot(b.cross(c)) / 6.0
             })
             .sum()
+    }
+
+    #[test]
+    fn bridging_two_faces_joins_the_shells_into_one_solid() {
+        let (mesh, topo) = two_cubes(1.0);
+        let near = face_at_z(&topo, 1.0); // top of the lower cube
+        let far = face_at_z(&topo, 2.0); // bottom of the upper cube
+
+        let out = bridge(&mesh, &topo, BridgeParts::Faces(near, far), 1, 0.0).expect("bridge");
+        validate(&out);
+        // 8 + 8 + the 2x2x1 tube that replaced the two removed faces
+        assert!((volume(&out) - 20.0).abs() < 1e-3, "volume {}", volume(&out));
+
+        let t = build_topology(&out);
+        // both faces gone, four tube walls in their place
+        assert_eq!(t.faces.len(), 2 * 6 - 2 + 4);
+        assert!(!t
+            .faces
+            .iter()
+            .any(|f| f.verts.iter().all(|&v| (t.verts[v].z - 1.0).abs() < 1e-4)));
+    }
+
+    #[test]
+    fn face_bridge_segments_subdivide_without_changing_the_volume() {
+        let (mesh, topo) = two_cubes(1.0);
+        let (near, far) = (face_at_z(&topo, 1.0), face_at_z(&topo, 2.0));
+        for segments in [2usize, 5] {
+            let out = bridge(&mesh, &topo, BridgeParts::Faces(near, far), segments, 0.0)
+                .expect("bridge");
+            validate(&out);
+            assert!((volume(&out) - 20.0).abs() < 1e-3, "segments {segments}");
+            // the rim seams keep every band a face of its own
+            let t = build_topology(&out);
+            assert_eq!(t.faces.len(), 10 + 4 * segments, "segments {segments}");
+        }
+    }
+
+    #[test]
+    fn a_twisted_pairing_is_never_chosen() {
+        // The upper cube is turned 90° about Z, so pairing the loops by raw
+        // index would wind the tube through itself; best_alignment must roll
+        // it back. A self-intersecting tube loses volume, so the check bites.
+        let one = Primitive::Cube { size: 2.0 }.generate(false);
+        let mut mesh = one.clone();
+        let base = mesh.positions.len() as u32;
+        mesh.positions.extend(
+            one.positions.iter().map(|p| Vec3::new(-p.y, p.x, p.z) + Vec3::new(0.0, 0.0, 3.0)),
+        );
+        let shifted: Vec<u32> = one.indices.iter().map(|i| i + base).collect();
+        mesh.indices.extend(shifted);
+        mesh.recompute_normals();
+        let topo = build_topology(&mesh);
+        let (near, far) = (face_at_z(&topo, 1.0), face_at_z(&topo, 2.0));
+
+        let out = bridge(&mesh, &topo, BridgeParts::Faces(near, far), 1, 0.0).expect("bridge");
+        validate(&out);
+        assert!((volume(&out) - 20.0).abs() < 1e-3, "volume {}", volume(&out));
+    }
+
+    #[test]
+    fn bridging_two_faces_of_one_shell_bores_a_tunnel() {
+        // inset the cube's top and bottom, then bridge the two small faces:
+        // the walls must face INTO the tunnel, not out of it — the solid is
+        // the part around them.
+        let (mesh, topo) = cube();
+        let inset = inset_face(&mesh, &topo, face_at_z(&topo, 1.0), 0.3).expect("inset top");
+        let topo = build_topology(&inset);
+        let inset = inset_face(&inset, &topo, face_at_z(&topo, -1.0), 0.3).expect("inset bottom");
+        let topo = build_topology(&inset);
+
+        let (top, bottom) = (face_at_z(&topo, 1.0), face_at_z(&topo, -1.0));
+        let out = bridge(&inset, &topo, BridgeParts::Faces(top, bottom), 1, 0.0).expect("bridge");
+        validate(&out);
+        // 2x2x2 cube minus a 1.4 x 1.4 shaft straight through it
+        let expected = 8.0 - 1.4 * 1.4 * 2.0;
+        assert!((volume(&out) - expected).abs() < 1e-3, "volume {}", volume(&out));
+    }
+
+    #[test]
+    fn faces_that_touch_are_refused() {
+        let (mesh, topo) = cube();
+        let top = face_at_z(&topo, 1.0);
+        let side = topo
+            .faces
+            .iter()
+            .position(|f| f.verts.iter().all(|&v| (topo.verts[v].x - 1.0).abs() < 1e-4))
+            .expect("side face");
+        // adjacent faces share corners: there is nothing to span
+        assert!(bridge(&mesh, &topo, BridgeParts::Faces(top, side), 1, 0.0).is_none());
+        assert!(bridge(&mesh, &topo, BridgeParts::Faces(top, top), 1, 0.0).is_none());
+    }
+
+    #[test]
+    fn bridging_two_edges_makes_a_double_sided_quad() {
+        let (mesh, topo) = two_cubes(1.0);
+        // a top edge of the lower cube and the one straight above it
+        let lower = find_edge(&topo, |a, b| {
+            (a.z - 1.0).abs() < 1e-4 && (b.z - 1.0).abs() < 1e-4 && (a.y - b.y).abs() < 1e-4
+                && a.y > 0.0
+        });
+        let upper = find_edge(&topo, |a, b| {
+            (a.z - 2.0).abs() < 1e-4 && (b.z - 2.0).abs() < 1e-4 && (a.y - b.y).abs() < 1e-4
+                && a.y > 0.0
+        });
+
+        let out = bridge(&mesh, &topo, BridgeParts::Edges(lower, upper), 1, 0.0).expect("bridge");
+        validate(&out);
+        // nothing was removed and the flap adds one quad per side
+        assert_eq!(out.indices.len(), mesh.indices.len() + 4 * 3);
+        // the two shells are untouched; the flap encloses no volume of its own
+        assert!((volume(&out) - 16.0).abs() < 1e-3, "volume {}", volume(&out));
+
+        // two edges on one LINE also span nothing: side-by-side cubes share
+        // the line their facing top edges sit on, and the quad has no area
+        let side_by_side = {
+            let one = Primitive::Cube { size: 2.0 }.generate(false);
+            let mut m = one.clone();
+            let base = m.positions.len() as u32;
+            m.positions.extend(one.positions.iter().map(|p| *p + Vec3::new(4.0, 0.0, 0.0)));
+            let shifted: Vec<u32> = one.indices.iter().map(|i| i + base).collect();
+            m.indices.extend(shifted);
+            m.recompute_normals();
+            build_topology(&m)
+        };
+        let along_x = |x_center: f32| {
+            find_edge(&side_by_side, |a, b| {
+                (a.z - 1.0).abs() < 1e-4
+                    && (b.z - 1.0).abs() < 1e-4
+                    && (a.y - 1.0).abs() < 1e-4
+                    && (b.y - 1.0).abs() < 1e-4
+                    && (0.5 * (a.x + b.x) - x_center).abs() < 1e-4
+            })
+        };
+        let collinear = BridgeParts::Edges(along_x(0.0), along_x(4.0));
+        assert!(bridge(&mesh, &side_by_side, collinear, 1, 0.0).is_none());
+
+        // edges that meet at a vertex have nothing to span
+        let (_, cube_topo) = cube();
+        let first = cube_topo.edges[0];
+        let touching = *cube_topo
+            .edges
+            .iter()
+            .find(|&&(x, y)| (x == first.0 || y == first.0) && (x, y) != first)
+            .expect("neighbor edge");
+        assert!(bridge(&mesh, &cube_topo, BridgeParts::Edges(first, touching), 1, 0.0).is_none());
+    }
+
+    #[test]
+    fn bridging_two_vertices_adds_a_closed_strut() {
+        let (mesh, topo) = two_cubes(1.0);
+        let corner = |target: Vec3| {
+            topo.verts
+                .iter()
+                .position(|v| (*v - target).length() < 1e-4)
+                .expect("corner")
+        };
+        let a = corner(Vec3::new(1.0, 1.0, 1.0));
+        let b = corner(Vec3::new(1.0, 1.0, 2.0));
+
+        let (default, max) = bridge_thickness(&topo, BridgeParts::Verts(a, b)).expect("span");
+        assert!(default > 0.0 && default < max);
+
+        let r = 0.1;
+        let out = bridge(&mesh, &topo, BridgeParts::Verts(a, b), 1, r).expect("bridge");
+        validate(&out);
+        // two cubes plus a 0.2 x 0.2 x 1.0 beam spanning the gap
+        let expected = 16.0 + (2.0 * r) * (2.0 * r) * 1.0;
+        assert!((volume(&out) - expected).abs() < 1e-3, "volume {}", volume(&out));
+
+        // 4 walls and 2 caps on top of the two cubes' 12 faces
+        assert_eq!(build_topology(&out).faces.len(), 12 + 6);
+        assert!(bridge(&mesh, &topo, BridgeParts::Verts(a, a), 1, r).is_none());
     }
 
     #[test]

@@ -384,6 +384,88 @@ pub fn boolean_selected(
     }
 }
 
+/// Blender's Ctrl+J: fold the other selected objects into the active one as
+/// a SINGLE mesh and remove them from the scene.
+///
+/// Unlike a boolean union this is a plain concatenation — no CSG runs, so
+/// pieces that don't touch stay separate shells inside one mesh. That is
+/// exactly what edit mode's Bridge needs: it spans two elements of ONE
+/// mesh, so two objects have to become one before they can be connected.
+pub fn join_objects(
+    scene: &mut Scene,
+    target: ObjectId,
+    others: &[ObjectId],
+) -> Result<String, String> {
+    let joinable = |o: &modeler_core::Object| -> Result<(), String> {
+        if o.primitive.is_gizmo() {
+            return Err(format!("'{}' is a light/camera/empty — it has no mesh to join", o.name));
+        }
+        if o.primitive.is_soft_sim() {
+            return Err(format!("'{}' is a rope/cloth — its mesh is driven by the sim", o.name));
+        }
+        Ok(())
+    };
+    let target_object = scene.object(target).ok_or("no such target object")?;
+    joinable(target_object)?;
+    let target_name = target_object.name.clone();
+
+    let mut ids: Vec<ObjectId> = Vec::new();
+    for &other in others {
+        if other == target {
+            continue; // the active object is usually in the selection too
+        }
+        let object = scene
+            .object(other)
+            .ok_or_else(|| format!("no object with id {}", other.0))?;
+        joinable(object)?;
+        if !ids.contains(&other) {
+            ids.push(other);
+        }
+    }
+    if ids.is_empty() {
+        return Err("select at least two objects to join".to_string());
+    }
+
+    let target_world = scene.world_transform(target);
+    let mut result = scene.object(target).expect("checked above").render_mesh();
+    for &other in &ids {
+        let object = scene.object(other).expect("checked above");
+        let mesh = modeler_core::mesh_to_frame(
+            &object.render_mesh(),
+            &scene.world_transform(other),
+            &target_world,
+        );
+        append_mesh(&mut result, &mesh);
+    }
+    result.recompute_normals();
+
+    for &other in &ids {
+        scene.remove_object(other);
+    }
+    if let Some(object) = scene.object_mut(target) {
+        object.edited_mesh = Some(result);
+        object.mesh_revision += 1;
+    }
+    let count = ids.len();
+    Ok(format!(
+        "joined {count} object{} into '{target_name}' — Tab in and Shift+click two \
+         elements to bridge them",
+        if count == 1 { "" } else { "s" },
+    ))
+}
+
+/// Append `add`'s geometry to `into`, shifting its indices and seams. Face
+/// material slots are dropped: they index the target's own palette, which
+/// the incoming triangles are not part of.
+fn append_mesh(into: &mut modeler_core::MeshData, add: &modeler_core::MeshData) {
+    let base = into.positions.len() as u32;
+    into.positions.extend_from_slice(&add.positions);
+    into.indices.extend(add.indices.iter().map(|i| i + base));
+    into.seams.extend(add.seams.iter().map(|&(a, b)| (a + base, b + base)));
+    into.uvs.clear();
+    into.tri_materials.clear();
+}
+
 /// The id-list core of [`boolean_selected`]; also driven directly by the
 /// control API (`boolean_objects` command). The tool meshes are brought
 /// into the target's local frame, combined one by one, and the result is
@@ -1756,6 +1838,73 @@ mod tests {
         assert!(scene.object(tool).is_none(), "tool consumed on apply");
         let mesh = scene.object(target).unwrap().edited_mesh.as_ref().unwrap();
         assert!((mesh_volume(mesh) - expected).abs() < 1e-3, "{}", mesh_volume(mesh));
+    }
+
+    #[test]
+    fn join_keeps_the_pieces_as_separate_shells() {
+        let _guard = crate::physics::ffi_test_lock();
+        let mut scene = Scene::new();
+        let a = scene.add_object(
+            modeler_core::Primitive::Cube { size: 2.0 },
+            modeler_core::Transform::default(),
+        );
+        let b = scene.add_object(
+            modeler_core::Primitive::Cube { size: 2.0 },
+            modeler_core::Transform {
+                location: Vec3::new(5.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+        let name = scene.object(a).unwrap().name.clone();
+
+        let message = join_objects(&mut scene, a, &[b]).expect("join");
+        assert!(message.contains("joined 1 object"), "{message}");
+        assert!(scene.object(b).is_none(), "the joined object is consumed");
+        let object = scene.object(a).unwrap();
+        assert_eq!(object.name, name, "the target keeps its identity");
+
+        // no boolean ran: both shells survive whole, in the target's space
+        let mesh = object.edited_mesh.as_ref().expect("joined mesh");
+        let topo = crate::edit_mode::build_topology(mesh);
+        assert_eq!(topo.faces.len(), 12, "two cubes' worth of faces");
+        assert_eq!(topo.verts.len(), 16);
+        // the second cube arrived at its position relative to the first
+        assert!(topo.verts.iter().any(|v| (*v - Vec3::new(6.0, 1.0, 1.0)).length() < 1e-4));
+
+        // and the result is exactly what Bridge needs
+        let wall_at = |x: f32| {
+            topo.faces
+                .iter()
+                .position(|f| f.verts.iter().all(|&v| (topo.verts[v].x - x).abs() < 1e-4))
+                .unwrap_or_else(|| panic!("no wall at x = {x}"))
+        };
+        assert!(crate::mesh_edit::bridge(
+            mesh,
+            &topo,
+            crate::mesh_edit::BridgeParts::Faces(wall_at(1.0), wall_at(4.0)),
+            1,
+            0.0,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn join_refuses_gizmos_and_a_lone_object() {
+        let _guard = crate::physics::ffi_test_lock();
+        let mut scene = Scene::new();
+        let cube = scene.add_object(
+            modeler_core::Primitive::Cube { size: 1.0 },
+            modeler_core::Transform::default(),
+        );
+        let light = scene.add_object(
+            modeler_core::Primitive::light_catalog()[0],
+            modeler_core::Transform::default(),
+        );
+        assert!(join_objects(&mut scene, cube, &[light]).is_err());
+        assert!(join_objects(&mut scene, light, &[cube]).is_err());
+        // the active object alone is not a join
+        assert!(join_objects(&mut scene, cube, &[cube]).is_err());
+        assert!(scene.object(cube).unwrap().edited_mesh.is_none(), "nothing was baked");
     }
 
     #[test]

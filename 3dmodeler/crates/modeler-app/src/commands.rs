@@ -5,6 +5,7 @@
 //! and the AI assistant (`ai.rs`, native + browser). Anything added here is
 //! immediately available to both coding agents and the chat assistant.
 
+use crate::mesh_edit;
 use crate::physics::PhysicsMirror;
 use crate::selection::Selection;
 use modeler_core::glam::{EulerRot, Quat, Vec2, Vec3};
@@ -1753,6 +1754,186 @@ fn execute_inner(
                 "status": message,
             }))
         }
+        "join_objects" => {
+            let target = resolve(scene, &command["target"])?;
+            let others: Vec<ObjectId> = command["objects"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or("'objects' must be a non-empty array of names/ids")?
+                .iter()
+                .map(|r| resolve(scene, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let message = crate::object_ops::join_objects(scene, target, &others)?;
+            selection.retain_existing(|i| scene.object(i).is_some());
+            Ok(json!({
+                "object": object_json(scene, scene.object(target).unwrap()),
+                "status": message,
+            }))
+        }
+        "get_mesh_elements" => {
+            let id = resolve(scene, &command["object"])?;
+            let object = scene.object(id).ok_or("no such object")?;
+            let topo = crate::edit_mode::build_topology(&object.render_mesh());
+            let kind = command["kind"].as_str().unwrap_or("face");
+            let limit = command["limit"].as_u64().unwrap_or(200).clamp(1, 5000) as usize;
+            let p = |v: Vec3| json!([v.x, v.y, v.z]);
+            let (count, elements) = match kind.to_ascii_lowercase().as_str() {
+                "vertex" | "vertices" | "vert" => (
+                    topo.verts.len(),
+                    topo.verts
+                        .iter()
+                        .take(limit)
+                        .enumerate()
+                        .map(|(i, &v)| json!({"index": i, "point": p(v)}))
+                        .collect::<Vec<_>>(),
+                ),
+                "edge" | "edges" => (
+                    topo.edges.len(),
+                    topo.edges
+                        .iter()
+                        .take(limit)
+                        .enumerate()
+                        .map(|(i, &(a, b))| {
+                            json!({
+                                "index": i,
+                                "point": p(0.5 * (topo.verts[a] + topo.verts[b])),
+                                "a": p(topo.verts[a]),
+                                "b": p(topo.verts[b]),
+                            })
+                        })
+                        .collect(),
+                ),
+                "face" | "faces" => (
+                    topo.faces.len(),
+                    topo.faces
+                        .iter()
+                        .take(limit)
+                        .enumerate()
+                        .map(|(i, group)| {
+                            let centroid = group.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+                                / group.verts.len().max(1) as f32;
+                            json!({
+                                "index": i,
+                                "point": p(centroid),
+                                "corners": group.outline.len(),
+                            })
+                        })
+                        .collect(),
+                ),
+                other => {
+                    return Err(format!("unknown kind '{other}' (vertex|edge|face)"));
+                }
+            };
+            Ok(json!({
+                "object": id.0,
+                "kind": kind,
+                "count": count,
+                "returned": elements.len(),
+                "space": "object-local (the space bridge_mesh selectors use)",
+                "elements": elements,
+            }))
+        }
+        "bridge_mesh" => {
+            let id = resolve(scene, &command["object"])?;
+            let kind = command["kind"]
+                .as_str()
+                .ok_or("missing 'kind' (vertex|edge|face)")?
+                .to_ascii_lowercase();
+            let object = scene.object(id).ok_or("no such object")?;
+            let was_pristine = object.edited_mesh.is_none();
+            let mesh = object.render_mesh();
+            let topo = crate::edit_mode::build_topology(&mesh);
+
+            // a selector is an element index or a point in object-local space
+            // (the nearest element of that kind wins)
+            let pick = |key: &str, points: &[Vec3]| -> Result<usize, String> {
+                let value = command.get(key).ok_or_else(|| format!("missing '{key}'"))?;
+                if let Some(index) = value.as_u64() {
+                    let index = index as usize;
+                    return (index < points.len()).then_some(index).ok_or_else(|| {
+                        format!("'{key}' index {index} is out of range (0..{})", points.len())
+                    });
+                }
+                let target = vec3_from(value)
+                    .ok_or_else(|| format!("'{key}' must be an element index or [x, y, z]"))?;
+                points
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| {
+                        a.1.distance_squared(target).total_cmp(&b.1.distance_squared(target))
+                    })
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| format!("the mesh has no {kind} to bridge"))
+            };
+
+            let parts = match kind.as_str() {
+                "vertex" | "vertices" | "vert" => {
+                    let points = topo.verts.clone();
+                    mesh_edit::BridgeParts::Verts(pick("a", &points)?, pick("b", &points)?)
+                }
+                "edge" | "edges" => {
+                    let points: Vec<Vec3> = topo
+                        .edges
+                        .iter()
+                        .map(|&(a, b)| 0.5 * (topo.verts[a] + topo.verts[b]))
+                        .collect();
+                    let (a, b) = (pick("a", &points)?, pick("b", &points)?);
+                    mesh_edit::BridgeParts::Edges(topo.edges[a], topo.edges[b])
+                }
+                "face" | "faces" => {
+                    let points: Vec<Vec3> = topo
+                        .faces
+                        .iter()
+                        .map(|g| {
+                            g.verts.iter().map(|&v| topo.verts[v]).sum::<Vec3>()
+                                / g.verts.len().max(1) as f32
+                        })
+                        .collect();
+                    mesh_edit::BridgeParts::Faces(pick("a", &points)?, pick("b", &points)?)
+                }
+                other => return Err(format!("unknown kind '{other}' (vertex|edge|face)")),
+            };
+
+            let segments =
+                command["segments"].as_u64().unwrap_or(1).clamp(1, 32) as usize;
+            // vertex struts get a girth; the default scales with the span
+            let thickness = match command.get("thickness").and_then(Value::as_f64) {
+                Some(t) => 0.5 * t as f32,
+                None => mesh_edit::bridge_thickness(&topo, parts).map_or(0.0, |(d, _)| d),
+            };
+
+            let bridged = mesh_edit::bridge(&mesh, &topo, parts, segments, thickness)
+                .ok_or_else(|| match parts {
+                    mesh_edit::BridgeParts::Faces(..) => "can't bridge these faces: they need \
+                        the same number of corners, a simple outline (no holes) and no shared \
+                        corner. get_mesh_elements reports each face's corner count."
+                        .to_string(),
+                    mesh_edit::BridgeParts::Edges(..) => "can't bridge these edges: they \
+                        meet at a vertex, or they lie on one line so the quad would have no area"
+                        .to_string(),
+                    mesh_edit::BridgeParts::Verts(..) =>
+                        "can't bridge these vertices: they sit on the same spot".to_string(),
+                })?;
+
+            let faces = crate::edit_mode::build_topology(&bridged).faces.len();
+            let object = scene.object_mut(id).ok_or("no such object")?;
+            object.edited_mesh = Some(bridged);
+            object.mesh_revision += 1;
+            let baked = if was_pristine {
+                " (the primitive is now an editable mesh)"
+            } else {
+                ""
+            };
+            Ok(json!({
+                "object": object_json(scene, scene.object(id).unwrap()),
+                "faces": faces,
+                "status": format!(
+                    "bridged the two {} with {segments} segment{}{baked}",
+                    parts.kind(),
+                    if segments == 1 { "" } else { "s" },
+                ),
+            }))
+        }
         "apply_modifiers" => {
             let id = resolve(scene, &command["object"])?;
             // apply the first `count` stack entries (default: all)
@@ -2415,6 +2596,88 @@ mod tests {
     fn tiny_png_base64() -> String {
         let pixels = vec![[255u8, 255, 255, 255]; 8 * 4];
         encode_screenshot(&pixels, 8, 4).expect("encode")
+    }
+
+    #[test]
+    fn bridge_mesh_bores_a_tunnel_and_reports_the_faces() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+        let id = scene.add_object(
+            modeler_core::Primitive::Cube { size: 2.0 },
+            modeler_core::Transform::default(),
+        );
+        let name = scene.object(id).unwrap().name.clone();
+
+        // discovery: the cube's six welded faces, with local centroids
+        let listed = execute(
+            &json!({"cmd": "get_mesh_elements", "object": name, "kind": "face"}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert_eq!(listed["count"], 6);
+        assert!(listed["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["corners"] == 4));
+
+        // bridge the top and bottom faces by local point — a shaft through it
+        let response = execute(
+            &json!({
+                "cmd": "bridge_mesh", "object": name, "kind": "face",
+                "a": [0.0, 0.0, 1.0], "b": [0.0, 0.0, -1.0], "segments": 2,
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(response["status"].as_str().unwrap().contains("2 segments"));
+        // top and bottom replaced by two bands of four walls each
+        assert_eq!(response["faces"], 4 + 8);
+        // the primitive was baked into an editable mesh, as in edit mode
+        assert!(scene.object(id).unwrap().edited_mesh.is_some());
+    }
+
+    #[test]
+    fn bridge_mesh_reports_what_it_cannot_do() {
+        let _guard = crate::physics::ffi_test_lock();
+        let (mut scene, mut sel, mut physics, mut lib) = setup();
+        let id = scene.add_object(
+            modeler_core::Primitive::Cube { size: 2.0 },
+            modeler_core::Transform::default(),
+        );
+        let name = scene.object(id).unwrap().name.clone();
+
+        // two faces that share corners have nothing to span
+        let response = execute(
+            &json!({
+                "cmd": "bridge_mesh", "object": name, "kind": "face",
+                "a": [0.0, 0.0, 1.0], "b": [1.0, 0.0, 0.0],
+            }),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(response["error"].as_str().unwrap().contains("shared corner"));
+        assert!(scene.object(id).unwrap().edited_mesh.is_none(), "nothing was baked");
+
+        // an out-of-range index says so instead of silently clamping
+        let response = execute(
+            &json!({"cmd": "bridge_mesh", "object": name, "kind": "vertex", "a": 0, "b": 99}),
+            &mut scene,
+            &mut sel,
+            &mut physics,
+            &mut lib,
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(response["error"].as_str().unwrap().contains("out of range"));
     }
 
     #[test]

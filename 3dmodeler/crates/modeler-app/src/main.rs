@@ -569,6 +569,28 @@ pub fn main() {
             }
         }
 
+        // Ctrl+J: join the selection into one mesh (Blender's Join) — the
+        // step that lets edit mode's Bridge span two formerly separate objects
+        if physics.is_stopped() && !modal.active() && !edit_mode.active() {
+            for event in frame_input.events.iter_mut() {
+                if let Event::KeyPress { kind: Key::J, modifiers, handled } = event {
+                    if !*handled && modifiers.ctrl && !egui_owns_keyboard {
+                        *handled = true;
+                        if let Some(active) = sel.active() {
+                            let others: Vec<_> =
+                                sel.selected().iter().copied().filter(|&i| i != active).collect();
+                            ui_state.status_message =
+                                Some(match object_ops::join_objects(&mut scene, active, &others) {
+                                    Ok(message) => message,
+                                    Err(message) => message,
+                                });
+                            sel.retain_existing(|i| scene.object(i).is_some());
+                        }
+                    }
+                }
+            }
+        }
+
         // parenting shortcuts (Ctrl+P / Alt+P)
         if physics.is_stopped() && !modal.active() {
             for event in frame_input.events.iter_mut() {
@@ -832,6 +854,10 @@ pub fn main() {
             physics.is_stopped(),
             settings.unit,
         );
+        // a refused bridge explains itself in the status bar
+        if let Some(notice) = edit_mode.take_notice() {
+            ui_state.status_message = Some(notice);
+        }
 
         // Space = play/pause, Esc = stop (when not editing)
         if !modal.active() && !edit_mode.active() && !wall_tool.active() && !roof_tool.active()

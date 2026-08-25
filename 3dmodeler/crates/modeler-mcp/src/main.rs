@@ -227,6 +227,47 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "join_objects",
+            "description": "Merge objects into ONE mesh (Blender's Ctrl+J): every other listed object's geometry is folded into the target, in the target's local space, and those objects are removed. This is a plain concatenation, NOT a boolean — pieces that do not touch stay separate shells inside the one mesh, and nothing is recomputed or welded. Use it before bridge_mesh: a bridge spans two elements of one mesh, so two separate objects must become one first. The target keeps its name, transform and material.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Object that receives the geometry and survives (name or id as string)"},
+                    "objects": {"type": "array", "items": {"type": "string"}, "description": "Objects folded into the target and removed (names or ids)"}
+                },
+                "required": ["target", "objects"]
+            }
+        },
+        {
+            "name": "get_mesh_elements",
+            "description": "List an object's mesh elements as edit mode sees them (coincident vertices welded, coplanar triangle groups as one face): vertices, edges or faces, each with its index and its point in OBJECT-LOCAL space. Faces also report their corner count. This is how you find the two elements bridge_mesh should span.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object name (or id as string)"},
+                    "kind": {"type": "string", "enum": ["vertex", "edge", "face"], "description": "Which elements to list (default face)"},
+                    "limit": {"type": "integer", "description": "Maximum elements returned, 1..5000 (default 200); 'count' always reports the true total"}
+                },
+                "required": ["object"]
+            }
+        },
+        {
+            "name": "bridge_mesh",
+            "description": "Bridge two elements of ONE object's mesh (Blender's bridge), applied immediately. kind 'face': both faces are removed and a tube of quads joins their outlines — they must have the same number of corners, a simple outline and no shared corner. Inset two opposite faces and bridge them to bore a tunnel through a solid, or bridge two disjoint shells of one mesh to connect them. kind 'edge': one quad spans the two edges (a flap, rendered from both sides). kind 'vertex': a solid square-section strut from one to the other — a triangle mesh has no wire edges, so a vertex bridge is a beam. 'a' and 'b' are element indices from get_mesh_elements, or [x, y, z] points in object-local space (the nearest element of that kind is used). The first bridge turns a primitive into an editable mesh. To connect two SEPARATE objects, boolean_objects union them into one first, then bridge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "object": {"type": "string", "description": "Object to edit (name or id as string)"},
+                    "kind": {"type": "string", "enum": ["vertex", "edge", "face"], "description": "What a and b refer to"},
+                    "a": {"type": ["integer", "array"], "description": "First element: an index from get_mesh_elements, or [x, y, z] in object-local space"},
+                    "b": {"type": ["integer", "array"], "description": "Second element: an index from get_mesh_elements, or [x, y, z] in object-local space"},
+                    "segments": {"type": "integer", "description": "Bands along the span, 1..32 (default 1) — more segments give the bridge intermediate edge loops to shape"},
+                    "thickness": {"type": "number", "description": "vertex bridge only: strut width in meters (default 12% of the span)"}
+                },
+                "required": ["object", "kind", "a", "b"]
+            }
+        },
+        {
             "name": "add_modifier",
             "description": "Add a NON-DESTRUCTIVE modifier to an object's stack (Blender-style): the viewport previews the result live; nothing is baked until apply_modifiers. type 'subdivision' smooths with Catmull-Clark (levels 1-4). type 'boolean' combines with another object (op union|subtract|intersect, tool = the other object): the tool stays in the scene, hidden, and the preview follows it when it moves — move/edit the tool to fine-tune, then apply_modifiers. Editing and physics keep using the base shape until applied.",
             "inputSchema": {
@@ -711,7 +752,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Value {
         "new_scene" => json!({"cmd": "new_scene"}),
         "get_library" => json!({"cmd": "get_library"}),
         "add_object" | "add_floor" | "add_roof" | "scatter_props" | "break_into_bricks" | "break_into_balls"
-        | "boolean_objects"
+        | "boolean_objects" | "join_objects" | "get_mesh_elements" | "bridge_mesh"
         | "add_modifier" | "update_modifier" | "remove_modifier" | "apply_modifiers"
         | "update_object" | "delete_object" | "set_parent" | "attach_object"
         | "group_objects" | "ungroup_object" | "add_measurement" | "simulate" | "set_view"

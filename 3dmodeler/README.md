@@ -16,6 +16,14 @@ Everything shipped across the 0.1.x series, now consolidated:
   rebuild it back into one wall object.
 - **Edit mode** (Tab) — vertex/edge/face editing with move/rotate/scale,
   vertex snapping, and setting a vertex/edge/face as pivot or anchor point.
+  Shift+click adds a second element to the selection; **Bridge** (F, the
+  toolbar button, or the right-click wheel) then connects the two — two
+  faces become a tube of quads (both faces removed), two edges a quad, two
+  vertices a solid strut.
+- **Join** (Ctrl+J, or Object ▸ Join) — merge the selected objects into the
+  active one as a single mesh, without a boolean: pieces that don't touch
+  stay separate shells. Edit mode edits ONE object, so this is the step that
+  lets Bridge connect what used to be two objects.
 - **Object library** — save selections as reusable assets and drag to place;
   placed objects behave as one group (Ungroup breaks them apart); full MCP
   CRUD.
@@ -163,7 +171,7 @@ trunk build --release --public-url ./
 | Click gizmo axis ball | Snap view to that axis |
 | Shift+A | Add mesh menu |
 | G / R / S | Move / rotate / scale (modal) |
-| X / Y / Z (in modal) | Axis constraint (Shift+axis: plane lock) |
+| X / Y / Z (in modal) | Axis constraint (Shift+axis: plane lock) — object *and* edit mode |
 | digits (in modal) | Exact value, Enter to apply |
 | Ctrl (in modal) | Snap (1 m / 5° / 0.1) |
 | Shift+D | Duplicate |
@@ -174,6 +182,13 @@ trunk build --release --public-url ./
 | Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y | Undo / redo (or Edit menu) |
 | Ctrl+S / Ctrl+O / Ctrl+N | Save / Open / New scene (or File menu) |
 | Ctrl+P / Alt+P | Parent selection to active / clear parent |
+| Ctrl+J | Join the selection into one mesh (so Bridge can span it) |
+| Tab | Enter / leave edit mode on the active object |
+| 1 / 2 / 3 (in edit mode) | Vertex / edge / face select |
+| Shift+click (in edit mode) | Add an element to the selection |
+| E / I (in edit mode) | Extrude / inset the selected face |
+| Ctrl+R / Ctrl+B (in edit mode) | Loop cut / bevel the selected edge |
+| F (in edit mode) | Bridge the two selected elements (wheel scrubs segments) |
 | Drag outliner row onto another | Parent it there (drop on the zone below to unparent) |
 | Add ▸ Measure | Ruler: click two points, Esc cancels |
 | View ▸ Grid spacing / snap | Configure grid; "snap" also in status bar |

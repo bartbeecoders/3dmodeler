@@ -185,6 +185,9 @@ optionally pass `MODELER_CONTROL_PORT` in `env`.
 | `attach_object` | Move an object so its **anchor point** lands on the target's anchor point (or an explicit location), then parent it there |
 | `group_objects` | Parent objects to a root and flag it as a **group**: the assembly selects and transforms as one unit |
 | `ungroup_object` | Clear the group flag (pass any member) so parts are selectable individually again |
+| `join_objects` | Merge objects into ONE mesh (Blender's Ctrl+J): the others' geometry is folded into the target, in its local space, and they are removed. A plain concatenation, not a boolean — pieces that don't touch stay separate shells. Run this before `bridge_mesh`, which spans two elements of a single mesh |
+| `get_mesh_elements` | List an object's mesh elements as edit mode sees them (coincident vertices welded, coplanar triangles grouped into one face): `kind` `vertex`/`edge`/`face`, each with its index and its point in **object-local** space; faces also report their corner count. This is how the agent finds the two elements to bridge |
+| `bridge_mesh` | Connect two elements of ONE object's mesh (Blender's bridge). `face`: both faces are removed and a tube of quads joins their outlines (same corner count required) — inset two opposite faces and bridge them to bore a tunnel, or bridge two disjoint shells of one mesh to link them. `edge`: a quad spans the two edges. `vertex`: a solid square strut (a triangle mesh has no wire edges). `a`/`b` are indices from `get_mesh_elements` or `[x, y, z]` points in object-local space; `segments` (1–32) cuts the span into bands, `thickness` sizes a vertex strut. To connect two **separate** objects, `boolean_objects` union them first |
 | `add_measurement` | Persistent ruler between two points, returns the distance in meters |
 | `simulate` | `play` / `pause` / `stop` the physics simulation (stop restores the scene) |
 | `new_scene` | Reset to the default scene |

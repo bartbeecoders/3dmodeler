@@ -248,7 +248,7 @@ impl UiState {
         settings: &mut Settings,
         library: &mut Library,
         edit_point: Option<(ObjectId, Vec3)>,
-        edit: Option<&mut EditMode>,
+        mut edit: Option<&mut EditMode>,
         wall_tool: &mut crate::wall_tool::WallTool,
         roof_tool: &mut crate::roof_tool::RoofTool,
         sculpt_tool: &mut crate::terrain_sculpt::SculptTool,
@@ -349,7 +349,7 @@ impl UiState {
         let top_offset = menu_offset
             + self.toolbar(
                 ctx, scene, selection, modal, physics, undo, settings, snap_to_grid,
-                snap_to_vertex, shade_mode, xray, edit,
+                snap_to_vertex, shade_mode, xray, edit.as_deref_mut(),
             );
         let chrome_bottom = self.status_bar(
             ctx, scene, physics, measure, calibrate, marker_tool, snap_to_grid, settings,
@@ -404,6 +404,7 @@ impl UiState {
         if let Some(message) = self.library_panel.dialog_window(ctx, scene, selection, library) {
             self.status_message = Some(message);
         }
+        let mut bridge_request = false;
         if let Some(message) = self.context_menu.ui(
             ctx,
             scene,
@@ -411,8 +412,15 @@ impl UiState {
             modal,
             &mut self.library_panel,
             &mut self.break_dialog,
+            edit.as_deref().is_some_and(EditMode::can_bridge),
+            &mut bridge_request,
         ) {
             self.status_message = Some(message);
+        }
+        if bridge_request {
+            if let Some(edit) = edit.as_deref_mut() {
+                edit.request_bridge();
+            }
         }
         self.library_panel
             .detect_viewport_drop(ctx, top_offset, right_offset, bottom_offset, left_offset);
@@ -652,6 +660,19 @@ impl UiState {
                         {
                             edit.set_mode(mode);
                         }
+                    }
+                    // Bridge: needs the two elements it spans, so it stays
+                    // greyed out until a second one is Shift+clicked
+                    let ready = edit.can_bridge();
+                    if bridge_button(ui, ready)
+                        .on_hover_text(
+                            "Bridge (F): connect the two selected elements — two faces \
+                             become a tube, two edges a quad, two vertices a strut. \
+                             Shift+click to select the second one.",
+                        )
+                        .clicked()
+                    {
+                        edit.request_bridge();
                     }
                     ui.separator();
                 }
@@ -1915,7 +1936,10 @@ impl UiState {
                         ("Ctrl (modal)", "Snap 1 m / 5° / 0.1"),
                         ("Shift+D", "Duplicate"),
                         ("X / Delete", "Delete (confirm / immediate)"),
+                        ("Ctrl+J", "Join the selection into one mesh (for Bridge)"),
                         ("Tab", "Object edit mode (active object)"),
+                        ("Shift+click", "Edit mode: add an element to the selection"),
+                        ("F", "Edit mode: bridge the two selected elements"),
                         ("1 / 2 / 3 (edit)", "Vertex / Edge / Face select"),
                         ("G / R / S (edit)", "Move / rotate / scale element (X/Y/Z axis)"),
                         ("P / A (edit)", "Selected element becomes pivot / anchor"),
@@ -2321,6 +2345,28 @@ fn object_menu(
     }
     ui.separator();
     let can_boolean = selection.selected().len() >= 2 && selection.active().is_some();
+    // Join is the step that makes edit mode's Bridge reachable across two
+    // objects: it edits ONE mesh, so the parts have to live in one first.
+    if ui
+        .add_enabled(can_boolean, egui::Button::new("Join  (Ctrl+J)"))
+        .on_hover_text(
+            "Merge the other selected objects into the active one as a single mesh \
+             (Blender's Ctrl+J) — the pieces stay separate shells, no boolean runs. \
+             Tab into the result and Shift+click two elements to Bridge them",
+        )
+        .clicked()
+    {
+        if let Some(active) = selection.active() {
+            let others: Vec<_> =
+                selection.selected().iter().copied().filter(|&i| i != active).collect();
+            *status = Some(match object_ops::join_objects(scene, active, &others) {
+                Ok(message) => message,
+                Err(message) => message,
+            });
+            selection.retain_existing(|i| scene.object(i).is_some());
+        }
+        close = true;
+    }
     for (op, tip) in [
         (
             modeler_core::BooleanOp::Union,
@@ -5006,6 +5052,34 @@ fn select_mode_button(ui: &mut egui::Ui, active: bool, mode: SelectMode) -> egui
                 egui::Stroke::NONE,
             ));
         }
+    }
+    response
+}
+
+/// Toolbar button for Bridge, with a painted two-posts-and-a-deck pictogram
+/// (the select-mode buttons next to it are painted for the same reason:
+/// no font glyph reads as this).
+fn bridge_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    // hover-only sense while disabled: the tooltip still explains it, but
+    // `clicked()` can never fire
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 20.0), sense);
+    let visuals = ui.style().interact(&response);
+    if enabled && response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let color = if enabled {
+        visuals.fg_stroke.color
+    } else {
+        visuals.fg_stroke.color.gamma_multiply(0.35)
+    };
+    let stroke = egui::Stroke::new(1.6, color);
+    let r = rect.shrink2(egui::vec2(7.0, 5.0));
+    let painter = ui.painter();
+    let deck = r.top() + r.height() * 0.35;
+    painter.line_segment([egui::pos2(r.left(), deck), egui::pos2(r.right(), deck)], stroke);
+    for x in [r.left() + 1.5, r.right() - 1.5] {
+        painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], stroke);
     }
     response
 }

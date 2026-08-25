@@ -23,11 +23,71 @@ enum Kind {
     Scale,
 }
 
+/// Axis restriction on a modal transform. Shared with edit mode, so
+/// G/R/S behave identically on objects and on mesh elements.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Constraint {
+pub enum Constraint {
     Free,
     Axis(usize),
     Plane(usize), // everything except this axis
+}
+
+impl Constraint {
+    /// X/Y/Z typed while a transform runs. An UPPERCASE letter (Shift+axis)
+    /// locks that axis and leaves the other two free; the same constraint
+    /// typed twice goes back to free.
+    pub fn typed(self, text: &str) -> Option<Self> {
+        let i = match text.to_ascii_lowercase().as_str() {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            _ => return None,
+        };
+        let plane = text.chars().next()?.is_ascii_uppercase();
+        let new = if plane { Constraint::Plane(i) } else { Constraint::Axis(i) };
+        Some(if self == new { Constraint::Free } else { new })
+    }
+
+    /// Keep only the part of a world-space delta the constraint allows.
+    pub fn restrict(self, delta: Vec3) -> Vec3 {
+        match self {
+            Constraint::Free => delta,
+            Constraint::Axis(i) => {
+                let axis = axis_vec(i);
+                axis * delta.dot(axis)
+            }
+            Constraint::Plane(i) => {
+                let axis = axis_vec(i);
+                delta - axis * delta.dot(axis)
+            }
+        }
+    }
+
+    /// Per-world-axis scale factors for a uniform `factor`.
+    pub fn scale_factors(self, factor: f32) -> Vec3 {
+        match self {
+            Constraint::Free => Vec3::splat(factor),
+            Constraint::Axis(i) => {
+                let mut f = Vec3::ONE;
+                f[i] = factor;
+                f
+            }
+            Constraint::Plane(i) => {
+                let mut f = Vec3::splat(factor);
+                f[i] = 1.0;
+                f
+            }
+        }
+    }
+
+    /// " along X" / " locking Z", for the status line.
+    pub fn tag(self) -> String {
+        match self {
+            Constraint::Free => String::new(),
+            Constraint::Axis(i) => format!(" along {}", axis_name(i)),
+            Constraint::Plane(i) => format!(" locking {}", axis_name(i)),
+        }
+    }
 }
 
 struct OriginalEntry {
@@ -93,11 +153,11 @@ pub struct ModalTransform {
     last_mouse: (f32, f32),
 }
 
-fn axis_vec(i: usize) -> Vec3 {
+pub(crate) fn axis_vec(i: usize) -> Vec3 {
     [Vec3::X, Vec3::Y, Vec3::Z][i]
 }
 
-fn axis_name(i: usize) -> &'static str {
+pub(crate) fn axis_name(i: usize) -> &'static str {
     ["X", "Y", "Z"][i]
 }
 
@@ -398,16 +458,11 @@ impl ModalTransform {
         let Some(state) = &mut self.state else { return };
         match text {
             "x" | "X" | "y" | "Y" | "z" | "Z" => {
-                let i = match text.to_ascii_lowercase().as_str() {
-                    "x" => 0,
-                    "y" => 1,
-                    _ => 2,
-                };
-                let plane = text.chars().next().unwrap().is_ascii_uppercase();
-                let new = if plane { Constraint::Plane(i) } else { Constraint::Axis(i) };
                 // same constraint again toggles back to free (Blender cycles
                 // global -> local -> free; local axes are a later refinement)
-                state.constraint = if state.constraint == new { Constraint::Free } else { new };
+                if let Some(next) = state.constraint.typed(text) {
+                    state.constraint = next;
+                }
             }
             "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 state.numeric.push_str(text);
@@ -452,11 +507,7 @@ impl ModalTransform {
         let dy = state.cur_mouse.1 - state.start_mouse.1;
         let numeric = Self::numeric_value(state);
 
-        let constraint_tag = match state.constraint {
-            Constraint::Free => String::new(),
-            Constraint::Axis(i) => format!(" along {}", axis_name(i)),
-            Constraint::Plane(i) => format!(" locking {}", axis_name(i)),
-        };
+        let constraint_tag = state.constraint.tag();
         let numeric_tag = if state.numeric.is_empty() {
             String::new()
         } else {
@@ -469,18 +520,8 @@ impl ModalTransform {
         match state.kind {
             Kind::Grab => {
                 let wpp = camera.world_per_pixel_at(viewport, state.pivot);
-                let mut delta = right * (dx * wpp) + up * (dy * wpp);
-                match state.constraint {
-                    Constraint::Free => {}
-                    Constraint::Axis(i) => {
-                        let axis = axis_vec(i);
-                        delta = axis * delta.dot(axis);
-                    }
-                    Constraint::Plane(i) => {
-                        let axis = axis_vec(i);
-                        delta -= axis * delta.dot(axis);
-                    }
-                }
+                let mut delta =
+                    state.constraint.restrict(right * (dx * wpp) + up * (dy * wpp));
                 // vertex snap: pull the selection so its closest vertex
                 // lands on the non-moving vertex nearest to the cursor
                 state.snap_target = None;
@@ -494,17 +535,7 @@ impl ModalTransform {
                         screen_of,
                         30.0,
                     ) {
-                        delta = match state.constraint {
-                            Constraint::Free => raw,
-                            Constraint::Axis(i) => {
-                                let axis = axis_vec(i);
-                                axis * raw.dot(axis)
-                            }
-                            Constraint::Plane(i) => {
-                                let axis = axis_vec(i);
-                                raw - axis * raw.dot(axis)
-                            }
-                        };
+                        delta = state.constraint.restrict(raw);
                         state.snap_target = Some(target);
                         vertex_snapped = true;
                     }
@@ -609,19 +640,7 @@ impl ModalTransform {
                 if numeric.is_none() && state.snap {
                     factor = (factor / 0.1).round() * 0.1;
                 }
-                let factors = match state.constraint {
-                    Constraint::Free => Vec3::splat(factor),
-                    Constraint::Axis(i) => {
-                        let mut f = Vec3::ONE;
-                        f[i] = factor;
-                        f
-                    }
-                    Constraint::Plane(i) => {
-                        let mut f = Vec3::splat(factor);
-                        f[i] = 1.0;
-                        f
-                    }
-                };
+                let factors = state.constraint.scale_factors(factor);
                 state.status = format!(
                     "Scale: {:.3}{}{}   |   LMB/Enter confirm · RMB/Esc cancel",
                     factor, constraint_tag, numeric_tag

@@ -1,0 +1,19 @@
+# Self-contained conda install + env (~15 GB, rebuilt via miniforge + build_extensions.sh)
+miniforge3/
+
+# Upstream checkout (git clone https://github.com/microsoft/TRELLIS.2 --recursive)
+TRELLIS.2/
+
+# CUDA extension build checkouts (recreated by build_extensions.sh)
+extensions/
+
+# Rust build artifacts
+img2model/target/
+
+# Worker script materialized at runtime by the img2model binary
+.img2model/
+
+# Generated models / videos
+output/
+*.glb
+*.mp4
