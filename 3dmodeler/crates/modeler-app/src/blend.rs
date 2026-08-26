@@ -1,4 +1,5 @@
-//! Blender .blend import/export via a headless Blender (native only).
+//! Blender .blend import/export via a headless Blender (native only), plus
+//! the interchange scene both it and the glTF importer merge through.
 //!
 //! The .blend format is Blender's internal DNA/memory-dump format — nothing
 //! outside Blender writes it reliably — so, like Godot, we drive an installed
@@ -11,19 +12,24 @@
 //! can take seconds), results land in `poll_import` / `poll_export`, and
 //! `poll_progress` surfaces "converting…" status lines along the way.
 
-use modeler_core::glam::{Quat, Vec3};
+use modeler_core::glam::{Quat, Vec2, Vec3};
 use modeler_core::{
     LightKind, Material, MeshData, Object, ObjectId, Primitive, Scene, Transform,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
+#[cfg(not(target_arch = "wasm32"))]
 const BLEND_TO_JSON: &str = include_str!("blend_scripts/blend_to_json.py");
+#[cfg(not(target_arch = "wasm32"))]
 const JSON_TO_BLEND: &str = include_str!("blend_scripts/json_to_blend.py");
 
 /// Kill a stuck Blender after this long; real conversions finish well within.
+#[cfg(not(target_arch = "wasm32"))]
 const TIMEOUT_SECS: u64 = 300;
 
 // ------------------------------------------------------------ interchange --
@@ -38,6 +44,11 @@ pub struct BlendScene {
     /// (import only): CAMERA, ARMATURE, face-less meshes, …
     #[serde(default)]
     pub skipped: HashMap<String, u32>,
+    /// Texture images to install in the app's texture cache (key, bytes)
+    /// before the materials referencing the keys merge. glTF imports only —
+    /// in-memory, never part of the Blender JSON exchange.
+    #[serde(skip)]
+    pub texture_files: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,13 +87,29 @@ pub struct BlendMesh {
     #[serde(default)]
     pub normals: Vec<f32>,
     pub indices: Vec<u32>,
+    /// Authored UVs, two floats per vertex (glTF imports carry these; the
+    /// Blender exchange leaves them empty and box-projection applies).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uvs: Vec<f32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BlendMaterial {
     pub base_color: [f32; 3],
     pub roughness: f32,
     pub metallic: f32,
+    /// Texture-cache keys (see `crate::pbr_library`), with the images
+    /// delivered via [`BlendScene::texture_files`] — glTF imports only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub albedo_texture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_texture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness_texture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic_texture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occlusion_texture: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,25 +124,33 @@ pub struct BlendLight {
 
 // -------------------------------------------------------- request / poll --
 
+#[cfg(not(target_arch = "wasm32"))]
 static PENDING_IMPORT: Mutex<Option<Result<(PathBuf, BlendScene), String>>> = Mutex::new(None);
+#[cfg(not(target_arch = "wasm32"))]
 static PENDING_EXPORT: Mutex<Option<Result<PathBuf, String>>> = Mutex::new(None);
+#[cfg(not(target_arch = "wasm32"))]
 static PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 /// One conversion (dialog included) at a time, mirroring `io::DIALOG_OPEN`.
+#[cfg(not(target_arch = "wasm32"))]
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn poll_import() -> Option<Result<(PathBuf, BlendScene), String>> {
     PENDING_IMPORT.lock().ok().and_then(|mut p| p.take())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn poll_export() -> Option<Result<PathBuf, String>> {
     PENDING_EXPORT.lock().ok().and_then(|mut p| p.take())
 }
 
 /// Transient status lines from the conversion thread ("converting …").
+#[cfg(not(target_arch = "wasm32"))]
 pub fn poll_progress() -> Option<String> {
     PROGRESS.lock().ok().and_then(|mut p| p.take())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn set_progress(message: String) {
     if let Ok(mut p) = PROGRESS.lock() {
         *p = Some(message);
@@ -123,6 +158,7 @@ fn set_progress(message: String) {
 }
 
 /// Pick a .blend file and convert it; the result lands in `poll_import`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn request_import(start_dir: Option<PathBuf>) {
     use std::sync::atomic::Ordering;
     if BUSY.swap(true, Ordering::SeqCst) {
@@ -141,6 +177,7 @@ pub fn request_import(start_dir: Option<PathBuf>) {
 }
 
 /// Convert a known .blend path (OS file drop) without showing a dialog.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn import_path(path: PathBuf) {
     use std::sync::atomic::Ordering;
     if BUSY.swap(true, Ordering::SeqCst) {
@@ -152,6 +189,7 @@ pub fn import_path(path: PathBuf) {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn convert_import(path: &Path) {
     set_progress(format!(
         "importing {} via Blender…",
@@ -165,6 +203,7 @@ fn convert_import(path: &Path) {
 
 /// Pick a save path and write `payload` (see [`export_payload`]) to it as a
 /// .blend; the result lands in `poll_export`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn request_export(payload: String, default_name: String, start_dir: Option<PathBuf>) {
     use std::sync::atomic::Ordering;
     if BUSY.swap(true, Ordering::SeqCst) {
@@ -199,6 +238,7 @@ pub fn request_export(payload: String, default_name: String, start_dir: Option<P
 /// Locate a Blender executable: $BLENDER_PATH, then $PATH, then .desktop
 /// entries (covers tarball installs launched via a desktop shortcut), then
 /// well-known locations.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn find_blender() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("BLENDER_PATH") {
         let path = PathBuf::from(path);
@@ -248,6 +288,7 @@ pub fn find_blender() -> Option<PathBuf> {
 
 /// Pull the executable out of a .desktop `Exec=` line, e.g.
 /// `Exec='/opt/blender/blender' %f`.
+#[cfg(not(target_arch = "wasm32"))]
 fn desktop_exec_path(desktop_file: &str) -> Option<PathBuf> {
     let exec = desktop_file
         .lines()
@@ -261,6 +302,7 @@ fn desktop_exec_path(desktop_file: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn no_blender_message() -> String {
     "Blender not found — install Blender or point the BLENDER_PATH \
      environment variable at its executable"
@@ -268,6 +310,7 @@ fn no_blender_message() -> String {
 }
 
 /// Fresh per-call scratch dir for the script + JSON handoff files.
+#[cfg(not(target_arch = "wasm32"))]
 fn scratch_dir() -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -282,6 +325,7 @@ fn scratch_dir() -> Result<PathBuf, String> {
 
 /// Run Blender to completion, killing it after [`TIMEOUT_SECS`]. Returns
 /// stderr+stdout tail on failure.
+#[cfg(not(target_arch = "wasm32"))]
 fn run_blender(mut command: std::process::Command) -> Result<(), String> {
     use std::process::Stdio;
     let mut child = command
@@ -325,6 +369,7 @@ fn run_blender(mut command: std::process::Command) -> Result<(), String> {
 }
 
 /// .blend → interchange, via the embedded `blend_to_json.py`.
+#[cfg(not(target_arch = "wasm32"))]
 fn import_blend(path: &Path) -> Result<BlendScene, String> {
     let blender = find_blender().ok_or_else(no_blender_message)?;
     let dir = scratch_dir()?;
@@ -355,6 +400,7 @@ fn import_blend(path: &Path) -> Result<BlendScene, String> {
 }
 
 /// Interchange → .blend, via the embedded `json_to_blend.py`.
+#[cfg(not(target_arch = "wasm32"))]
 fn export_blend(payload: &str, out_path: &Path) -> Result<(), String> {
     let blender = find_blender().ok_or_else(no_blender_message)?;
     let dir = scratch_dir()?;
@@ -390,6 +436,7 @@ fn export_blend(payload: &str, out_path: &Path) -> Result<(), String> {
 /// Serialize the scene for `json_to_blend.py`: every object, parents-first,
 /// with the mesh the viewport shows (modifier stacks evaluated via
 /// `mesh_for`, like the OBJ export).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshData) -> String {
     // parents before children so the Blender script can link in one pass
     let mut ordered: Vec<&Object> = Vec::with_capacity(scene.objects().len());
@@ -441,6 +488,7 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
                             positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
                             normals: mesh.normals.iter().flat_map(|n| [n.x, n.y, n.z]).collect(),
                             indices: mesh.indices.clone(),
+                            uvs: Vec::new(),
                         }),
                         Some({
                             let m = scene
@@ -450,6 +498,7 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
                                 base_color: m.base_color,
                                 roughness: m.roughness,
                                 metallic: m.metallic,
+                                ..Default::default()
                             }
                         }),
                         None,
@@ -482,6 +531,7 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
         blender_version: None,
         objects,
         skipped: HashMap::new(),
+        texture_files: Vec::new(),
     };
     serde_json::to_string(&payload).expect("interchange payload serializes")
 }
@@ -489,6 +539,12 @@ pub fn export_payload(scene: &Scene, mesh_for: impl Fn(&Scene, &Object) -> MeshD
 /// Add the imported objects to the scene. Returns the new ids (for
 /// selection), in payload order.
 pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
+    // install imported texture images before the materials that key them
+    for (key, bytes) in &data.texture_files {
+        if let Err(e) = crate::pbr_library::store_texture_bytes(key, bytes) {
+            eprintln!("storing imported texture {key}: {e}");
+        }
+    }
     let mut name_to_id: HashMap<&str, ObjectId> = HashMap::new();
     let mut new_ids = Vec::with_capacity(data.objects.len());
     for imported in &data.objects {
@@ -501,6 +557,14 @@ pub fn merge_into_scene(scene: &mut Scene, data: &BlendScene) -> Vec<ObjectId> {
                     base_color: m.base_color.map(|c| c.clamp(0.0, 1.0)),
                     roughness: m.roughness.clamp(0.0, 1.0),
                     metallic: m.metallic.clamp(0.0, 1.0),
+                    textures: modeler_core::MaterialTextures {
+                        albedo: m.albedo_texture.clone(),
+                        normal: m.normal_texture.clone(),
+                        roughness: m.roughness_texture.clone(),
+                        metallic: m.metallic_texture.clone(),
+                        occlusion: m.occlusion_texture.clone(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }
                 .clamped()
@@ -621,7 +685,11 @@ fn imported_mesh(mesh: &BlendMesh) -> MeshData {
         .chunks_exact(3)
         .map(|c| Vec3::new(c[0], c[1], c[2]))
         .collect();
+    let uvs: Vec<Vec2> = mesh.uvs.chunks_exact(2).map(|c| Vec2::new(c[0], c[1])).collect();
     let mut data = MeshData { positions, normals, indices, ..Default::default() };
+    if uvs.len() == data.positions.len() {
+        data.uvs = uvs; // authored UVs; otherwise ensure_uvs box-projects
+    }
     if data.normals.len() != data.positions.len() {
         data.recompute_normals();
     }
@@ -650,11 +718,13 @@ mod tests {
                 ],
                 normals: Vec::new(), // force the recompute path
                 indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+                uvs: Vec::new(),
             }),
             material: Some(BlendMaterial {
                 base_color: [0.2, 0.4, 0.6],
                 roughness: 0.5,
                 metallic: 1.5, // out of range on purpose
+                ..Default::default()
             }),
             light: None,
             size: None,
@@ -669,6 +739,7 @@ mod tests {
             blender_version: None,
             objects: vec![imported_cube("Root", None), imported_cube("Child", Some("Root"))],
             skipped: HashMap::new(),
+            texture_files: Vec::new(),
         };
         let ids = merge_into_scene(&mut scene, &data);
         assert_eq!(ids.len(), 2);
@@ -690,6 +761,7 @@ mod tests {
             blender_version: None,
             objects: vec![cube],
             skipped: HashMap::new(),
+            texture_files: Vec::new(),
         };
         let ids = merge_into_scene(&mut scene, &data);
         let object = scene.object(ids[0]).unwrap();

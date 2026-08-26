@@ -88,6 +88,16 @@ pub fn load(handle: &FileHandle) -> Result<SceneData, String> {
     Scene::from_json(&json)
 }
 
+/// Queue a scene file so the first `poll_open()` delivers it. Used when the
+/// desktop entry opens a `.bee3d` via `Exec ... %F`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn queue_open_path(path: FileHandle) {
+    let result = load(&path).map(|data| (path, data));
+    if let Ok(mut pending) = PENDING_OPEN.lock() {
+        *pending = Some(result);
+    }
+}
+
 /// Show the Open dialog on a background thread; result lands in `poll_open`.
 /// `start_dir` (the Preferences default save location) sets where the dialog
 /// opens; None keeps the platform's last-used location.

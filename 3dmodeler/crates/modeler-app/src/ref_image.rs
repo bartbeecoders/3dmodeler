@@ -204,7 +204,9 @@ pub fn push_setup_file(path: &std::path::Path) {
     let supported = path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "pdf"));
+        .is_some_and(|e| {
+            matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "pdf")
+        });
     if !supported {
         return;
     }
@@ -215,6 +217,13 @@ pub fn push_setup_file(path: &std::path::Path) {
         .unwrap_or_else(|| "Image".into());
     // off the event loop: PDF page rendering takes ~0.2 s per sheet
     std::thread::spawn(move || deliver_setup_file(name, bytes));
+}
+
+/// Setup-tray delivery from in-memory bytes (browser file drops — there are
+/// no paths there, and no threads either: pages render inline).
+#[cfg(target_arch = "wasm32")]
+pub fn push_setup_bytes(name: String, bytes: Vec<u8>) {
+    deliver_setup_file(name, bytes);
 }
 
 /// Build a `ReferenceImage` from raw file bytes: validates/decodes the image

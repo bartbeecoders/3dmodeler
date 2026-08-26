@@ -7,9 +7,6 @@ TRELLIS.2/
 # CUDA extension build checkouts (recreated by build_extensions.sh)
 extensions/
 
-# Rust build artifacts
-img2model/target/
-
 # Worker script materialized at runtime by the img2model binary
 .img2model/
 

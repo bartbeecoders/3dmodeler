@@ -75,6 +75,16 @@ struct Args {
     #[arg(long)]
     video: bool,
 
+    /// Also save the baked texture maps (basecolor, metallic/roughness) as
+    /// PNGs next to each GLB
+    #[arg(short, long)]
+    textures: bool,
+
+    /// Store GLB textures as WebP (EXT_texture_webp) — smaller files, but not
+    /// every glTF loader supports the extension. Default is standard PNG.
+    #[arg(long)]
+    webp: bool,
+
     /// Attention backend override (flash_attn, sdpa, xformers, naive)
     #[arg(long)]
     attn: Option<String>,
@@ -129,8 +139,12 @@ fn find_root(cli_root: &Option<PathBuf>) -> Result<PathBuf> {
         }
     }
     for c in candidates {
-        if c.join("TRELLIS.2").is_dir() && c.join("miniforge3/envs/trellis2").is_dir() {
-            return Ok(c);
+        // Accept the workspace itself or a `trellis-poc` child (the app lives
+        // in ShapeCreator/, the runtime workspace in a sibling trellis-poc/).
+        for c in [c.clone(), c.join("trellis-poc")] {
+            if c.join("TRELLIS.2").is_dir() && c.join("miniforge3/envs/trellis2").is_dir() {
+                return Ok(c);
+            }
         }
     }
     bail!(
@@ -232,6 +246,12 @@ fn run_inference(args: &Args, env: &Env, image: &Path, output: &Path) -> Result<
         .stderr(Stdio::inherit());
     if args.video {
         cmd.arg("--video");
+    }
+    if args.textures {
+        cmd.arg("--export-textures");
+    }
+    if args.webp {
+        cmd.arg("--webp");
     }
 
     let mut child = cmd.spawn().context("failed to launch python worker")?;

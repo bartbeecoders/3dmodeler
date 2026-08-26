@@ -1546,6 +1546,27 @@ fn execute_inner(
             selection.set(Vec::new(), None);
             Ok(json!({}))
         }
+        // native only: paths come from this machine's filesystem
+        #[cfg(not(target_arch = "wasm32"))]
+        "import_model" => {
+            let path = command["path"]
+                .as_str()
+                .ok_or("missing 'path' (a .glb / .gltf / .blend file, image, or PDF)")?;
+            let path = std::path::PathBuf::from(path);
+            // an image drop asks the user reference-vs-3D; 'as' answers up
+            // front so agents and scripts don't block on the dialog
+            match command["as"].as_str() {
+                Some("model") => crate::trellis::convert(vec![path]),
+                Some("reference") => crate::ref_image::push_setup_file(&path),
+                Some(other) => {
+                    return Err(format!("unknown 'as' value '{other}' (model|reference)"))
+                }
+                None => crate::drop_target::handle_path(path),
+            }
+            // conversion is async — objects appear in a later get_scene;
+            // failures land in the status bar like any dropped file's
+            Ok(json!({"status": "import started"}))
+        }
         "add_object" => {
             let primitive_name = command["primitive"]
                 .as_str()

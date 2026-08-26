@@ -102,6 +102,10 @@ pub struct UiState {
     render_result: Option<RenderResult>,
     import_open: bool,
     import_buffer: String,
+    /// Dropped images waiting for the reference-vs-3D-model choice; the
+    /// dialog in `image_drop_window` empties it.
+    #[cfg(not(target_arch = "wasm32"))]
+    image_drops: Vec<std::path::PathBuf>,
     /// Break-into-particles dialog: Some((kind, target count)) while open.
     /// Set by the Object menu, the properties panel and the context wheel;
     /// the window itself lives in `break_dialog_window`.
@@ -188,6 +192,8 @@ impl UiState {
             render_result: None,
             import_open: false,
             import_buffer: String::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            image_drops: Vec::new(),
             pick_boolean_tool: None,
             break_dialog: None,
             scatter_kind: modeler_core::PropKind::Conifer,
@@ -312,6 +318,10 @@ impl UiState {
             if let Some(message) = crate::blend::poll_progress() {
                 self.status_message = Some(message);
             }
+            // TRELLIS image→3D conversions report stages the same way
+            if let Some(message) = crate::trellis::poll_progress() {
+                self.status_message = Some(message);
+            }
             if let Some(result) = crate::blend::poll_import() {
                 match result {
                     Ok((path, data)) => {
@@ -340,6 +350,33 @@ impl UiState {
                     }
                     Err(e) => self.status_message = Some(format!("export .blend failed: {e}")),
                 }
+            }
+        }
+        // dropped files nothing could import (unknown extension, .blend in
+        // the browser) leave an explanation here
+        if let Some(message) = crate::drop_target::poll_status() {
+            self.status_message = Some(message);
+        }
+        // finished .glb/.gltf parses (drops and File ▸ Import, both targets)
+        for result in crate::gltf_import::poll_imports() {
+            match result {
+                Ok((name, data)) => {
+                    let ids = crate::blend::merge_into_scene(scene, &data);
+                    let active = ids.last().copied();
+                    let mut message = format!(
+                        "imported {} object{} from {}",
+                        ids.len(),
+                        if ids.len() == 1 { "" } else { "s" },
+                        name,
+                    );
+                    let skipped: u32 = data.skipped.values().sum();
+                    if skipped > 0 {
+                        message.push_str(&format!(" ({skipped} unsupported skipped)"));
+                    }
+                    selection.set(ids, active);
+                    self.status_message = Some(message);
+                }
+                Err(e) => self.status_message = Some(format!("import failed: {e}")),
             }
         }
         let menu_offset = self.menu_bar(
@@ -390,6 +427,8 @@ impl UiState {
         #[cfg(target_arch = "wasm32")]
         self.render_result_window(ctx);
         self.import_window(ctx, scene, undo);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.image_drop_window(ctx);
         self.save_as_window(ctx, scene, settings);
         self.confirm_new_window(ctx, scene, selection, undo);
         self.break_dialog_window(ctx, scene, selection);
@@ -814,6 +853,11 @@ impl UiState {
         }
 
         ui.separator();
+        if ui.button("Import .glb/.gltf…").clicked() {
+            crate::gltf_import::request_import(settings.save_dir());
+            self.status_message = Some("Import glTF: pick a file…".into());
+            close = true;
+        }
         // .blend exchange drives a headless Blender install — native only
         // (the browser can neither launch processes nor read local files)
         #[cfg(not(target_arch = "wasm32"))]
@@ -1134,6 +1178,87 @@ impl UiState {
             });
         if !open {
             self.import_open = false;
+        }
+    }
+
+    /// Dropped pictures are ambiguous: reference material, or an object to
+    /// build? This dialog asks. "3D model" hands them to TRELLIS
+    /// (image→3D on the local GPU); "Reference image" feeds the
+    /// reference-setup tray as image drops always did.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn image_drop_window(&mut self, ctx: &egui::Context) {
+        self.image_drops.extend(crate::drop_target::poll_images());
+        if self.image_drops.is_empty() {
+            return;
+        }
+        enum Choice {
+            Reference,
+            Model,
+            Cancel,
+        }
+        let mut choice = None;
+        egui::Window::new("Dropped images")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let count = self.image_drops.len();
+                ui.label(if count == 1 {
+                    "What should this image become?".to_string()
+                } else {
+                    format!("What should these {count} images become?")
+                });
+                for path in self.image_drops.iter().take(6) {
+                    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                    ui.label(egui::RichText::new(name).weak());
+                }
+                if count > 6 {
+                    ui.label(egui::RichText::new(format!("… and {} more", count - 6)).weak());
+                }
+                ui.add_space(6.0);
+
+                let trellis_ready = crate::trellis::workspace().is_some();
+                let trellis_busy = crate::trellis::busy();
+                ui.horizontal(|ui| {
+                    if ui.button("Reference image").clicked() {
+                        choice = Some(Choice::Reference);
+                    }
+                    let convert = ui.add_enabled(
+                        trellis_ready && !trellis_busy,
+                        egui::Button::new("3D model (TRELLIS)"),
+                    );
+                    if convert.clicked() {
+                        choice = Some(Choice::Model);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(if !trellis_ready {
+                        "3D conversion needs the trellis-poc workspace (TRELLIS.2 + conda \
+                         env) next to the app — not found on this machine"
+                    } else if trellis_busy {
+                        "a TRELLIS conversion is already running — see the status bar"
+                    } else {
+                        "3D model: TRELLIS.2 generates a textured mesh on the GPU — \
+                         roughly two minutes per image"
+                    })
+                    .weak()
+                    .size(11.0),
+                );
+            });
+        match choice {
+            Some(Choice::Reference) => {
+                for path in self.image_drops.drain(..) {
+                    crate::ref_image::push_setup_file(&path);
+                }
+            }
+            Some(Choice::Model) => {
+                crate::trellis::convert(std::mem::take(&mut self.image_drops));
+            }
+            Some(Choice::Cancel) => self.image_drops.clear(),
+            None => {}
         }
     }
 

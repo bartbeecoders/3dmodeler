@@ -182,7 +182,9 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-fn store_texture_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
+/// Install image bytes under a texture cache key (native: disk under the
+/// pbr root; wasm: memory). Also the entry point for glTF-imported maps.
+pub fn store_texture_bytes(key: &str, bytes: &[u8]) -> Result<(), String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let path = pbr_root()

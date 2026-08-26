@@ -9,7 +9,6 @@
 mod add_menu;
 mod ai;
 mod axis_widget;
-#[cfg(not(target_arch = "wasm32"))]
 mod blend;
 mod clipboard;
 mod commands;
@@ -22,6 +21,8 @@ mod dock;
 #[cfg(not(target_arch = "wasm32"))]
 mod render_preview;
 mod cutout_handles;
+mod drop_target;
+mod gltf_import;
 mod force_handles;
 mod rope_handles;
 mod cloth_handles;
@@ -53,7 +54,11 @@ mod ui;
 mod undo;
 mod terrain_sculpt;
 mod texture_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+mod trellis;
 mod wall_tool;
+#[cfg(target_os = "linux")]
+mod wayland_drop;
 mod wire_render;
 
 use crate::gfx::*;
@@ -115,6 +120,7 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
     clipboard::init();
+    drop_target::init();
 
     #[cfg(target_arch = "wasm32")]
     let window = Window::new(WindowSettings {
@@ -143,6 +149,12 @@ pub fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::var("MODELER_AI_PANEL").is_ok() {
         ui_state.chat_panel.open = true;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = std::env::args_os().nth(1).map(std::path::PathBuf::from) {
+        if path.is_file() {
+            io::queue_open_path(path);
+        }
     }
     let mut undo = undo::UndoStack::new(&scene);
     let mut measure = overlay::MeasureTool::new();
@@ -1641,10 +1653,19 @@ where
             .with_title("3D Modeler")
             .with_min_inner_size(winit::dpi::LogicalSize::new(2.0, 2.0))
             .with_maximized(true);
+        // Match the Omarchy .desktop StartupWMClass / Wayland app_id.
+        #[cfg(target_os = "linux")]
+        let attributes = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes.with_name("3d-modeler", "3d-modeler")
+        };
         let window = std::sync::Arc::new(
             event_loop.create_window(attributes).expect("a window"),
         );
         window.focus_window();
+        // winit has no Wayland file-drop support; this listener fills it in
+        #[cfg(target_os = "linux")]
+        wayland_drop::init(&window);
 
         let gfx = GfxWindow::new(window.clone()).unwrap_or_else(|e| {
             // A real dialog: this is where a machine with no usable GPU stops,
@@ -1701,15 +1722,7 @@ where
                 }
             }
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::DroppedFile(path) => {
-                // .blend drops import as scene objects; everything else goes
-                // to the reference-image setup as before
-                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("blend")) {
-                    blend::import_path(path);
-                } else {
-                    ref_image::push_setup_file(&path);
-                }
-            }
+            WindowEvent::DroppedFile(path) => drop_target::handle_path(path),
             _ => {}
         }
     }

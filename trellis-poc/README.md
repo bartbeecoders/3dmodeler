@@ -6,10 +6,12 @@ Rust console app. Targets the local RTX 4080 SUPER (16 GB VRAM).
 
 ## Layout
 
+The Rust console app lives in `../ShapeCreator/img2model/` (cargo project; its
+`python/infer.py` inference worker is embedded into the binary at compile time).
+This directory holds the runtime workspace it drives:
+
 ```
 trellis-poc/
-├── img2model/          Rust console app (cargo project)
-│   └── python/infer.py Inference worker, embedded into the binary at compile time
 ├── TRELLIS.2/          Microsoft TRELLIS.2 checkout (pipeline code + assets)
 ├── miniforge3/         Self-contained conda install
 │   └── envs/trellis2/  Python 3.10 + torch 2.6.0+cu124 + CUDA 12.4 toolchain
@@ -23,20 +25,20 @@ trellis-poc/
 ## Usage
 
 ```sh
-cd img2model
+cd ../ShapeCreator/img2model
 cargo build --release
 
 # sanity check: GPU, torch, all extension imports
 ./target/release/img2model --check
 
-# single image → output/crown.glb
-./target/release/img2model ../examples/crown.webp -o ../output
+# single image → trellis-poc/output/crown.glb
+./target/release/img2model ../../trellis-poc/examples/crown.webp -o ../../trellis-poc/output
 
 # batch, with a turntable video per model
-./target/release/img2model ../examples/*.webp -o ../output --video
+./target/release/img2model ../../trellis-poc/examples/*.webp -o ../../trellis-poc/output --video
 
 # higher resolution (more VRAM!), fixed seed, smaller texture
-./target/release/img2model ../examples/pineapple.webp -r 1024-cascade --seed 7 --texture-size 1024
+./target/release/img2model ../../trellis-poc/examples/pineapple.webp -r 1024-cascade --seed 7 --texture-size 1024
 ```
 
 Options: `-r/--resolution 512|1024|1024-cascade|1536-cascade` (default 512 — the

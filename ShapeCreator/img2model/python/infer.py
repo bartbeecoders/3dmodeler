@@ -32,6 +32,11 @@ def main():
     parser.add_argument("--model", default="microsoft/TRELLIS.2-4B")
     parser.add_argument("--video", action="store_true",
                         help="also render a turntable PBR video next to the GLB")
+    parser.add_argument("--export-textures", action="store_true",
+                        help="also save the baked texture maps as PNGs next to the GLB")
+    parser.add_argument("--webp", action="store_true",
+                        help="store GLB textures as WebP (EXT_texture_webp; smaller file, "
+                             "but not every glTF loader supports it). Default is PNG.")
     parser.add_argument("--trellis-repo", required=True,
                         help="path to the TRELLIS.2 checkout (for assets/hdri)")
     args = parser.parse_args()
@@ -114,7 +119,35 @@ def main():
         remesh_project=0,
         verbose=True,
     )
-    glb.export(args.output, extension_webp=True)
+    glb.export(args.output, extension_webp=args.webp)
+
+    if args.export_textures:
+        # to_glb returns a trimesh.Trimesh with a PBRMaterial holding the baked
+        # maps: baseColorTexture is RGBA, metallicRoughnessTexture is packed
+        # per glTF convention (G = roughness, B = metallic).
+        mat = glb.visual.material
+        stem = os.path.splitext(args.output)[0]
+        textures = {}
+        if mat.baseColorTexture is not None:
+            path = f"{stem}_basecolor.png"
+            mat.baseColorTexture.save(path)
+            textures["basecolor"] = path
+        if mat.metallicRoughnessTexture is not None:
+            mr = mat.metallicRoughnessTexture
+            path = f"{stem}_metallic_roughness.png"
+            mr.save(path)
+            textures["metallic_roughness"] = path
+            _, g, b = mr.convert("RGB").split()[:3]
+            g.save(f"{stem}_roughness.png")
+            b.save(f"{stem}_metallic.png")
+            textures["roughness"] = f"{stem}_roughness.png"
+            textures["metallic"] = f"{stem}_metallic.png"
+        if getattr(mat, "normalTexture", None) is not None:
+            path = f"{stem}_normal.png"
+            mat.normalTexture.save(path)
+            textures["normal"] = path
+        stage("textures_saved", **textures)
+
     stage("done", seconds=round(time.time() - t0, 1), path=args.output,
           size_mb=round(os.path.getsize(args.output) / 1e6, 2))
 
